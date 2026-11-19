@@ -70,6 +70,8 @@ struct App {
     tray_icon: HICON,
     taskbar_created: u32,
     overview: Option<overview::Overview>,
+    /// Monitor the mouse was on at the last focus change (see `current_mon`).
+    focus_mouse_mon: Option<String>,
 }
 
 thread_local! {
@@ -135,8 +137,18 @@ impl App {
             .collect();
     }
 
-    /// The focused window's monitor, else the mouse's monitor.
+    /// "The monitor you're on": whichever moved last, focus or mouse.
+    /// If the mouse is on a different monitor than it was at the last focus change, the user
+    /// has moved to it since, so the mouse wins. Otherwise the focused window's monitor wins.
     fn current_mon(&self) -> usize {
+        let mouse = win::monitor_name_at_cursor();
+        if let (Some(now), Some(then)) = (&mouse, &self.focus_mouse_mon) {
+            if now != then {
+                if let Some(i) = self.mon_index(now) {
+                    return i;
+                }
+            }
+        }
         unsafe {
             let fg = GetForegroundWindow();
             if win::is_manageable(fg, false) {
@@ -335,6 +347,7 @@ impl App {
 
     /// Activation of a hidden window (taskbar click, app raising itself): go to its workspace.
     fn on_foreground(&mut self, h: HWND) {
+        self.focus_mouse_mon = win::monitor_name_at_cursor();
         let k = hwnd_key(h);
         let found = self.mons.iter().enumerate().find_map(|(mi, ms)| {
             ms.hidden.iter().position(|ws| ws.contains(&k)).map(|wi| (mi, wi))
@@ -775,6 +788,7 @@ fn main() {
             tray_icon: HICON::default(),
             taskbar_created: RegisterWindowMessageW(w!("TaskbarCreated")),
             overview: None,
+            focus_mouse_mon: None,
         };
         trace("app"); app.rebuild_monitors(); trace("monitors");
         app.add_tray(); trace("tray");
@@ -809,5 +823,8 @@ fn main() {
             let _ = TranslateMessage(&msg);
             DispatchMessageW(&msg);
         }
+        // Windows were restored and the state file removed in WM_DESTROY. Skip the normal
+        // runtime teardown: releasing the shell COM object during process exit can hang.
+        let _ = windows::Win32::System::Threading::TerminateProcess(windows::Win32::System::Threading::GetCurrentProcess(), 0);
     }
 }
