@@ -19,6 +19,7 @@ mod config;
 mod layout;
 mod overview;
 mod taskbar;
+mod tray;
 mod ui;
 mod win;
 
@@ -60,6 +61,7 @@ const RULE_DELAY_MS: u32 = 250;
 const CLOCK_TIMER: usize = 3;
 const BAR_TIMER: usize = 4;
 const PLACE_TIMER: usize = 5;
+const TRAY_TIMER: usize = 6;
 const OSD_MS: u32 = 900;
 const RUN_KEY: PCWSTR = w!("Software\\Microsoft\\Windows\\CurrentVersion\\Run");
 const APP_NAME: PCWSTR = w!("LastDesk");
@@ -296,6 +298,23 @@ impl App {
         }
     }
 
+    /// Start/stop hosting tray icons to match the config.
+    fn tray_apply(&mut self) {
+        let want = self.config.bar && self.config.tray && !self.bars.is_empty();
+        if want && !tray::active() {
+            tray::create(self.main);
+            unsafe {
+                SetTimer(self.main, TRAY_TIMER, 2000, None);
+            }
+        } else if !want && tray::active() {
+            tray::destroy();
+            unsafe {
+                let _ = KillTimer(self.main, TRAY_TIMER);
+            }
+        }
+        self.bars_refresh();
+    }
+
     fn bars_place_all(&mut self) {
         let hwnds: Vec<HWND> = self.bars.iter().map(|b| b.hwnd).collect();
         for h in hwnds {
@@ -390,6 +409,7 @@ impl App {
             self.bars_destroy();
         }
         self.taskbar_apply();
+        self.tray_apply();
         let failed = self.register_hotkeys();
         if !failed.is_empty() {
             problems.push(format!("These shortcuts are used by another app and won't work: {}", failed.join(", ")));
@@ -986,6 +1006,10 @@ unsafe extern "system" fn main_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
             });
             LRESULT(0)
         }
+        WM_TIMER if wp.0 == TRAY_TIMER => {
+            tray::maintain();
+            LRESULT(0)
+        }
         WM_TIMER if wp.0 == PLACE_TIMER => {
             let _ = KillTimer(hwnd, PLACE_TIMER);
             with_app(|app| {
@@ -1019,6 +1043,7 @@ unsafe extern "system" fn main_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
             LRESULT(0)
         }
         WM_DESTROY => {
+            tray::destroy();
             with_app(|app| {
                 app.taskbar_restore();
                 app.bars_destroy();
@@ -1116,6 +1141,7 @@ fn main() {
                 let _ = std::fs::create_dir_all(dir);
             }
             let _ = std::fs::write(&log, format!("{info}\n{}", std::backtrace::Backtrace::force_capture()));
+            tray::destroy();
             taskbar::restore_if_hidden();
             let c = Cloaker::new();
             for (k, m) in PANIC_LIST.lock().unwrap_or_else(|e| e.into_inner()).iter() {
@@ -1148,9 +1174,12 @@ fn main() {
             hInstance: hinst,
             lpszClassName: bar::CLASS,
             hCursor: LoadCursorW(None, IDC_ARROW).unwrap_or_default(),
+            style: CS_DBLCLKS,
             ..Default::default()
         };
         RegisterClassW(&bar_class);
+        let tip_class = WNDCLASSW { lpfnWndProc: Some(bar::tip_proc), hInstance: hinst, lpszClassName: bar::TIP_CLASS, ..Default::default() };
+        RegisterClassW(&tip_class);
         trace("classes");
 
         let main = CreateWindowExW(WINDOW_EX_STYLE(0), w!("LastDeskMain"), w!("LastDesk"), WS_OVERLAPPED, 0, 0, 0, 0, None, None, hinst, None).unwrap();
@@ -1195,6 +1224,7 @@ fn main() {
         trace("layout");
         app.bars_create();
         app.taskbar_apply();
+        app.tray_apply();
         // Rules only apply to windows opened from now on.
         app.seen = win::visible_windows().into_iter().map(hwnd_key).collect();
         app.seen.extend(app.mons.iter().flat_map(|m| m.hidden.iter().flatten().copied()));

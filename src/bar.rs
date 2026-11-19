@@ -25,12 +25,106 @@ pub const CLASS: windows::core::PCWSTR = w!("LastDeskBar");
 pub const WM_APPBAR: u32 = WM_APP + 2;
 const BASE_HEIGHT: f32 = 34.0;
 const WM_MOUSELEAVE: u32 = 0x02A3;
+const TIP_TIMER: usize = 1;
+pub const TIP_CLASS: windows::core::PCWSTR = w!("LastDeskTip");
+
+fn cursor() -> POINT {
+    let mut p = POINT::default();
+    unsafe {
+        let _ = GetCursorPos(&mut p);
+    }
+    p
+}
+
+// ---------- tooltip for tray icons ----------
+
+thread_local! {
+    static TIP: std::cell::RefCell<(HWND, String, f32)> = const { std::cell::RefCell::new((HWND(std::ptr::null_mut()), String::new(), 1.0)) };
+}
+
+fn tip_font(scale: f32) -> HFONT {
+    unsafe { ui::font((12.5 * scale) as i32, false) }
+}
+
+fn show_tip(text: &str, anchor: POINT, scale: f32) {
+    if text.trim().is_empty() {
+        return;
+    }
+    let hwnd = TIP.with(|t| t.borrow().0);
+    let hwnd = if hwnd.is_invalid() {
+        let hinst: HINSTANCE = unsafe { GetModuleHandleW(None).unwrap_or_default().into() };
+        let Ok(h) = (unsafe {
+            CreateWindowExW(WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_TRANSPARENT, TIP_CLASS, w!(""), WS_POPUP, 0, 0, 10, 10, None, None, hinst, None)
+        }) else { return };
+        h
+    } else {
+        hwnd
+    };
+    TIP.with(|t| *t.borrow_mut() = (hwnd, text.to_string(), scale));
+    let pad = (8.0 * scale) as i32;
+    unsafe {
+        let dc = GetDC(hwnd);
+        let f = tip_font(scale);
+        let old = SelectObject(dc, f);
+        let mut w: Vec<u16> = text.encode_utf16().collect();
+        let mut r = RECT { left: 0, top: 0, right: (420.0 * scale) as i32, bottom: 0 };
+        DrawTextW(dc, &mut w, &mut r, DT_CALCRECT | DT_NOPREFIX | DT_WORDBREAK);
+        SelectObject(dc, old);
+        let _ = DeleteObject(f);
+        ReleaseDC(hwnd, dc);
+        let (tw, th) = (r.right + pad * 2, r.bottom + pad * 2);
+        let x = anchor.x - tw / 2;
+        let _ = SetWindowPos(hwnd, HWND_TOPMOST, x, anchor.y + (4.0 * scale) as i32, tw, th, SWP_NOACTIVATE | SWP_SHOWWINDOW);
+        let _ = InvalidateRect(hwnd, None, true);
+    }
+}
+
+fn hide_tip() {
+    let hwnd = TIP.with(|t| t.borrow().0);
+    if !hwnd.is_invalid() {
+        unsafe {
+            let _ = ShowWindow(hwnd, SW_HIDE);
+        }
+    }
+}
+
+pub unsafe extern "system" fn tip_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
+    match msg {
+        WM_PAINT => {
+            let mut ps = PAINTSTRUCT::default();
+            let hdc = BeginPaint(hwnd, &mut ps);
+            let (text, scale) = TIP.with(|t| { let t = t.borrow(); (t.1.clone(), t.2) });
+            let mut r = RECT::default();
+            let _ = GetClientRect(hwnd, &mut r);
+            let brush = CreateSolidBrush(ui::rgb(0x2A, 0x2B, 0x30));
+            FillRect(hdc, &r, brush);
+            let _ = DeleteObject(brush);
+            let pad = (8.0 * scale) as i32;
+            let f = tip_font(scale);
+            let old = SelectObject(hdc, f);
+            SetTextColor(hdc, ui::TEXT);
+            SetBkMode(hdc, TRANSPARENT);
+            let mut w: Vec<u16> = text.encode_utf16().collect();
+            let mut tr = RECT { left: pad, top: pad, right: r.right - pad, bottom: r.bottom - pad };
+            if !w.is_empty() {
+                DrawTextW(hdc, &mut w, &mut tr, DT_NOPREFIX | DT_WORDBREAK);
+            }
+            SelectObject(hdc, old);
+            let _ = DeleteObject(f);
+            let _ = EndPaint(hwnd, &ps);
+            LRESULT(0)
+        }
+        WM_ERASEBKGND => LRESULT(1),
+        _ => DefWindowProcW(hwnd, msg, wp, lp),
+    }
+}
 
 #[derive(Clone, Copy, PartialEq)]
 pub enum Hit {
     Start,
     Workspace(usize),
     Window(isize),
+    TrayIcon(usize),
     Tray,
     Battery,
     Clock,
@@ -53,6 +147,8 @@ pub struct Bar {
     pub start: RECT,
     pub cells: Vec<RECT>,
     pub buttons: Vec<Button>,
+    /// Tray icons shown in this bar: (owner hwnd, uid, rect).
+    pub tray_icons: Vec<(u32, u32, RECT)>,
     pub tray: RECT,
     pub battery: RECT,
     pub clock: RECT,
@@ -101,6 +197,9 @@ impl Bar {
         }
         if let Some(b) = self.buttons.iter().find(|b| contains(&b.rect, x, y)) {
             return Hit::Window(b.hwnd);
+        }
+        if let Some(i) = self.tray_icons.iter().position(|(_, _, r)| contains(r, x, y)) {
+            return Hit::TrayIcon(i);
         }
         if contains(&self.tray, x, y) {
             return Hit::Tray;
@@ -193,6 +292,7 @@ impl App {
                 start: RECT::default(),
                 cells: Vec::new(),
                 buttons: Vec::new(),
+                tray_icons: Vec::new(),
                 tray: RECT::default(),
                 battery: RECT::default(),
                 clock: RECT::default(),
@@ -268,7 +368,9 @@ impl App {
         }
         let all = win::visible_windows();
         let n = workspaces();
-        let tray_on = self.taskbar_hidden;
+        let tray_host = crate::tray::active();
+        let tray_on = self.taskbar_hidden && !tray_host;
+        let icons = if tray_host { crate::tray::icons() } else { Vec::new() };
         for bi in 0..self.bars.len() {
             let m = self.bars[bi].mon;
             if m >= self.mons.len() {
@@ -305,7 +407,19 @@ impl App {
             let batt_w = s(64.0);
             b.clock = RECT { left: w - pad - right_w, top: s(3.0), right: w - pad, bottom: h - s(3.0) };
             b.battery = RECT { left: b.clock.left - batt_w, top: s(3.0), right: b.clock.left - s(4.0), bottom: h - s(3.0) };
-            b.tray = if tray_on { RECT { left: b.battery.left - s(32.0), top: s(3.0), right: b.battery.left - s(4.0), bottom: h - s(3.0) } } else { RECT { left: b.battery.left, top: 0, right: b.battery.left, bottom: 0 } };
+            let iw = s(28.0);
+            let mut ix = b.battery.left - s(4.0);
+            let mut tray_icons: Vec<(u32, u32, RECT)> = icons
+                .iter()
+                .rev()
+                .map(|(hw, uid, _, _)| {
+                    ix -= iw;
+                    (*hw, *uid, RECT { left: ix, top: s(3.0), right: ix + iw, bottom: h - s(3.0) })
+                })
+                .collect();
+            tray_icons.reverse();
+            b.tray_icons = tray_icons;
+            b.tray = if tray_on { RECT { left: ix - s(32.0), top: s(3.0), right: ix - s(4.0), bottom: h - s(3.0) } } else { RECT { left: ix, top: 0, right: ix, bottom: 0 } };
             let start_x = x + s(10.0);
             let avail = (b.tray.left - s(10.0) - start_x).max(0);
             let count = b.order.len() as i32;
@@ -400,6 +514,20 @@ impl App {
                 }
             }
 
+            // Tray icons (drawn from the live list: icons can change between refreshes).
+            if !b.tray_icons.is_empty() {
+                let cur = crate::tray::icons();
+                for (i, (hw, uid, r)) in b.tray_icons.iter().enumerate() {
+                    if b.hover == Hit::TrayIcon(i) {
+                        ui::fill_round(mem, *r, s(6.0), hover_bg);
+                    }
+                    if let Some((_, _, icon, _)) = cur.iter().find(|c| c.0 == *hw && c.1 == *uid) {
+                        let sz = s(16.0);
+                        let _ = DrawIconEx(mem, r.left + (r.right - r.left - sz) / 2, (h - sz) / 2, *icon, sz, sz, 0, None, DI_NORMAL);
+                    }
+                }
+            }
+
             // Tray: ^ brings up the Windows taskbar with its notification area.
             if b.tray.right > b.tray.left {
                 if b.hover == Hit::Tray {
@@ -443,6 +571,28 @@ impl App {
         }
     }
 
+    /// Right/double click on a tray icon. Returns true if (x, y) was a tray icon.
+    pub fn bar_tray_click(&mut self, hwnd: HWND, x: i32, y: i32, kind: crate::tray::Click) -> bool {
+        let Some(i) = self.bar_index(hwnd) else { return false };
+        if let Hit::TrayIcon(t) = self.bars[i].hit(x, y) {
+            let (hw, uid, _) = self.bars[i].tray_icons[t];
+            hide_tip();
+            crate::tray::click(hw, uid, kind, cursor());
+            return true;
+        }
+        false
+    }
+
+    pub fn bar_show_tip(&mut self, hwnd: HWND) {
+        let Some(i) = self.bar_index(hwnd) else { return };
+        let b = &self.bars[i];
+        if let Hit::TrayIcon(t) = b.hover {
+            let (hw, uid, r) = b.tray_icons[t];
+            let text = crate::tray::tip(hw, uid);
+            show_tip(&text, POINT { x: b.rect.left + (r.left + r.right) / 2, y: b.rect.top + b.height() }, b.scale);
+        }
+    }
+
     fn bar_index(&self, hwnd: HWND) -> Option<usize> {
         self.bars.iter().position(|b| b.hwnd == hwnd)
     }
@@ -460,6 +610,14 @@ impl App {
         let hit = b.hit(x, y);
         if hit != b.hover {
             b.hover = hit;
+            hide_tip();
+            if let Hit::TrayIcon(t) = hit {
+                let (hw, uid, _) = b.tray_icons[t];
+                crate::tray::click(hw, uid, crate::tray::Click::Hover, cursor());
+                unsafe {
+                    SetTimer(hwnd, TIP_TIMER, 450, None);
+                }
+            }
             unsafe {
                 let _ = InvalidateRect(hwnd, None, false);
             }
@@ -471,6 +629,7 @@ impl App {
         let b = &mut self.bars[i];
         b.tracking = false;
         b.hover = Hit::None;
+        hide_tip();
         unsafe {
             let _ = InvalidateRect(hwnd, None, false);
         }
@@ -491,12 +650,15 @@ impl App {
                 } else if GetForegroundWindow() == h && !IsIconic(h).as_bool() {
                     let _ = ShowWindow(h, SW_MINIMIZE);
                 } else {
-                    if IsIconic(h).as_bool() {
-                        let _ = ShowWindow(h, SW_RESTORE);
-                    }
-                    let _ = SetForegroundWindow(h);
+                    // Works for elevated windows (Task Manager) too, and restores minimized ones.
+                    SwitchToThisWindow(h, true);
                 }
             },
+            Hit::TrayIcon(t) => {
+                let (hw, uid, _) = self.bars[i].tray_icons[t];
+                hide_tip();
+                crate::tray::click(hw, uid, if middle { crate::tray::Click::Middle } else { crate::tray::Click::Left }, cursor());
+            }
             Hit::Tray if !middle => {
                 crate::taskbar::peek();
                 return Some(vec![VK_LWIN, VIRTUAL_KEY('B' as u16)]);
@@ -538,7 +700,20 @@ pub unsafe extern "system" fn bar_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPA
             LRESULT(0)
         }
         WM_RBUTTONUP => {
-            crate::show_menu(with_app(|a| a.main).unwrap_or(hwnd));
+            let (x, y) = xy();
+            if with_app(|app| app.bar_tray_click(hwnd, x, y, crate::tray::Click::Right)) != Some(true) {
+                crate::show_menu(with_app(|a| a.main).unwrap_or(hwnd));
+            }
+            LRESULT(0)
+        }
+        WM_LBUTTONDBLCLK => {
+            let (x, y) = xy();
+            with_app(|app| app.bar_tray_click(hwnd, x, y, crate::tray::Click::Double));
+            LRESULT(0)
+        }
+        WM_TIMER if wp.0 == TIP_TIMER => {
+            let _ = KillTimer(hwnd, TIP_TIMER);
+            with_app(|app| app.bar_show_tip(hwnd));
             LRESULT(0)
         }
         WM_MOUSEACTIVATE => LRESULT(MA_NOACTIVATE as isize),

@@ -25,6 +25,8 @@ overview = alt+`
 enabled = true
 # Hide the Windows taskbar while the LastDesk bar is on (its tray icons: the ^ button).
 hide_taskbar = false
+# Show apps' tray icons in the LastDesk bar.
+tray = true
 
 [pinned_apps]
 # Apps shown on every workspace. One exe name per line (without .exe), e.g.:
@@ -61,6 +63,7 @@ pub struct Config {
     pub rules: Vec<Rule>,
     pub bar: bool,
     pub hide_taskbar: bool,
+    pub tray: bool,
     pub errors: Vec<String>,
 }
 
@@ -145,6 +148,7 @@ pub fn parse(text: &str) -> Config {
         rules: Vec::new(),
         bar: true,
         hide_taskbar: false,
+        tray: true,
         errors: Vec::new(),
     };
     let mut section = String::new();
@@ -192,6 +196,11 @@ pub fn parse(text: &str) -> Config {
             ("bar", "hide_taskbar") => match val.to_lowercase().as_str() {
                 "true" | "yes" | "on" | "1" => c.hide_taskbar = true,
                 "false" | "no" | "off" | "0" => c.hide_taskbar = false,
+                _ => bad(),
+            },
+            ("bar", "tray") => match val.to_lowercase().as_str() {
+                "true" | "yes" | "on" | "1" => c.tray = true,
+                "false" | "no" | "off" | "0" => c.tray = false,
                 _ => bad(),
             },
             ("pinned_apps", app) => c.pinned_apps.push(app.trim_end_matches(".exe").to_string()),

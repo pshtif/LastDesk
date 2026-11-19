@@ -465,12 +465,8 @@ impl App {
         }
         if let Some(k) = k {
             let h = key_hwnd(k);
-            unsafe {
-                if IsIconic(h).as_bool() {
-                    let _ = ShowWindow(h, SW_RESTORE);
-                }
-                let _ = SetForegroundWindow(h);
-            }
+            // Works for elevated windows (Task Manager) and restores minimized ones.
+            unsafe { SwitchToThisWindow(h, true) };
         }
     }
 
