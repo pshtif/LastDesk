@@ -52,6 +52,8 @@ fn workspaces() -> usize {
 }
 
 const WM_TRAY: u32 = WM_APP + 1;
+/// Sent by `lastdesk.exe --settings` to the running instance.
+const WM_OPEN_SETTINGS: u32 = WM_APP + 3;
 const HK_FOCUS: i32 = 1; // ids 1..=9
 const HK_MOVE: i32 = 101; // ids 101..=109
 const HK_PIN: i32 = 200;
@@ -989,6 +991,10 @@ unsafe extern "system" fn main_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
             });
             LRESULT(0)
         }
+        WM_OPEN_SETTINGS => {
+            settings::open();
+            LRESULT(0)
+        }
         WM_TRAY => {
             let ev = (lp.0 & 0xFFFF) as u32;
             if ev == WM_RBUTTONUP || ev == WM_LBUTTONUP {
@@ -1140,6 +1146,12 @@ fn main() {
         let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
         let _mutex = CreateMutexW(None, true, w!("Local\\lastdesk-single-instance"));
         if GetLastError() == ERROR_ALREADY_EXISTS {
+            if std::env::args().any(|a| a == "--settings") {
+                if let Ok(h) = FindWindowW(w!("LastDeskMain"), None) {
+                    let _ = PostMessageW(h, WM_OPEN_SETTINGS, WPARAM(0), LPARAM(0));
+                }
+                return;
+            }
             MessageBoxW(None, w!("LastDesk is already running (see the tray)."), w!("LastDesk"), MB_OK | MB_ICONINFORMATION);
             return;
         }
@@ -1198,11 +1210,18 @@ fn main() {
             hInstance: hinst,
             lpszClassName: settings::CLASS,
             hCursor: LoadCursorW(None, IDC_ARROW).unwrap_or_default(),
-            hbrBackground: windows::Win32::Graphics::Gdi::HBRUSH((windows::Win32::Graphics::Gdi::COLOR_BTNFACE.0 + 1) as usize as *mut _),
             hIcon: LoadIconW(None, IDI_APPLICATION).unwrap_or_default(),
             ..Default::default()
         };
         RegisterClassW(&settings_class);
+        let ctl_class = WNDCLASSW {
+            lpfnWndProc: Some(settings::ctl_proc),
+            hInstance: hinst,
+            lpszClassName: settings::CTL_CLASS,
+            hCursor: LoadCursorW(None, IDC_HAND).unwrap_or_default(),
+            ..Default::default()
+        };
+        RegisterClassW(&ctl_class);
         let tip_class = WNDCLASSW { lpfnWndProc: Some(bar::tip_proc), hInstance: hinst, lpszClassName: bar::TIP_CLASS, ..Default::default() };
         RegisterClassW(&tip_class);
         trace("classes");
