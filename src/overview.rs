@@ -3,7 +3,7 @@
 //! drag a window onto another column (any monitor) to move it, type to filter, Esc to close.
 //!
 //! Thumbnails are DWM live thumbnails (like taskbar previews): the compositor draws the
-//! window into our rectangle. Nothing is captured, copied or stored by monodesk.
+//! window into our rectangle. Nothing is captured, copied or stored by LastDesk.
 
 use windows::core::{w, PWSTR};
 use windows::Win32::Foundation::*;
@@ -19,7 +19,7 @@ use crate::ui;
 use crate::win::{self, hwnd_key, key_hwnd};
 use crate::{monitor_labels, with_app, App, WORKSPACES};
 
-pub const CLASS: windows::core::PCWSTR = w!("MonodeskOverview");
+pub const CLASS: windows::core::PCWSTR = w!("LastDeskOverview");
 
 pub struct Card {
     pub hwnd: isize,
@@ -236,7 +236,7 @@ impl App {
                 let Ok(hwnd) = CreateWindowExW(
                     WS_EX_TOPMOST | WS_EX_TOOLWINDOW,
                     CLASS,
-                    w!("monodesk overview"),
+                    w!("LastDesk overview"),
                     WS_POPUP,
                     r.left, r.top, r.right - r.left, r.bottom - r.top,
                     None, None, hinst, None,

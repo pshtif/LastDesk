@@ -1,8 +1,8 @@
-# monodesk
+# LastDesk
 
 Per-monitor workspaces for Windows. Native Rust, no tiling, ~3 MB RAM.
 
-Windows' own virtual desktops switch every monitor at once. monodesk gives each monitor
+Windows' own virtual desktops switch every monitor at once. LastDesk gives each monitor
 its own workspaces 1–4.
 
 | Keys | Action |
@@ -21,7 +21,7 @@ workspaces and windows, "Show all windows (reset)", "Start with Windows" and "Ex
 
 ## Crash safety
 
-Hidden windows are recorded in `%LOCALAPPDATA%\monodesk\hidden.txt` and restored on exit,
+Hidden windows are recorded in `%LOCALAPPDATA%\LastDesk\hidden.txt` and restored on exit,
 on panic, on display changes and on the next start, so a crash never leaves windows invisible.
 
 ## Build

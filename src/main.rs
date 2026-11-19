@@ -1,4 +1,4 @@
-//! monodesk: per-monitor workspaces for Windows.
+//! LastDesk: per-monitor workspaces for Windows.
 //!
 //! Alt+1..4        switch the workspace of the monitor you're on
 //! Alt+Shift+1..4  move the focused window to that workspace (same monitor)
@@ -8,7 +8,7 @@
 //! window is focused. Windows are assigned to a workspace lazily: whatever is visible on a
 //! monitor when you switch away belongs to the workspace you left.
 //!
-//! Crash safety: every hidden window is recorded in %LOCALAPPDATA%\monodesk\hidden.txt and
+//! Crash safety: every hidden window is recorded in %LOCALAPPDATA%\LastDesk\hidden.txt and
 //! restored on exit, on panic, on display changes and on the next start.
 
 #![windows_subsystem = "windows"]
@@ -48,7 +48,7 @@ const VK_BACKTICK: u32 = 0xC0; // VK_OEM_3, the key left of 1
 const OSD_TIMER: usize = 1;
 const OSD_MS: u32 = 900;
 const RUN_KEY: PCWSTR = w!("Software\\Microsoft\\Windows\\CurrentVersion\\Run");
-const APP_NAME: PCWSTR = w!("monodesk");
+const APP_NAME: PCWSTR = w!("LastDesk");
 
 struct MonState {
     name: String,
@@ -84,7 +84,7 @@ fn with_app<R>(f: impl FnOnce(&mut App) -> R) -> Option<R> {
 
 fn state_path() -> PathBuf {
     let base = std::env::var_os("LOCALAPPDATA").map(PathBuf::from).unwrap_or_else(std::env::temp_dir);
-    base.join("monodesk").join("hidden.txt")
+    base.join("LastDesk").join("hidden.txt")
 }
 
 fn wide(s: &str) -> Vec<u16> {
@@ -442,7 +442,7 @@ impl App {
             .map(|(i, m)| format!("{}: {}", labels[i].replace(" monitor", ""), m.active + 1))
             .collect::<Vec<_>>()
             .join(" · ");
-        (icon, format!("monodesk — {tip}"))
+        (icon, format!("LastDesk — {tip}"))
     }
 
     fn update_tray(&mut self) {
@@ -709,9 +709,9 @@ unsafe extern "system" fn win_event(_: HWINEVENTHOOK, event: u32, hwnd: HWND, id
 }
 
 fn trace(s: &str) {
-    if std::env::var_os("MONODESK_TRACE").is_some() {
+    if std::env::var_os("LASTDESK_TRACE").is_some() {
         use std::io::Write;
-        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(std::env::temp_dir().join("monodesk-trace.txt")) {
+        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(std::env::temp_dir().join("lastdesk-trace.txt")) {
             let _ = writeln!(f, "{s}");
         }
     }
@@ -720,9 +720,9 @@ fn trace(s: &str) {
 fn main() {
     unsafe {
         let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
-        let _mutex = CreateMutexW(None, true, w!("Local\\monodesk-single-instance"));
+        let _mutex = CreateMutexW(None, true, w!("Local\\lastdesk-single-instance"));
         if GetLastError() == ERROR_ALREADY_EXISTS {
-            MessageBoxW(None, w!("monodesk is already running (see the tray)."), w!("monodesk"), MB_OK | MB_ICONINFORMATION);
+            MessageBoxW(None, w!("LastDesk is already running (see the tray)."), w!("LastDesk"), MB_OK | MB_ICONINFORMATION);
             return;
         }
         let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
@@ -744,12 +744,12 @@ fn main() {
         }));
 
         let hinst: HINSTANCE = GetModuleHandleW(None).unwrap().into();
-        let main_class = WNDCLASSW { lpfnWndProc: Some(main_proc), hInstance: hinst, lpszClassName: w!("MonodeskMain"), ..Default::default() };
+        let main_class = WNDCLASSW { lpfnWndProc: Some(main_proc), hInstance: hinst, lpszClassName: w!("LastDeskMain"), ..Default::default() };
         RegisterClassW(&main_class);
         let osd_class = WNDCLASSW {
             lpfnWndProc: Some(osd_proc),
             hInstance: hinst,
-            lpszClassName: w!("MonodeskOSD"),
+            lpszClassName: w!("LastDeskOSD"),
             hCursor: LoadCursorW(None, IDC_ARROW).unwrap_or_default(),
             ..Default::default()
         };
@@ -763,11 +763,11 @@ fn main() {
         };
         RegisterClassW(&overview_class); trace("classes");
 
-        let main = CreateWindowExW(WINDOW_EX_STYLE(0), w!("MonodeskMain"), w!("monodesk"), WS_OVERLAPPED, 0, 0, 0, 0, None, None, hinst, None).unwrap();
+        let main = CreateWindowExW(WINDOW_EX_STYLE(0), w!("LastDeskMain"), w!("LastDesk"), WS_OVERLAPPED, 0, 0, 0, 0, None, None, hinst, None).unwrap();
         let osd = CreateWindowExW(
             WS_EX_LAYERED | WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_TRANSPARENT,
-            w!("MonodeskOSD"),
-            w!("monodesk osd"),
+            w!("LastDeskOSD"),
+            w!("LastDesk osd"),
             WS_POPUP,
             0, 0, 10, 10,
             None, None, hinst, None,
@@ -813,7 +813,7 @@ fn main() {
         }
         if !failed.is_empty() {
             let msg = wide(&format!("These shortcuts are used by another app and won't work:\n{}", failed.join(", ")));
-            MessageBoxW(None, PCWSTR(msg.as_ptr()), w!("monodesk"), MB_OK | MB_ICONWARNING);
+            MessageBoxW(None, PCWSTR(msg.as_ptr()), w!("LastDesk"), MB_OK | MB_ICONWARNING);
         }
 
         trace("hotkeys"); let _hook = SetWinEventHook(EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_FOREGROUND, None, Some(win_event), 0, 0, WINEVENT_OUTOFCONTEXT);

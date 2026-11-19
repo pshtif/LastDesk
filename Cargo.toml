@@ -1,5 +1,5 @@
-﻿[package]
-name = "monodesk"
+[package]
+name = "lastdesk"
 version = "0.1.0"
 edition = "2021"
 description = "Per-monitor workspaces for Windows, tiny and crash-safe"
