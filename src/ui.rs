@@ -6,10 +6,10 @@ use windows::Win32::Graphics::Gdi::*;
 use windows::Win32::UI::WindowsAndMessaging::{CreateIconIndirect, GetSystemMetrics, HICON, ICONINFO, SM_CXSMICON};
 
 pub const ACCENT: COLORREF = rgb(0x34, 0x78, 0xF6);
-const BG: COLORREF = rgb(0x1E, 0x1F, 0x22);
-const CELL: COLORREF = rgb(0x3A, 0x3B, 0x40);
-const TEXT: COLORREF = rgb(0xFF, 0xFF, 0xFF);
-const MUTED: COLORREF = rgb(0xA0, 0xA4, 0xAB);
+pub(crate) const BG: COLORREF = rgb(0x1E, 0x1F, 0x22);
+pub(crate) const CELL: COLORREF = rgb(0x3A, 0x3B, 0x40);
+pub(crate) const TEXT: COLORREF = rgb(0xFF, 0xFF, 0xFF);
+pub(crate) const MUTED: COLORREF = rgb(0xA0, 0xA4, 0xAB);
 
 pub const fn rgb(r: u8, g: u8, b: u8) -> COLORREF {
     COLORREF(r as u32 | (g as u32) << 8 | (b as u32) << 16)
@@ -19,7 +19,7 @@ fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
 }
 
-unsafe fn font(height: i32, bold: bool) -> HFONT {
+pub(crate) unsafe fn font(height: i32, bold: bool) -> HFONT {
     let face = wide("Segoe UI");
     CreateFontW(
         -height, 0, 0, 0,
@@ -34,7 +34,7 @@ unsafe fn font(height: i32, bold: bool) -> HFONT {
     )
 }
 
-unsafe fn draw_text(hdc: HDC, s: &str, r: &mut RECT, color: COLORREF, f: HFONT) {
+pub(crate) unsafe fn draw_text(hdc: HDC, s: &str, r: &mut RECT, color: COLORREF, f: HFONT) {
     // DrawTextW reads through the (dangling) pointer of an empty slice: skip empty text.
     if s.is_empty() {
         return;
@@ -47,7 +47,7 @@ unsafe fn draw_text(hdc: HDC, s: &str, r: &mut RECT, color: COLORREF, f: HFONT) 
     SelectObject(hdc, old);
 }
 
-unsafe fn fill_round(hdc: HDC, r: RECT, radius: i32, color: COLORREF) {
+pub(crate) unsafe fn fill_round(hdc: HDC, r: RECT, radius: i32, color: COLORREF) {
     let brush = CreateSolidBrush(color);
     let pen = CreatePen(PS_SOLID, 1, color);
     let ob = SelectObject(hdc, brush);
@@ -177,4 +177,28 @@ pub unsafe fn paint_osd(hdc: HDC, model: &OsdModel, scale: f32) {
         }
     }
     let _ = DeleteObject(big);
+}
+
+/// Left-aligned single line with "…" when it doesn't fit.
+pub(crate) unsafe fn draw_text_left(hdc: HDC, s: &str, r: &mut RECT, color: COLORREF, f: HFONT) {
+    if s.is_empty() {
+        return;
+    }
+    let old = SelectObject(hdc, f);
+    SetTextColor(hdc, color);
+    SetBkMode(hdc, TRANSPARENT);
+    let mut w: Vec<u16> = s.encode_utf16().collect();
+    DrawTextW(hdc, &mut w, r, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
+    SelectObject(hdc, old);
+}
+
+/// Rounded outline (no fill).
+pub(crate) unsafe fn frame_round(hdc: HDC, r: RECT, radius: i32, width: i32, color: COLORREF) {
+    let pen = CreatePen(PS_SOLID, width, color);
+    let op = SelectObject(hdc, pen);
+    let ob = SelectObject(hdc, GetStockObject(NULL_BRUSH));
+    let _ = RoundRect(hdc, r.left, r.top, r.right, r.bottom, radius, radius);
+    SelectObject(hdc, ob);
+    SelectObject(hdc, op);
+    let _ = DeleteObject(pen);
 }

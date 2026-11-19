@@ -14,6 +14,7 @@
 #![windows_subsystem = "windows"]
 
 mod cloak;
+mod overview;
 mod ui;
 mod win;
 
@@ -42,6 +43,8 @@ const WM_TRAY: u32 = WM_APP + 1;
 const HK_FOCUS: i32 = 1; // ids 1..=WORKSPACES
 const HK_MOVE: i32 = 101; // ids 101..
 const HK_PIN: i32 = 200;
+const HK_OVERVIEW: i32 = 300;
+const VK_BACKTICK: u32 = 0xC0; // VK_OEM_3, the key left of 1
 const OSD_TIMER: usize = 1;
 const OSD_MS: u32 = 900;
 const RUN_KEY: PCWSTR = w!("Software\\Microsoft\\Windows\\CurrentVersion\\Run");
@@ -66,6 +69,7 @@ struct App {
     osd_scale: f32,
     tray_icon: HICON,
     taskbar_created: u32,
+    overview: Option<overview::Overview>,
 }
 
 thread_local! {
@@ -259,6 +263,76 @@ impl App {
         self.show_osd(m, Some(if pinned { "Pinned: shown on every workspace".into() } else { "Unpinned".into() }));
     }
 
+    /// Move window `k` from (monitor, workspace) to another, possibly on another monitor.
+    fn move_window(&mut self, k: isize, from: (usize, usize), to: (usize, usize)) {
+        if from == to || from.0 >= self.mons.len() || to.0 >= self.mons.len() {
+            return;
+        }
+        let h = key_hwnd(k);
+        if unsafe { !IsWindow(h).as_bool() } {
+            return;
+        }
+        self.pinned.remove(&k);
+        let was_visible = from.1 == self.mons[from.0].active;
+        if !was_visible {
+            self.mons[from.0].hidden[from.1].retain(|x| *x != k);
+        }
+        if from.0 != to.0 {
+            self.reposition(h, from.0, to.0, was_visible);
+        }
+        let target_visible = to.1 == self.mons[to.0].active;
+        match (was_visible, target_visible) {
+            (true, false) => {
+                self.hide(h);
+                self.mons[to.0].hidden[to.1].insert(0, k);
+            }
+            (false, true) => {
+                self.show(k);
+            }
+            (false, false) => self.mons[to.0].hidden[to.1].insert(0, k),
+            (true, true) => {}
+        }
+        self.save();
+        self.update_tray();
+    }
+
+    /// Place a window on another monitor at the same relative spot, keeping its size
+    /// (clamped) and maximized/minimized state.
+    fn reposition(&mut self, h: HWND, from: usize, to: usize, visible: bool) {
+        // Windows hidden with SW_HIDE would reappear if we changed their placement.
+        if !visible && self.methods.get(&hwnd_key(h)) == Some(&Method::Hide) {
+            return;
+        }
+        let a = self.monitors[from].work;
+        let b = self.monitors[to].work;
+        // rcNormalPosition is in "workspace" coordinates: screen minus the primary work-area offset.
+        let off = self
+            .monitors
+            .iter()
+            .find(|m| m.rect.left == 0 && m.rect.top == 0)
+            .map(|m| (m.work.left - m.rect.left, m.work.top - m.rect.top))
+            .unwrap_or((0, 0));
+        unsafe {
+            let mut wp = WINDOWPLACEMENT { length: std::mem::size_of::<WINDOWPLACEMENT>() as u32, ..Default::default() };
+            if GetWindowPlacement(h, &mut wp).is_err() {
+                return;
+            }
+            let r = wp.rcNormalPosition;
+            let (sl, st) = (r.left + off.0, r.top + off.1);
+            let w = (r.right - r.left).min(b.right - b.left);
+            let ht = (r.bottom - r.top).min(b.bottom - b.top);
+            let nl = b.left + (sl - a.left).clamp(0, (b.right - b.left - w).max(0));
+            let nt = b.top + (st - a.top).clamp(0, (b.bottom - b.top - ht).max(0));
+            wp.rcNormalPosition = RECT { left: nl - off.0, top: nt - off.1, right: nl - off.0 + w, bottom: nt - off.1 + ht };
+            wp.showCmd = match SHOW_WINDOW_CMD(wp.showCmd as i32) {
+                SW_SHOWMAXIMIZED => SW_SHOWMAXIMIZED.0 as u32,
+                SW_SHOWMINIMIZED => SW_SHOWMINNOACTIVE.0 as u32,
+                _ => SW_SHOWNOACTIVATE.0 as u32,
+            };
+            let _ = SetWindowPlacement(h, &wp);
+        }
+    }
+
     /// Activation of a hidden window (taskbar click, app raising itself): go to its workspace.
     fn on_foreground(&mut self, h: HWND) {
         let k = hwnd_key(h);
@@ -419,6 +493,7 @@ fn set_autostart(on: bool) {
 
 enum MenuAction {
     Go(usize, usize, Option<isize>),
+    Overview,
     RevealAll,
     Autostart(bool),
     Exit,
@@ -451,6 +526,7 @@ fn show_menu(hwnd: HWND) {
             }
             e.push((String::new(), None, false)); // separator
         }
+        e.push(("Overview  (Alt+`)".into(), Some(MenuAction::Overview), false));
         e.push(("Show all windows (reset)".into(), Some(MenuAction::RevealAll), false));
         let auto = autostart_enabled();
         e.push(("Start with Windows".into(), Some(MenuAction::Autostart(!auto)), auto));
@@ -502,6 +578,9 @@ fn show_menu(hwnd: HWND) {
                     }
                 });
             }
+            Some(MenuAction::Overview) => {
+                with_app(|app| app.overview_open());
+            }
             Some(MenuAction::RevealAll) => {
                 with_app(|app| app.reveal_all());
             }
@@ -533,6 +612,11 @@ unsafe extern "system" fn main_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
             mask_alt();
             let id = wp.0 as i32;
             with_app(|app| {
+                if id == HK_OVERVIEW {
+                    app.overview_toggle();
+                    return;
+                }
+                app.overview_close();
                 if (HK_FOCUS..HK_FOCUS + WORKSPACES as i32).contains(&id) {
                     let m = app.current_mon();
                     app.switch_to(m, (id - HK_FOCUS) as usize, None);
@@ -553,8 +637,9 @@ unsafe extern "system" fn main_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
         }
         WM_DISPLAYCHANGE => {
             with_app(|app| {
+                app.overview_close();
                 app.reveal_all();
-                trace("app"); app.rebuild_monitors(); trace("monitors");
+                app.rebuild_monitors();
                 app.update_tray();
             });
             LRESULT(0)
@@ -655,7 +740,15 @@ fn main() {
             hCursor: LoadCursorW(None, IDC_ARROW).unwrap_or_default(),
             ..Default::default()
         };
-        RegisterClassW(&osd_class); trace("classes");
+        RegisterClassW(&osd_class);
+        let overview_class = WNDCLASSW {
+            lpfnWndProc: Some(overview::overview_proc),
+            hInstance: hinst,
+            lpszClassName: overview::CLASS,
+            hCursor: LoadCursorW(None, IDC_ARROW).unwrap_or_default(),
+            ..Default::default()
+        };
+        RegisterClassW(&overview_class); trace("classes");
 
         let main = CreateWindowExW(WINDOW_EX_STYLE(0), w!("MonodeskMain"), w!("monodesk"), WS_OVERLAPPED, 0, 0, 0, 0, None, None, hinst, None).unwrap();
         let osd = CreateWindowExW(
@@ -681,6 +774,7 @@ fn main() {
             osd_scale: 1.0,
             tray_icon: HICON::default(),
             taskbar_created: RegisterWindowMessageW(w!("TaskbarCreated")),
+            overview: None,
         };
         trace("app"); app.rebuild_monitors(); trace("monitors");
         app.add_tray(); trace("tray");
@@ -699,6 +793,9 @@ fn main() {
         }
         if RegisterHotKey(main, HK_PIN, MOD_ALT | MOD_SHIFT | MOD_NOREPEAT, 'P' as u32).is_err() {
             failed.push("Alt+Shift+P".into());
+        }
+        if RegisterHotKey(main, HK_OVERVIEW, MOD_ALT | MOD_NOREPEAT, VK_BACKTICK).is_err() {
+            failed.push("Alt+` (overview)".into());
         }
         if !failed.is_empty() {
             let msg = wide(&format!("These shortcuts are used by another app and won't work:\n{}", failed.join(", ")));
