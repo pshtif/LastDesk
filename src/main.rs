@@ -1141,7 +1141,26 @@ fn trace(s: &str) {
     }
 }
 
+/// Dark popup menus: uxtheme's SetPreferredAppMode (ordinal 135, ForceDark = 2) and
+/// FlushMenuThemes (136). Undocumented but stable since Windows 10 1903; skipped if missing.
+fn enable_dark_menus() {
+    use windows::core::PCSTR;
+    use windows::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
+    unsafe {
+        let Ok(ux) = LoadLibraryW(w!("uxtheme.dll")) else { return };
+        if let Some(f) = GetProcAddress(ux, PCSTR(135 as *const u8)) {
+            let set_mode: unsafe extern "system" fn(i32) -> i32 = std::mem::transmute(f);
+            set_mode(2);
+        }
+        if let Some(f) = GetProcAddress(ux, PCSTR(136 as *const u8)) {
+            let flush: unsafe extern "system" fn() = std::mem::transmute(f);
+            flush();
+        }
+    }
+}
+
 fn main() {
+    enable_dark_menus();
     unsafe {
         let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
         let _mutex = CreateMutexW(None, true, w!("Local\\lastdesk-single-instance"));
