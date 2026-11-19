@@ -24,6 +24,28 @@ workspaces and windows, "Show all windows (reset)", "Start with Windows" and "Ex
 Hidden windows are recorded in `%LOCALAPPDATA%\LastDesk\hidden.txt` and restored on exit,
 on panic, on display changes and on the next start, so a crash never leaves windows invisible.
 
+## Config
+
+`%APPDATA%\LastDesk\config.ini` (tray > "Edit config…", then "Reload config"):
+
+```ini
+workspaces = 4            # per monitor, 1-9
+
+[keys]
+switch = alt              # alt+1..N
+move = alt+shift          # alt+shift+1..N
+pin = alt+shift+p
+overview = alt+`
+
+[pinned_apps]             # shown on every workspace
+spotify
+
+[rules]                   # new windows of an app open on monitor, workspace (1 = leftmost)
+slack = 2, 3
+```
+
+Windows' own Win+Shift+Left/Right moves a window to another monitor and works with LastDesk.
+
 ## Remembered layout
 
 The workspace of every hidden or pinned window and each monitor's current workspace are kept

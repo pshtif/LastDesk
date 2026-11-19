@@ -14,6 +14,7 @@
 #![windows_subsystem = "windows"]
 
 mod cloak;
+mod config;
 mod layout;
 mod overview;
 mod ui;
@@ -39,14 +40,21 @@ use windows::Win32::UI::WindowsAndMessaging::*;
 use cloak::{Cloaker, Method};
 use win::{hwnd_key, key_hwnd, Monitor};
 
-const WORKSPACES: usize = 4;
+/// Workspaces per monitor (from config, 1..=9).
+static WS_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(4);
+
+fn workspaces() -> usize {
+    WS_COUNT.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 const WM_TRAY: u32 = WM_APP + 1;
-const HK_FOCUS: i32 = 1; // ids 1..=WORKSPACES
-const HK_MOVE: i32 = 101; // ids 101..
+const HK_FOCUS: i32 = 1; // ids 1..=9
+const HK_MOVE: i32 = 101; // ids 101..=109
 const HK_PIN: i32 = 200;
 const HK_OVERVIEW: i32 = 300;
-const VK_BACKTICK: u32 = 0xC0; // VK_OEM_3, the key left of 1
 const OSD_TIMER: usize = 1;
+const RULE_TIMER: usize = 2;
+const RULE_DELAY_MS: u32 = 250;
 const OSD_MS: u32 = 900;
 const RUN_KEY: PCWSTR = w!("Software\\Microsoft\\Windows\\CurrentVersion\\Run");
 const APP_NAME: PCWSTR = w!("LastDesk");
@@ -75,6 +83,13 @@ struct App {
     focus_mouse_mon: Option<String>,
     /// While set, `save()` doesn't touch layout.txt (exit/reveal that should be undone later).
     layout_frozen: bool,
+    config: config::Config,
+    /// Lower-case exe name per window (process lookups are not free).
+    exe_cache: RefCell<HashMap<isize, String>>,
+    /// Windows that existed already / were checked against app rules.
+    seen: HashSet<isize>,
+    /// New windows waiting for the rule timer (the shell needs a moment before it can cloak them).
+    pending: Vec<isize>,
 }
 
 thread_local! {
@@ -136,7 +151,7 @@ impl App {
         self.mons = self
             .monitors
             .iter()
-            .map(|m| MonState { name: m.name.clone(), active: 0, hidden: vec![Vec::new(); WORKSPACES] })
+            .map(|m| MonState { name: m.name.clone(), active: 0, hidden: vec![Vec::new(); workspaces()] })
             .collect();
     }
 
@@ -163,11 +178,28 @@ impl App {
         win::monitor_name_at_cursor().and_then(|n| self.mon_index(&n)).unwrap_or(0)
     }
 
+    fn exe(&self, h: HWND) -> String {
+        let k = hwnd_key(h);
+        if let Some(e) = self.exe_cache.borrow().get(&k) {
+            return e.clone();
+        }
+        let e = overview::app_name(h).to_lowercase();
+        self.exe_cache.borrow_mut().insert(k, e.clone());
+        e
+    }
+
+    fn is_pinned_app(&self, h: HWND) -> bool {
+        !self.config.pinned_apps.is_empty() && {
+            let e = self.exe(h);
+            self.config.pinned_apps.iter().any(|a| *a == e)
+        }
+    }
+
     fn visible_on(&self, m: usize) -> Vec<HWND> {
         let name = &self.mons[m].name;
         win::visible_windows()
             .into_iter()
-            .filter(|h| !self.pinned.contains(&hwnd_key(*h)))
+            .filter(|h| !self.pinned.contains(&hwnd_key(*h)) && !self.is_pinned_app(*h))
             .filter(|h| win::monitor_name_of_window(*h).as_deref() == Some(name.as_str()))
             .collect()
     }
@@ -194,6 +226,108 @@ impl App {
             }
         }
         self.methods.retain(|k, _| unsafe { IsWindow(key_hwnd(*k)).as_bool() });
+        self.seen.retain(|k| unsafe { IsWindow(key_hwnd(*k)).as_bool() });
+        self.exe_cache.borrow_mut().retain(|k, _| unsafe { IsWindow(key_hwnd(*k)).as_bool() });
+    }
+
+    /// A window was shown: queue it for the rule check if it's new.
+    fn on_show(&mut self, h: HWND) {
+        let k = hwnd_key(h);
+        if self.config.rules.is_empty() || self.seen.contains(&k) || !win::is_manageable(h, false) {
+            return;
+        }
+        self.seen.insert(k);
+        self.pending.push(k);
+        unsafe {
+            SetTimer(self.main, RULE_TIMER, RULE_DELAY_MS, None);
+        }
+    }
+
+    fn run_pending_rules(&mut self) {
+        for k in std::mem::take(&mut self.pending) {
+            let h = key_hwnd(k);
+            if win::is_manageable(h, false) {
+                self.apply_rule(h);
+            }
+        }
+    }
+
+    /// Send window h to the workspace its app rule names.
+    fn apply_rule(&mut self, h: HWND) {
+        let k = hwnd_key(h);
+        let exe = self.exe(h);
+        let Some(rule) = self.config.rules.iter().find(|r| r.app == exe) else { return };
+        let to = (rule.monitor.min(self.mons.len().saturating_sub(1)), rule.workspace.min(workspaces() - 1));
+        let Some(cur) = win::monitor_name_of_window(h).and_then(|n| self.mon_index(&n)) else { return };
+        let from = (cur, self.mons[cur].active);
+        if from == to {
+            return;
+        }
+        self.move_window(k, from, to);
+        if to.1 != self.mons[to.0].active {
+            let labels = monitor_labels(self.mons.len());
+            self.show_osd(to.0, Some(format!("{} → {}, workspace {}", overview::app_name(h), labels[to.0], to.1 + 1)));
+        }
+    }
+
+    fn unregister_hotkeys(&self) {
+        unsafe {
+            for i in 0..9 {
+                let _ = UnregisterHotKey(self.main, HK_FOCUS + i);
+                let _ = UnregisterHotKey(self.main, HK_MOVE + i);
+            }
+            let _ = UnregisterHotKey(self.main, HK_PIN);
+            let _ = UnregisterHotKey(self.main, HK_OVERVIEW);
+        }
+    }
+
+    /// Register shortcuts from the config; returns the ones another app already owns.
+    fn register_hotkeys(&self) -> Vec<String> {
+        let c = &self.config;
+        let mut failed = Vec::new();
+        unsafe {
+            for i in 0..workspaces() as u32 {
+                let vk = 0x31 + i; // '1'..
+                if RegisterHotKey(self.main, HK_FOCUS + i as i32, c.switch | MOD_NOREPEAT, vk).is_err() {
+                    failed.push(format!("{}+{}", c.switch_text, i + 1));
+                }
+                if RegisterHotKey(self.main, HK_MOVE + i as i32, c.move_ | MOD_NOREPEAT, vk).is_err() {
+                    failed.push(format!("{}+{}", c.move_text, i + 1));
+                }
+            }
+            if RegisterHotKey(self.main, HK_PIN, c.pin.mods | MOD_NOREPEAT, c.pin.vk).is_err() {
+                failed.push(format!("{} (pin)", c.pin.text));
+            }
+            if RegisterHotKey(self.main, HK_OVERVIEW, c.overview.mods | MOD_NOREPEAT, c.overview.vk).is_err() {
+                failed.push(format!("{} (overview)", c.overview.text));
+            }
+        }
+        failed
+    }
+
+    /// Re-read config.ini and apply it. Returns problems to report.
+    fn reload_config(&mut self) -> Vec<String> {
+        let new = config::load();
+        let mut problems: Vec<String> = new.errors.iter().map(|e| format!("Not understood, ignored: {e}")).collect();
+        self.unregister_hotkeys();
+        if new.workspaces != workspaces() {
+            // Changing the count: show everything, then rebuild and re-apply the layout.
+            let saved = layout::load();
+            self.layout_frozen = true;
+            self.reveal_all();
+            WS_COUNT.store(new.workspaces, std::sync::atomic::Ordering::Relaxed);
+            self.rebuild_monitors();
+            self.layout_frozen = false;
+            self.config = new;
+            self.apply_layout(saved);
+        } else {
+            self.config = new;
+        }
+        let failed = self.register_hotkeys();
+        if !failed.is_empty() {
+            problems.push(format!("These shortcuts are used by another app and won't work: {}", failed.join(", ")));
+        }
+        problems
     }
 
     /// Give focus to something on monitor `m` after its windows went away.
@@ -403,7 +537,7 @@ impl App {
     fn apply_layout(&mut self, l: layout::Layout) {
         for (name, a) in &l.active {
             if let Some(m) = self.mon_index(name) {
-                if *a < WORKSPACES {
+                if *a < workspaces() {
                     self.mons[m].active = *a;
                 }
             }
@@ -431,7 +565,7 @@ impl App {
                 None => {
                     self.pinned.insert(k);
                 }
-                Some(w) if w < WORKSPACES && w != self.mons[m].active => {
+                Some(w) if w < workspaces() && w != self.mons[m].active => {
                     self.hide(h);
                     self.mons[m].hidden[w].push(k);
                 }
@@ -482,7 +616,7 @@ impl App {
     }
 
     fn counts(&self, m: usize) -> Vec<usize> {
-        (0..WORKSPACES)
+        (0..workspaces())
             .map(|w| if w == self.mons[m].active { self.visible_on(m).len() } else { self.mons[m].hidden[w].len() })
             .collect()
     }
@@ -504,7 +638,7 @@ impl App {
             let hm = windows::Win32::Graphics::Gdi::MonitorFromPoint(pt, MONITOR_DEFAULTTONEAREST);
             let _ = GetDpiForMonitor(hm, MDT_EFFECTIVE_DPI, &mut dpi_x, &mut dpi_y);
             self.osd_scale = dpi_x as f32 / 96.0;
-            let l = ui::osd_layout(WORKSPACES, self.osd_scale);
+            let l = ui::osd_layout(workspaces(), self.osd_scale);
             let x = (mon.work.left + mon.work.right - l.w) / 2;
             let y = mon.work.top + (mon.work.bottom - mon.work.top) * 2 / 3 - l.h / 2;
             let rgn = CreateRoundRectRgn(0, 0, l.w + 1, l.h + 1, (14.0 * self.osd_scale) as i32, (14.0 * self.osd_scale) as i32);
@@ -591,8 +725,17 @@ enum MenuAction {
     Go(usize, usize, Option<isize>),
     Overview,
     RevealAll,
+    EditConfig,
+    ReloadConfig,
     Autostart(bool),
     Exit,
+}
+
+fn message(text: &str, warn: bool) {
+    let w = wide(text);
+    unsafe {
+        MessageBoxW(None, PCWSTR(w.as_ptr()), w!("LastDesk"), MB_OK | if warn { MB_ICONWARNING } else { MB_ICONINFORMATION });
+    }
 }
 
 fn show_menu(hwnd: HWND) {
@@ -604,7 +747,7 @@ fn show_menu(hwnd: HWND) {
         for m in 0..app.mons.len() {
             e.push((labels[m].to_string(), None, false));
             let visible = app.visible_on(m);
-            for w in 0..WORKSPACES {
+            for w in 0..workspaces() {
                 let wins: Vec<isize> = if w == app.mons[m].active {
                     visible.iter().map(|h| hwnd_key(*h)).collect()
                 } else {
@@ -624,6 +767,8 @@ fn show_menu(hwnd: HWND) {
         }
         e.push(("Overview  (Alt+`)".into(), Some(MenuAction::Overview), false));
         e.push(("Show all windows (reset)".into(), Some(MenuAction::RevealAll), false));
+        e.push(("Edit config…".into(), Some(MenuAction::EditConfig), false));
+        e.push(("Reload config".into(), Some(MenuAction::ReloadConfig), false));
         let auto = autostart_enabled();
         e.push(("Start with Windows".into(), Some(MenuAction::Autostart(!auto)), auto));
         e.push(("Exit (shows all windows)".into(), Some(MenuAction::Exit), false));
@@ -680,6 +825,23 @@ fn show_menu(hwnd: HWND) {
             Some(MenuAction::RevealAll) => {
                 with_app(|app| app.reveal_all());
             }
+            Some(MenuAction::EditConfig) => {
+                let p = wide(&config::path().display().to_string());
+                ShellExecuteW(None, w!("open"), w!("notepad.exe"), PCWSTR(p.as_ptr()), None, SW_SHOWNORMAL);
+            }
+            Some(MenuAction::ReloadConfig) => {
+                // Report outside the borrow: MessageBox pumps messages.
+                if let Some(problems) = with_app(|app| app.reload_config()) {
+                    if problems.is_empty() {
+                        with_app(|app| {
+                            let m = app.current_mon();
+                            app.show_osd(m, Some("Config reloaded".into()));
+                        });
+                    } else {
+                        message(&problems.join("\n"), true);
+                    }
+                }
+            }
             Some(MenuAction::Autostart(on)) => set_autostart(*on),
             Some(MenuAction::Exit) => {
                 let _ = DestroyWindow(hwnd);
@@ -713,10 +875,10 @@ unsafe extern "system" fn main_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
                     return;
                 }
                 app.overview_close();
-                if (HK_FOCUS..HK_FOCUS + WORKSPACES as i32).contains(&id) {
+                if (HK_FOCUS..HK_FOCUS + workspaces() as i32).contains(&id) {
                     let m = app.current_mon();
                     app.switch_to(m, (id - HK_FOCUS) as usize, None);
-                } else if (HK_MOVE..HK_MOVE + WORKSPACES as i32).contains(&id) {
+                } else if (HK_MOVE..HK_MOVE + workspaces() as i32).contains(&id) {
                     app.move_focused((id - HK_MOVE) as usize);
                 } else if id == HK_PIN {
                     app.toggle_pin();
@@ -743,6 +905,11 @@ unsafe extern "system" fn main_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
                 app.layout_frozen = false;
                 app.apply_layout(saved);
             });
+            LRESULT(0)
+        }
+        WM_TIMER if wp.0 == RULE_TIMER => {
+            let _ = KillTimer(hwnd, RULE_TIMER);
+            with_app(|app| app.run_pending_rules());
             LRESULT(0)
         }
         WM_QUERYENDSESSION => LRESULT(1),
@@ -794,10 +961,15 @@ unsafe extern "system" fn osd_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM)
     }
 }
 
-unsafe extern "system" fn win_event(_: HWINEVENTHOOK, event: u32, hwnd: HWND, id_object: i32, _: i32, _: u32, _: u32) {
-    if event == EVENT_SYSTEM_FOREGROUND && id_object == OBJID_WINDOW.0 && !hwnd.is_invalid() {
+unsafe extern "system" fn win_event(_: HWINEVENTHOOK, event: u32, hwnd: HWND, id_object: i32, id_child: i32, _: u32, _: u32) {
+    if id_object != OBJID_WINDOW.0 || hwnd.is_invalid() {
+        return;
+    }
+    if event == EVENT_SYSTEM_FOREGROUND {
         let root = GetAncestor(hwnd, GA_ROOT);
         with_app(|app| app.on_foreground(if root.is_invalid() { hwnd } else { root }));
+    } else if event == EVENT_OBJECT_SHOW && id_child == CHILDID_SELF as i32 {
+        with_app(|app| app.on_show(hwnd));
     }
 }
 
@@ -868,6 +1040,8 @@ fn main() {
         .unwrap();
         trace("windows"); let _ = SetLayeredWindowAttributes(osd, COLORREF(0), 240, LWA_ALPHA);
 
+        let cfg = config::load();
+        WS_COUNT.store(cfg.workspaces, std::sync::atomic::Ordering::Relaxed);
         let mut app = App {
             main,
             osd,
@@ -876,43 +1050,38 @@ fn main() {
             mons: Vec::new(),
             methods: HashMap::new(),
             pinned: HashSet::new(),
-            osd_model: ui::OsdModel { label: String::new(), active: 0, counts: vec![0; WORKSPACES] },
+            osd_model: ui::OsdModel { label: String::new(), active: 0, counts: vec![0; workspaces()] },
             osd_scale: 1.0,
             tray_icon: HICON::default(),
             taskbar_created: RegisterWindowMessageW(w!("TaskbarCreated")),
             overview: None,
             focus_mouse_mon: None,
             layout_frozen: false,
+            config: cfg,
+            exe_cache: RefCell::new(HashMap::new()),
+            seen: HashSet::new(),
+            pending: Vec::new(),
         };
         trace("app"); app.rebuild_monitors(); trace("monitors");
         app.add_tray(); trace("tray");
         app.apply_layout(layout::load());
         trace("layout");
-        APP.with(|a| *a.borrow_mut() = Some(app));
-
-        // Hotkeys.
-        let mut failed = Vec::new();
-        for i in 0..WORKSPACES as u32 {
-            let vk = 0x31 + i; // '1'..
-            if RegisterHotKey(main, HK_FOCUS + i as i32, MOD_ALT | MOD_NOREPEAT, vk).is_err() {
-                failed.push(format!("Alt+{}", i + 1));
-            }
-            if RegisterHotKey(main, HK_MOVE + i as i32, MOD_ALT | MOD_SHIFT | MOD_NOREPEAT, vk).is_err() {
-                failed.push(format!("Alt+Shift+{}", i + 1));
-            }
-        }
-        if RegisterHotKey(main, HK_PIN, MOD_ALT | MOD_SHIFT | MOD_NOREPEAT, 'P' as u32).is_err() {
-            failed.push("Alt+Shift+P".into());
-        }
-        if RegisterHotKey(main, HK_OVERVIEW, MOD_ALT | MOD_NOREPEAT, VK_BACKTICK).is_err() {
-            failed.push("Alt+` (overview)".into());
-        }
+        // Rules only apply to windows opened from now on.
+        app.seen = win::visible_windows().into_iter().map(hwnd_key).collect();
+        app.seen.extend(app.mons.iter().flat_map(|m| m.hidden.iter().flatten().copied()));
+        let mut problems: Vec<String> = app.config.errors.iter().map(|e| format!("Config not understood, ignored: {e}")).collect();
+        let failed = app.register_hotkeys();
         if !failed.is_empty() {
-            let msg = wide(&format!("These shortcuts are used by another app and won't work:\n{}", failed.join(", ")));
-            MessageBoxW(None, PCWSTR(msg.as_ptr()), w!("LastDesk"), MB_OK | MB_ICONWARNING);
+            problems.push(format!("These shortcuts are used by another app and won't work:\n{}", failed.join(", ")));
+        }
+        APP.with(|a| *a.borrow_mut() = Some(app));
+        if !problems.is_empty() {
+            message(&problems.join("\n"), true);
         }
 
-        trace("hotkeys"); let _hook = SetWinEventHook(EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_FOREGROUND, None, Some(win_event), 0, 0, WINEVENT_OUTOFCONTEXT);
+        trace("hotkeys");
+        let _hook = SetWinEventHook(EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_FOREGROUND, None, Some(win_event), 0, 0, WINEVENT_OUTOFCONTEXT);
+        let _hook_show = SetWinEventHook(EVENT_OBJECT_SHOW, EVENT_OBJECT_SHOW, None, Some(win_event), 0, 0, WINEVENT_OUTOFCONTEXT);
 
         trace("loop"); let mut msg = MSG::default();
         while GetMessageW(&mut msg, None, 0, 0).as_bool() {
