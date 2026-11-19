@@ -31,6 +31,7 @@ pub enum Hit {
     Start,
     Workspace(usize),
     Window(isize),
+    Tray,
     Battery,
     Clock,
     None,
@@ -52,12 +53,15 @@ pub struct Bar {
     pub start: RECT,
     pub cells: Vec<RECT>,
     pub buttons: Vec<Button>,
+    pub tray: RECT,
     pub battery: RECT,
     pub clock: RECT,
     /// Button order: first-seen, so buttons don't jump around with z-order.
     pub order: Vec<isize>,
     pub hover: Hit,
     pub tracking: bool,
+    /// Registered as an app bar (normal mode) vs sitting in the hidden taskbar's strip.
+    pub registered: bool,
 }
 
 fn contains(r: &RECT, x: i32, y: i32) -> bool {
@@ -98,6 +102,9 @@ impl Bar {
         if let Some(b) = self.buttons.iter().find(|b| contains(&b.rect, x, y)) {
             return Hit::Window(b.hwnd);
         }
+        if contains(&self.tray, x, y) {
+            return Hit::Tray;
+        }
         if contains(&self.battery, x, y) {
             return Hit::Battery;
         }
@@ -108,12 +115,38 @@ impl Bar {
     }
 
     fn height(&self) -> i32 {
-        (BASE_HEIGHT * self.scale).round() as i32
+        if self.registered || self.rect.bottom <= self.rect.top {
+            (BASE_HEIGHT * self.scale).round() as i32
+        } else {
+            self.rect.bottom - self.rect.top
+        }
     }
 
-    /// Reserve the strip at the top of the monitor and move the bar there.
-    fn place(&mut self, monitor: RECT) {
-        let h = self.height();
+    /// Sit in strip (the hidden taskbar's reserved area) or, without one, reserve our own
+    /// strip at the top of the monitor as an app bar.
+    fn place(&mut self, monitor: RECT, strip: Option<RECT>) {
+        if let Some(s) = strip {
+            if self.registered {
+                let mut abd = appbar_data(self.hwnd, RECT::default());
+                unsafe {
+                    SHAppBarMessage(ABM_REMOVE, &mut abd);
+                }
+                self.registered = false;
+            }
+            self.rect = s;
+            unsafe {
+                let _ = SetWindowPos(self.hwnd, HWND_TOPMOST, s.left, s.top, s.right - s.left, s.bottom - s.top, SWP_NOACTIVATE | SWP_SHOWWINDOW);
+            }
+            return;
+        }
+        if !self.registered {
+            let mut abd = appbar_data(self.hwnd, RECT::default());
+            unsafe {
+                SHAppBarMessage(ABM_NEW, &mut abd);
+            }
+            self.registered = true;
+        }
+        let h = (BASE_HEIGHT * self.scale).round() as i32;
         let mut abd = appbar_data(self.hwnd, RECT { left: monitor.left, top: monitor.top, right: monitor.right, bottom: monitor.top + h });
         unsafe {
             SHAppBarMessage(ABM_QUERYPOS, &mut abd);
@@ -160,13 +193,15 @@ impl App {
                 start: RECT::default(),
                 cells: Vec::new(),
                 buttons: Vec::new(),
+                tray: RECT::default(),
                 battery: RECT::default(),
                 clock: RECT::default(),
                 order: Vec::new(),
                 hover: Hit::None,
                 tracking: false,
+                registered: true,
             };
-            bar.place(r);
+            bar.place(r, None);
             self.bars.push(bar);
         }
         self.refresh_work_areas();
@@ -180,7 +215,9 @@ impl App {
         for b in self.bars.drain(..) {
             let mut abd = appbar_data(b.hwnd, RECT::default());
             unsafe {
-                SHAppBarMessage(ABM_REMOVE, &mut abd);
+                if b.registered {
+                    SHAppBarMessage(ABM_REMOVE, &mut abd);
+                }
                 let _ = DestroyWindow(b.hwnd);
             }
         }
@@ -198,12 +235,20 @@ impl App {
     }
 
     pub fn bar_reposition(&mut self, hwnd: HWND) {
-        let monitors = self.monitors.clone();
-        if let Some(b) = self.bars.iter_mut().find(|b| b.hwnd == hwnd) {
-            if let Some(mon) = monitors.get(b.mon) {
-                b.place(mon.rect);
+        let hidden = self.taskbar_hidden;
+        let Some(i) = self.bars.iter().position(|b| b.hwnd == hwnd) else { return };
+        let Some(mon) = self.monitors.get(self.bars[i].mon).map(|m| m.rect) else { return };
+        // Work area without our own app bar, to see whether the taskbar reserves a strip here.
+        if self.bars[i].registered && hidden {
+            let mut abd = appbar_data(hwnd, RECT::default());
+            unsafe {
+                SHAppBarMessage(ABM_REMOVE, &mut abd);
             }
+            self.bars[i].registered = false;
         }
+        let work = win::monitors().into_iter().find(|m| m.rect == mon).map(|m| m.work).unwrap_or(mon);
+        let strip = if hidden { crate::taskbar::reserved_strip(mon, work) } else { None };
+        self.bars[i].place(mon, strip);
         self.refresh_work_areas();
         self.bars_refresh();
     }
@@ -223,6 +268,7 @@ impl App {
         }
         let all = win::visible_windows();
         let n = workspaces();
+        let tray_on = self.taskbar_hidden;
         for bi in 0..self.bars.len() {
             let m = self.bars[bi].mon;
             if m >= self.mons.len() {
@@ -259,8 +305,9 @@ impl App {
             let batt_w = s(64.0);
             b.clock = RECT { left: w - pad - right_w, top: s(3.0), right: w - pad, bottom: h - s(3.0) };
             b.battery = RECT { left: b.clock.left - batt_w, top: s(3.0), right: b.clock.left - s(4.0), bottom: h - s(3.0) };
+            b.tray = if tray_on { RECT { left: b.battery.left - s(32.0), top: s(3.0), right: b.battery.left - s(4.0), bottom: h - s(3.0) } } else { RECT { left: b.battery.left, top: 0, right: b.battery.left, bottom: 0 } };
             let start_x = x + s(10.0);
-            let avail = (b.battery.left - s(10.0) - start_x).max(0);
+            let avail = (b.tray.left - s(10.0) - start_x).max(0);
             let count = b.order.len() as i32;
             let bw = if count == 0 { 0 } else { s(220.0).min((avail - s(4.0) * (count - 1)) / count).max(s(34.0)) };
             let mut bx = start_x;
@@ -353,6 +400,15 @@ impl App {
                 }
             }
 
+            // Tray: ^ brings up the Windows taskbar with its notification area.
+            if b.tray.right > b.tray.left {
+                if b.hover == Hit::Tray {
+                    ui::fill_round(mem, b.tray, s(6.0), hover_bg);
+                }
+                let mut r = b.tray;
+                ui::draw_text(mem, "^", &mut r, ui::TEXT, f_num);
+            }
+
             // Battery.
             let mut ps = SYSTEM_POWER_STATUS::default();
             if GetSystemPowerStatus(&mut ps).is_ok() && ps.BatteryLifePercent <= 100 {
@@ -441,6 +497,10 @@ impl App {
                     let _ = SetForegroundWindow(h);
                 }
             },
+            Hit::Tray if !middle => {
+                crate::taskbar::peek();
+                return Some(vec![VK_LWIN, VIRTUAL_KEY('B' as u16)]);
+            }
             Hit::Battery if !middle => return Some(vec![VK_LWIN, VIRTUAL_KEY('A' as u16)]),
             Hit::Clock if !middle => return Some(vec![VK_LWIN, VIRTUAL_KEY('N' as u16)]),
             _ => {}

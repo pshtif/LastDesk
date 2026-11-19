@@ -18,6 +18,7 @@ mod cloak;
 mod config;
 mod layout;
 mod overview;
+mod taskbar;
 mod ui;
 mod win;
 
@@ -58,6 +59,7 @@ const RULE_TIMER: usize = 2;
 const RULE_DELAY_MS: u32 = 250;
 const CLOCK_TIMER: usize = 3;
 const BAR_TIMER: usize = 4;
+const PLACE_TIMER: usize = 5;
 const OSD_MS: u32 = 900;
 const RUN_KEY: PCWSTR = w!("Software\\Microsoft\\Windows\\CurrentVersion\\Run");
 const APP_NAME: PCWSTR = w!("LastDesk");
@@ -94,6 +96,8 @@ struct App {
     /// New windows waiting for the rule timer (the shell needs a moment before it can cloak them).
     pending: Vec<isize>,
     bars: Vec<bar::Bar>,
+    /// LastDesk is keeping the Windows taskbar hidden (its bar sits in the taskbar's strip).
+    taskbar_hidden: bool,
 }
 
 thread_local! {
@@ -274,6 +278,49 @@ impl App {
         }
     }
 
+    /// Hide or restore the Windows taskbar to match the config.
+    fn taskbar_apply(&mut self) {
+        let want = self.config.bar && self.config.hide_taskbar && !self.bars.is_empty();
+        if want && !self.taskbar_hidden {
+            taskbar::hide();
+            self.taskbar_hidden = true;
+        } else if !want && self.taskbar_hidden {
+            taskbar::restore();
+            self.taskbar_hidden = false;
+        }
+        // The freed (or re-taken) strip changes where the bars belong: re-place now and
+        // once more shortly, in case Explorer applies the change late.
+        self.bars_place_all();
+        unsafe {
+            SetTimer(self.main, PLACE_TIMER, 400, None);
+        }
+    }
+
+    fn bars_place_all(&mut self) {
+        let hwnds: Vec<HWND> = self.bars.iter().map(|b| b.hwnd).collect();
+        for h in hwnds {
+            self.bar_reposition(h);
+        }
+        self.taskbar_enforce();
+    }
+
+    fn taskbar_restore(&mut self) {
+        if self.taskbar_hidden {
+            taskbar::restore();
+            self.taskbar_hidden = false;
+        }
+    }
+
+    /// Explorer shows its taskbar again now and then: hide it unless the shell UI is in use.
+    fn taskbar_enforce(&self) {
+        if self.taskbar_hidden {
+            let fg = unsafe { GetForegroundWindow() };
+            if !taskbar::is_shell_ui(fg) {
+                taskbar::hide_all();
+            }
+        }
+    }
+
     /// Coalesce bursts of window events into one bar refresh.
     fn schedule_bar_refresh(&self) {
         if !self.bars.is_empty() {
@@ -339,8 +386,10 @@ impl App {
         if self.config.bar && self.bars.is_empty() {
             self.bars_create();
         } else if !self.config.bar && !self.bars.is_empty() {
+            self.taskbar_restore();
             self.bars_destroy();
         }
+        self.taskbar_apply();
         let failed = self.register_hotkeys();
         if !failed.is_empty() {
             problems.push(format!("These shortcuts are used by another app and won't work: {}", failed.join(", ")));
@@ -503,6 +552,7 @@ impl App {
 
     /// Activation of a hidden window (taskbar click, app raising itself): go to its workspace.
     fn on_foreground(&mut self, h: HWND) {
+        self.taskbar_enforce();
         self.focus_mouse_mon = win::monitor_name_at_cursor();
         let k = hwnd_key(h);
         let found = self.mons.iter().enumerate().find_map(|(mi, ms)| {
@@ -924,16 +974,29 @@ unsafe extern "system" fn main_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
                 app.layout_frozen = false;
                 app.apply_layout(saved);
                 app.bars_create();
+                app.taskbar_enforce();
             });
             LRESULT(0)
         }
         WM_TIMER if wp.0 == BAR_TIMER => {
             let _ = KillTimer(hwnd, BAR_TIMER);
-            with_app(|app| app.bars_refresh());
+            with_app(|app| {
+                app.bars_refresh();
+                app.taskbar_enforce();
+            });
+            LRESULT(0)
+        }
+        WM_TIMER if wp.0 == PLACE_TIMER => {
+            let _ = KillTimer(hwnd, PLACE_TIMER);
+            with_app(|app| {
+                app.bars_place_all();
+                app.taskbar_enforce();
+            });
             LRESULT(0)
         }
         WM_TIMER if wp.0 == CLOCK_TIMER => {
             with_app(|app| {
+                app.taskbar_enforce();
                 for b in &app.bars {
                     let _ = InvalidateRect(b.hwnd, None, false);
                 }
@@ -949,6 +1012,7 @@ unsafe extern "system" fn main_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
         WM_ENDSESSION => {
             // Logging off / shutting down: keep the layout for next time.
             with_app(|app| {
+                app.taskbar_restore();
                 app.layout_frozen = true;
                 app.reveal_all();
             });
@@ -956,6 +1020,7 @@ unsafe extern "system" fn main_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
         }
         WM_DESTROY => {
             with_app(|app| {
+                app.taskbar_restore();
                 app.bars_destroy();
                 app.layout_frozen = true;
                 app.reveal_all();
@@ -968,7 +1033,14 @@ unsafe extern "system" fn main_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
         _ => {
             let tc = with_app(|a| a.taskbar_created).unwrap_or(0);
             if tc != 0 && msg == tc {
-                with_app(|app| app.add_tray());
+                with_app(|app| {
+                    app.add_tray();
+                    // Explorer restarted: its taskbar is back, hide it again.
+                    if app.taskbar_hidden {
+                        taskbar::hide_all();
+                        app.bars_place_all();
+                    }
+                });
                 return LRESULT(0);
             }
             DefWindowProcW(hwnd, msg, wp, lp)
@@ -1033,7 +1105,9 @@ fn main() {
         }
         let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
         trace("com"); let cloaker = Cloaker::new(); trace("cloaker");
-        recover_from_file(&cloaker); trace("recovered");
+        recover_from_file(&cloaker);
+        taskbar::recover();
+        trace("recovered");
 
         // On panic: restore every hidden window before the process dies.
         std::panic::set_hook(Box::new(|info| {
@@ -1042,6 +1116,7 @@ fn main() {
                 let _ = std::fs::create_dir_all(dir);
             }
             let _ = std::fs::write(&log, format!("{info}\n{}", std::backtrace::Backtrace::force_capture()));
+            taskbar::restore_if_hidden();
             let c = Cloaker::new();
             for (k, m) in PANIC_LIST.lock().unwrap_or_else(|e| e.into_inner()).iter() {
                 c.show(key_hwnd(*k), *m);
@@ -1112,12 +1187,14 @@ fn main() {
             seen: HashSet::new(),
             pending: Vec::new(),
             bars: Vec::new(),
+            taskbar_hidden: false,
         };
         trace("app"); app.rebuild_monitors(); trace("monitors");
         app.add_tray(); trace("tray");
         app.apply_layout(layout::load());
         trace("layout");
         app.bars_create();
+        app.taskbar_apply();
         // Rules only apply to windows opened from now on.
         app.seen = win::visible_windows().into_iter().map(hwnd_key).collect();
         app.seen.extend(app.mons.iter().flat_map(|m| m.hidden.iter().flatten().copied()));

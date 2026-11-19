@@ -37,6 +37,10 @@ move = alt+shift          # alt+shift+1..N
 pin = alt+shift+p
 overview = alt+`
 
+[bar]
+enabled = true            # LastDesk bar on every monitor
+hide_taskbar = false      # hide the Windows taskbar; the bar takes its place, ^ shows tray icons
+
 [pinned_apps]             # shown on every workspace
 spotify
 
