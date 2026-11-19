@@ -1,42 +1,10 @@
-//! `%APPDATA%\LastDesk\config.ini`: workspace count, shortcuts, pinned apps and app rules.
-//! A commented default is written on first start. Tray > "Reload config" applies changes.
+//! `%APPDATA%\LastDesk\config.ini`: workspace count, shortcuts, bar options, pinned apps and
+//! app rules. A commented file is written on first start; the Settings window rewrites it
+//! with `render`. Tray > "Reload config" applies hand edits.
 
 use std::path::PathBuf;
 
 use windows::Win32::UI::Input::KeyboardAndMouse::{HOT_KEY_MODIFIERS, MOD_ALT, MOD_CONTROL, MOD_SHIFT, MOD_WIN};
-
-pub const DEFAULT: &str = r#"# LastDesk configuration. Edit, save, then tray > "Reload config".
-# Lines starting with # are comments.
-
-# Workspaces per monitor (1-9).
-workspaces = 4
-
-[keys]
-# Switch workspace:            <switch>+1..N
-switch = alt
-# Move focused window there:   <move>+1..N
-move = alt+shift
-pin = alt+shift+p
-overview = alt+`
-# Tip: Windows' own Win+Shift+Left/Right moves a window to the other monitor and works with LastDesk.
-
-[bar]
-# LastDesk's own taskbar on top of every monitor.
-enabled = true
-# Hide the Windows taskbar while the LastDesk bar is on (its tray icons: the ^ button).
-hide_taskbar = false
-# Show apps' tray icons in the LastDesk bar.
-tray = true
-
-[pinned_apps]
-# Apps shown on every workspace. One exe name per line (without .exe), e.g.:
-# spotify
-
-[rules]
-# New windows of an app open on a given monitor and workspace (monitor 1 = leftmost):
-# app = monitor, workspace
-# slack = 2, 3
-"#;
 
 #[derive(Clone)]
 pub struct Hotkey {
@@ -45,12 +13,27 @@ pub struct Hotkey {
     pub text: String,
 }
 
+#[derive(Clone)]
 pub struct Rule {
     pub app: String,
     pub monitor: usize,
     pub workspace: usize,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Edge {
+    Top,
+    Bottom,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Align {
+    Left,
+    Center,
+    Right,
+}
+
+#[derive(Clone)]
 pub struct Config {
     pub workspaces: usize,
     pub switch: HOT_KEY_MODIFIERS,
@@ -62,6 +45,9 @@ pub struct Config {
     pub pinned_apps: Vec<String>,
     pub rules: Vec<Rule>,
     pub bar: bool,
+    pub bar_edge: Edge,
+    pub icons_only: bool,
+    pub align: Align,
     pub hide_taskbar: bool,
     pub tray: bool,
     pub errors: Vec<String>,
@@ -72,7 +58,7 @@ pub fn path() -> PathBuf {
     base.join("LastDesk").join("config.ini")
 }
 
-fn parse_mods(s: &str) -> Option<HOT_KEY_MODIFIERS> {
+pub fn parse_mods(s: &str) -> Option<HOT_KEY_MODIFIERS> {
     let mut m = HOT_KEY_MODIFIERS(0);
     for t in s.split('+').map(|t| t.trim().to_lowercase()).filter(|t| !t.is_empty()) {
         m |= match t.as_str() {
@@ -118,9 +104,13 @@ fn parse_key(s: &str) -> Option<u32> {
     Some(vk)
 }
 
-fn parse_hotkey(s: &str) -> Option<Hotkey> {
+pub fn parse_hotkey(s: &str) -> Option<Hotkey> {
     let (mods, key) = s.rsplit_once('+')?;
     Some(Hotkey { mods: parse_mods(mods)?, vk: parse_key(key)?, text: s.trim().to_string() })
+}
+
+pub fn default_text() -> String {
+    render(&parse(""))
 }
 
 pub fn load() -> Config {
@@ -129,10 +119,26 @@ pub fn load() -> Config {
         if let Some(dir) = p.parent() {
             let _ = std::fs::create_dir_all(dir);
         }
-        let _ = std::fs::write(&p, DEFAULT);
+        let _ = std::fs::write(&p, default_text());
     }
-    let text = std::fs::read_to_string(&p).unwrap_or_else(|_| DEFAULT.to_string());
+    let text = std::fs::read_to_string(&p).unwrap_or_else(|_| default_text());
     parse(&text)
+}
+
+pub fn save(c: &Config) -> std::io::Result<()> {
+    let p = path();
+    if let Some(dir) = p.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    std::fs::write(p, render(c))
+}
+
+fn bool_of(v: &str) -> Option<bool> {
+    match v.to_lowercase().as_str() {
+        "true" | "yes" | "on" | "1" => Some(true),
+        "false" | "no" | "off" | "0" => Some(false),
+        _ => None,
+    }
 }
 
 pub fn parse(text: &str) -> Config {
@@ -147,6 +153,9 @@ pub fn parse(text: &str) -> Config {
         pinned_apps: Vec::new(),
         rules: Vec::new(),
         bar: true,
+        bar_edge: Edge::Top,
+        icons_only: false,
+        align: Align::Left,
         hide_taskbar: false,
         tray: true,
         errors: Vec::new(),
@@ -154,7 +163,6 @@ pub fn parse(text: &str) -> Config {
     let mut section = String::new();
     for (n, raw) in text.lines().enumerate() {
         let line = raw.split('#').next().unwrap_or("").trim();
-        // A bare "`" key must survive comment stripping: "overview = alt+`" has no '#'.
         if line.is_empty() {
             continue;
         }
@@ -173,11 +181,11 @@ pub fn parse(text: &str) -> Config {
                 _ => bad(),
             },
             ("keys", "switch") => match parse_mods(val) {
-                Some(m) => (c.switch, c.switch_text) = (m, val.to_string()),
+                Some(m) => (c.switch, c.switch_text) = (m, val.to_lowercase()),
                 None => bad(),
             },
             ("keys", "move") => match parse_mods(val) {
-                Some(m) => (c.move_, c.move_text) = (m, val.to_string()),
+                Some(m) => (c.move_, c.move_text) = (m, val.to_lowercase()),
                 None => bad(),
             },
             ("keys", "pin") => match parse_hotkey(val) {
@@ -188,20 +196,33 @@ pub fn parse(text: &str) -> Config {
                 Some(h) => c.overview = h,
                 None => bad(),
             },
-            ("bar", "enabled") => match val.to_lowercase().as_str() {
-                "true" | "yes" | "on" | "1" => c.bar = true,
-                "false" | "no" | "off" | "0" => c.bar = false,
+            ("bar", "enabled") => match bool_of(val) {
+                Some(b) => c.bar = b,
+                None => bad(),
+            },
+            ("bar", "position") => match val.to_lowercase().as_str() {
+                "top" => c.bar_edge = Edge::Top,
+                "bottom" => c.bar_edge = Edge::Bottom,
                 _ => bad(),
             },
-            ("bar", "hide_taskbar") => match val.to_lowercase().as_str() {
-                "true" | "yes" | "on" | "1" => c.hide_taskbar = true,
-                "false" | "no" | "off" | "0" => c.hide_taskbar = false,
+            ("bar", "buttons") => match val.to_lowercase().as_str() {
+                "full" | "title" | "icon+title" => c.icons_only = false,
+                "icons" | "icon" | "icons_only" => c.icons_only = true,
                 _ => bad(),
             },
-            ("bar", "tray") => match val.to_lowercase().as_str() {
-                "true" | "yes" | "on" | "1" => c.tray = true,
-                "false" | "no" | "off" | "0" => c.tray = false,
+            ("bar", "align") => match val.to_lowercase().as_str() {
+                "left" => c.align = Align::Left,
+                "center" | "centre" => c.align = Align::Center,
+                "right" => c.align = Align::Right,
                 _ => bad(),
+            },
+            ("bar", "hide_taskbar") => match bool_of(val) {
+                Some(b) => c.hide_taskbar = b,
+                None => bad(),
+            },
+            ("bar", "tray") => match bool_of(val) {
+                Some(b) => c.tray = b,
+                None => bad(),
             },
             ("pinned_apps", app) => c.pinned_apps.push(app.trim_end_matches(".exe").to_string()),
             ("rules", app) => {
@@ -221,13 +242,64 @@ pub fn parse(text: &str) -> Config {
     c
 }
 
+/// The whole config file, with comments.
+pub fn render(c: &Config) -> String {
+    let edge = match c.bar_edge {
+        Edge::Top => "top",
+        Edge::Bottom => "bottom",
+    };
+    let align = match c.align {
+        Align::Left => "left",
+        Align::Center => "center",
+        Align::Right => "right",
+    };
+    let mut s = String::new();
+    s.push_str("# LastDesk configuration. Use tray > Settings, or edit this file and use tray > \"Reload config\".\n");
+    s.push_str("# Lines starting with # are comments.\n\n");
+    s.push_str("# Workspaces per monitor (1-9).\n");
+    s.push_str(&format!("workspaces = {}\n\n", c.workspaces));
+    s.push_str("[keys]\n");
+    s.push_str("# Switch workspace:            <switch>+1..N\n");
+    s.push_str(&format!("switch = {}\n", c.switch_text));
+    s.push_str("# Move focused window there:   <move>+1..N\n");
+    s.push_str(&format!("move = {}\n", c.move_text));
+    s.push_str(&format!("pin = {}\n", c.pin.text));
+    s.push_str(&format!("overview = {}\n", c.overview.text));
+    s.push_str("# Tip: Windows' own Win+Shift+Left/Right moves a window to the other monitor and works with LastDesk.\n\n");
+    s.push_str("[bar]\n");
+    s.push_str("# LastDesk's own taskbar on every monitor.\n");
+    s.push_str(&format!("enabled = {}\n", c.bar));
+    s.push_str("# top | bottom\n");
+    s.push_str(&format!("position = {edge}\n"));
+    s.push_str("# Window buttons: full (icon + title) | icons\n");
+    s.push_str(&format!("buttons = {}\n", if c.icons_only { "icons" } else { "full" }));
+    s.push_str("# Window buttons alignment: left | center | right\n");
+    s.push_str(&format!("align = {align}\n"));
+    s.push_str("# Hide the Windows taskbar while the LastDesk bar is on.\n");
+    s.push_str(&format!("hide_taskbar = {}\n", c.hide_taskbar));
+    s.push_str("# Show apps' tray icons in the LastDesk bar.\n");
+    s.push_str(&format!("tray = {}\n\n", c.tray));
+    s.push_str("[pinned_apps]\n");
+    s.push_str("# Apps shown on every workspace. One exe name per line (without .exe), e.g. spotify\n");
+    for a in &c.pinned_apps {
+        s.push_str(&format!("{a}\n"));
+    }
+    s.push_str("\n[rules]\n");
+    s.push_str("# New windows of an app open on a given monitor and workspace (monitor 1 = leftmost):\n");
+    s.push_str("# app = monitor, workspace      e.g.  slack = 2, 3\n");
+    for r in &c.rules {
+        s.push_str(&format!("{} = {}, {}\n", r.app, r.monitor + 1, r.workspace + 1));
+    }
+    s
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn default_config_parses_cleanly() {
-        let c = parse(DEFAULT);
+        let c = parse(&default_text());
         assert!(c.errors.is_empty(), "{:?}", c.errors);
         assert_eq!(c.workspaces, 4);
         assert_eq!(c.switch, MOD_ALT);
@@ -235,17 +307,33 @@ mod tests {
         assert_eq!((c.pin.mods, c.pin.vk), (MOD_ALT | MOD_SHIFT, 'P' as u32));
         assert_eq!((c.overview.mods, c.overview.vk), (MOD_ALT, 0xC0));
         assert!(c.pinned_apps.is_empty() && c.rules.is_empty());
+        assert_eq!((c.bar_edge, c.icons_only, c.align), (Edge::Top, false, Align::Left));
     }
 
     #[test]
     fn custom_values_rules_and_errors() {
-        let c = parse("workspaces = 6\n[keys]\nswitch = win+alt\noverview = ctrl+alt+f2\n[pinned_apps]\nSpotify.exe\n[rules]\nslack = 2, 3\nbroken = x\n");
+        let c = parse("workspaces = 6\n[keys]\nswitch = win+alt\noverview = ctrl+alt+f2\n[bar]\nposition = bottom\nbuttons = icons\nalign = center\n[pinned_apps]\nSpotify.exe\n[rules]\nslack = 2, 3\nbroken = x\n");
         assert_eq!(c.workspaces, 6);
         assert_eq!(c.switch, MOD_WIN | MOD_ALT);
         assert_eq!((c.overview.mods, c.overview.vk), (MOD_CONTROL | MOD_ALT, 0x71));
+        assert_eq!((c.bar_edge, c.icons_only, c.align), (Edge::Bottom, true, Align::Center));
         assert_eq!(c.pinned_apps, vec!["spotify".to_string()]);
         assert_eq!((c.rules[0].app.as_str(), c.rules[0].monitor, c.rules[0].workspace), ("slack", 1, 2));
         assert_eq!(c.errors.len(), 1);
+    }
+
+    #[test]
+    fn render_round_trips() {
+        let mut c = parse("workspaces = 3\n[keys]\nswitch = ctrl+alt\n[bar]\nposition = bottom\nbuttons = icons\nalign = right\nhide_taskbar = true\ntray = false\n[pinned_apps]\nspotify\n[rules]\nslack = 2, 3\n");
+        c.errors.clear();
+        let back = parse(&render(&c));
+        assert!(back.errors.is_empty(), "{:?}", back.errors);
+        assert_eq!(back.workspaces, 3);
+        assert_eq!(back.switch, MOD_CONTROL | MOD_ALT);
+        assert_eq!((back.bar_edge, back.icons_only, back.align), (Edge::Bottom, true, Align::Right));
+        assert!(back.hide_taskbar && !back.tray);
+        assert_eq!(back.pinned_apps, vec!["spotify".to_string()]);
+        assert_eq!((back.rules[0].monitor, back.rules[0].workspace), (1, 2));
     }
 
     #[test]

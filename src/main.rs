@@ -18,6 +18,7 @@ mod cloak;
 mod config;
 mod layout;
 mod overview;
+mod settings;
 mod taskbar;
 mod tray;
 mod ui;
@@ -387,6 +388,12 @@ impl App {
     /// Re-read config.ini and apply it. Returns problems to report.
     fn reload_config(&mut self) -> Vec<String> {
         let new = config::load();
+        self.apply_config(new)
+    }
+
+    /// Apply a config (from file or the Settings window). Returns problems to report.
+    fn apply_config(&mut self, new: config::Config) -> Vec<String> {
+        let old_edge = self.config.bar_edge;
         let mut problems: Vec<String> = new.errors.iter().map(|e| format!("Not understood, ignored: {e}")).collect();
         self.unregister_hotkeys();
         if new.workspaces != workspaces() {
@@ -401,6 +408,11 @@ impl App {
             self.apply_layout(saved);
         } else {
             self.config = new;
+        }
+        // Bar moved to the other edge: rebuild it there.
+        if !self.bars.is_empty() && self.config.bar_edge != old_edge {
+            self.taskbar_restore();
+            self.bars_destroy();
         }
         if self.config.bar && self.bars.is_empty() {
             self.bars_create();
@@ -813,6 +825,7 @@ enum MenuAction {
     Go(usize, usize, Option<isize>),
     Overview,
     RevealAll,
+    Settings,
     EditConfig,
     ReloadConfig,
     Autostart(bool),
@@ -855,7 +868,8 @@ pub(crate) fn show_menu(hwnd: HWND) {
         }
         e.push(("Overview  (Alt+`)".into(), Some(MenuAction::Overview), false));
         e.push(("Show all windows (reset)".into(), Some(MenuAction::RevealAll), false));
-        e.push(("Edit config…".into(), Some(MenuAction::EditConfig), false));
+        e.push(("Settings…".into(), Some(MenuAction::Settings), false));
+        e.push(("Edit config file…".into(), Some(MenuAction::EditConfig), false));
         e.push(("Reload config".into(), Some(MenuAction::ReloadConfig), false));
         let auto = autostart_enabled();
         e.push(("Start with Windows".into(), Some(MenuAction::Autostart(!auto)), auto));
@@ -913,6 +927,7 @@ pub(crate) fn show_menu(hwnd: HWND) {
             Some(MenuAction::RevealAll) => {
                 with_app(|app| app.reveal_all());
             }
+            Some(MenuAction::Settings) => settings::open(),
             Some(MenuAction::EditConfig) => {
                 let p = wide(&config::path().display().to_string());
                 ShellExecuteW(None, w!("open"), w!("notepad.exe"), PCWSTR(p.as_ptr()), None, SW_SHOWNORMAL);
@@ -1178,6 +1193,16 @@ fn main() {
             ..Default::default()
         };
         RegisterClassW(&bar_class);
+        let settings_class = WNDCLASSW {
+            lpfnWndProc: Some(settings::settings_proc),
+            hInstance: hinst,
+            lpszClassName: settings::CLASS,
+            hCursor: LoadCursorW(None, IDC_ARROW).unwrap_or_default(),
+            hbrBackground: windows::Win32::Graphics::Gdi::HBRUSH((windows::Win32::Graphics::Gdi::COLOR_BTNFACE.0 + 1) as usize as *mut _),
+            hIcon: LoadIconW(None, IDI_APPLICATION).unwrap_or_default(),
+            ..Default::default()
+        };
+        RegisterClassW(&settings_class);
         let tip_class = WNDCLASSW { lpfnWndProc: Some(bar::tip_proc), hInstance: hinst, lpszClassName: bar::TIP_CLASS, ..Default::default() };
         RegisterClassW(&tip_class);
         trace("classes");
@@ -1249,6 +1274,9 @@ fn main() {
 
         trace("loop"); let mut msg = MSG::default();
         while GetMessageW(&mut msg, None, 0, 0).as_bool() {
+            if settings::is_dialog_message(&msg) {
+                continue;
+            }
             let _ = TranslateMessage(&msg);
             DispatchMessageW(&msg);
         }

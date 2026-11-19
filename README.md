@@ -26,7 +26,8 @@ on panic, on display changes and on the next start, so a crash never leaves wind
 
 ## Config
 
-`%APPDATA%\LastDesk\config.ini` (tray > "Edit config…", then "Reload config"):
+Tray > **Settings…** edits everything below and applies it on Save. The file itself is
+`%APPDATA%\LastDesk\config.ini` (tray > "Edit config file…", then "Reload config"):
 
 ```ini
 workspaces = 4            # per monitor, 1-9
@@ -39,6 +40,9 @@ overview = alt+`
 
 [bar]
 enabled = true            # LastDesk bar on every monitor
+position = top            # top | bottom
+buttons = full            # full (icon + title) | icons
+align = left              # left | center | right
 hide_taskbar = false      # hide the Windows taskbar; the bar takes its place, ^ shows tray icons
 
 [pinned_apps]             # shown on every workspace

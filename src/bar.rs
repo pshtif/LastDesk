@@ -46,7 +46,7 @@ fn tip_font(scale: f32) -> HFONT {
     unsafe { ui::font((12.5 * scale) as i32, false) }
 }
 
-fn show_tip(text: &str, anchor: POINT, scale: f32) {
+fn show_tip(text: &str, anchor: POINT, scale: f32, above: bool) {
     if text.trim().is_empty() {
         return;
     }
@@ -74,7 +74,9 @@ fn show_tip(text: &str, anchor: POINT, scale: f32) {
         ReleaseDC(hwnd, dc);
         let (tw, th) = (r.right + pad * 2, r.bottom + pad * 2);
         let x = anchor.x - tw / 2;
-        let _ = SetWindowPos(hwnd, HWND_TOPMOST, x, anchor.y + (4.0 * scale) as i32, tw, th, SWP_NOACTIVATE | SWP_SHOWWINDOW);
+        let gap = (4.0 * scale) as i32;
+        let y = if above { anchor.y - th - gap } else { anchor.y + gap };
+        let _ = SetWindowPos(hwnd, HWND_TOPMOST, x, y, tw, th, SWP_NOACTIVATE | SWP_SHOWWINDOW);
         let _ = InvalidateRect(hwnd, None, true);
     }
 }
@@ -158,6 +160,7 @@ pub struct Bar {
     pub tracking: bool,
     /// Registered as an app bar (normal mode) vs sitting in the hidden taskbar's strip.
     pub registered: bool,
+    pub edge: crate::config::Edge,
 }
 
 fn contains(r: &RECT, x: i32, y: i32) -> bool {
@@ -246,10 +249,21 @@ impl Bar {
             self.registered = true;
         }
         let h = (BASE_HEIGHT * self.scale).round() as i32;
-        let mut abd = appbar_data(self.hwnd, RECT { left: monitor.left, top: monitor.top, right: monitor.right, bottom: monitor.top + h });
+        let bottom = self.edge == crate::config::Edge::Bottom;
+        let rc = if bottom {
+            RECT { left: monitor.left, top: monitor.bottom - h, right: monitor.right, bottom: monitor.bottom }
+        } else {
+            RECT { left: monitor.left, top: monitor.top, right: monitor.right, bottom: monitor.top + h }
+        };
+        let mut abd = appbar_data(self.hwnd, rc);
+        abd.uEdge = if bottom { ABE_BOTTOM } else { ABE_TOP };
         unsafe {
             SHAppBarMessage(ABM_QUERYPOS, &mut abd);
-            abd.rc.bottom = abd.rc.top + h;
+            if bottom {
+                abd.rc.top = abd.rc.bottom - h;
+            } else {
+                abd.rc.bottom = abd.rc.top + h;
+            }
             SHAppBarMessage(ABM_SETPOS, &mut abd);
             self.rect = abd.rc;
             let _ = SetWindowPos(self.hwnd, HWND_TOPMOST, abd.rc.left, abd.rc.top, abd.rc.right - abd.rc.left, h, SWP_NOACTIVATE | SWP_SHOWWINDOW);
@@ -300,6 +314,7 @@ impl App {
                 hover: Hit::None,
                 tracking: false,
                 registered: true,
+                edge: self.config.bar_edge,
             };
             bar.place(r, None);
             self.bars.push(bar);
@@ -347,7 +362,16 @@ impl App {
             self.bars[i].registered = false;
         }
         let work = win::monitors().into_iter().find(|m| m.rect == mon).map(|m| m.work).unwrap_or(mon);
-        let strip = if hidden { crate::taskbar::reserved_strip(mon, work) } else { None };
+        // Take the hidden taskbar's strip only if it's on the edge the bar should be on.
+        let edge = self.bars[i].edge;
+        let strip = if hidden {
+            crate::taskbar::reserved_strip(mon, work).filter(|s| match edge {
+                crate::config::Edge::Top => s.top == mon.top,
+                crate::config::Edge::Bottom => s.bottom == mon.bottom,
+            })
+        } else {
+            None
+        };
         self.bars[i].place(mon, strip);
         self.refresh_work_areas();
         self.bars_refresh();
@@ -368,6 +392,8 @@ impl App {
         }
         let all = win::visible_windows();
         let n = workspaces();
+        let icons_only = self.config.icons_only;
+        let align = self.config.align;
         let tray_host = crate::tray::active();
         let tray_on = self.taskbar_hidden && !tray_host;
         let icons = if tray_host { crate::tray::icons() } else { Vec::new() };
@@ -423,13 +449,28 @@ impl App {
             let start_x = x + s(10.0);
             let avail = (b.tray.left - s(10.0) - start_x).max(0);
             let count = b.order.len() as i32;
-            let bw = if count == 0 { 0 } else { s(220.0).min((avail - s(4.0) * (count - 1)) / count).max(s(34.0)) };
-            let mut bx = start_x;
+            let gap = s(4.0);
+            let bw = if count == 0 {
+                0
+            } else if icons_only {
+                s(40.0)
+            } else {
+                s(220.0).min((avail - gap * (count - 1)) / count).max(s(34.0))
+            };
+            let shown = if bw == 0 { 0 } else { ((avail + gap) / (bw + gap)).min(count) };
+            let total = (shown * bw + (shown - 1).max(0) * gap).max(0);
+            let mut bx = match align {
+                crate::config::Align::Left => start_x,
+                // Centered on the whole bar (like Windows 11), kept inside the free area.
+                crate::config::Align::Center => (w / 2 - total / 2).clamp(start_x, (start_x + avail - total).max(start_x)),
+                crate::config::Align::Right => (start_x + avail - total).max(start_x),
+            };
+            let limit = bx + total;
             b.buttons = b
                 .order
                 .iter()
                 .filter_map(|k| {
-                    if bx + bw > start_x + avail {
+                    if bx + bw > limit {
                         return None;
                     }
                     let hw = key_hwnd(*k);
@@ -504,12 +545,13 @@ impl App {
                     ui::fill_round(mem, line, s(2.0), ui::ACCENT);
                 }
                 let icon = s(16.0);
-                let ix = btn.rect.left + s(8.0);
+                let icons_only = self.config.icons_only;
+                let ix = if icons_only { btn.rect.left + (btn.rect.right - btn.rect.left - icon) / 2 } else { btn.rect.left + s(8.0) };
                 if !btn.icon.is_invalid() {
                     let _ = DrawIconEx(mem, ix, (h - icon) / 2, btn.icon, icon, icon, 0, None, DI_NORMAL);
                 }
                 let mut tr = RECT { left: ix + icon + s(7.0), top: btn.rect.top, right: btn.rect.right - s(6.0), bottom: btn.rect.bottom };
-                if tr.right - tr.left > s(12.0) {
+                if !icons_only && tr.right - tr.left > s(12.0) {
                     ui::draw_text_left(mem, &btn.title, &mut tr, if btn.minimized { ui::MUTED } else { ui::TEXT }, f_text);
                 }
             }
@@ -589,7 +631,9 @@ impl App {
         if let Hit::TrayIcon(t) = b.hover {
             let (hw, uid, r) = b.tray_icons[t];
             let text = crate::tray::tip(hw, uid);
-            show_tip(&text, POINT { x: b.rect.left + (r.left + r.right) / 2, y: b.rect.top + b.height() }, b.scale);
+            let above = b.edge == crate::config::Edge::Bottom;
+            let y = if above { b.rect.top } else { b.rect.top + b.height() };
+            show_tip(&text, POINT { x: b.rect.left + (r.left + r.right) / 2, y }, b.scale, above);
         }
     }
 
