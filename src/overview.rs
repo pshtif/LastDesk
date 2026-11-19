@@ -98,7 +98,7 @@ pub(crate) fn app_name(h: HWND) -> String {
     }
 }
 
-fn window_icon(h: HWND) -> HICON {
+pub(crate) fn window_icon(h: HWND) -> HICON {
     unsafe {
         let mut res: usize = 0;
         for kind in [ICON_SMALL2, ICON_SMALL, ICON_BIG] {

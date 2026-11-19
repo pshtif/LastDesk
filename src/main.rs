@@ -13,6 +13,7 @@
 
 #![windows_subsystem = "windows"]
 
+mod bar;
 mod cloak;
 mod config;
 mod layout;
@@ -55,6 +56,8 @@ const HK_OVERVIEW: i32 = 300;
 const OSD_TIMER: usize = 1;
 const RULE_TIMER: usize = 2;
 const RULE_DELAY_MS: u32 = 250;
+const CLOCK_TIMER: usize = 3;
+const BAR_TIMER: usize = 4;
 const OSD_MS: u32 = 900;
 const RUN_KEY: PCWSTR = w!("Software\\Microsoft\\Windows\\CurrentVersion\\Run");
 const APP_NAME: PCWSTR = w!("LastDesk");
@@ -90,6 +93,7 @@ struct App {
     seen: HashSet<isize>,
     /// New windows waiting for the rule timer (the shell needs a moment before it can cloak them).
     pending: Vec<isize>,
+    bars: Vec<bar::Bar>,
 }
 
 thread_local! {
@@ -270,6 +274,15 @@ impl App {
         }
     }
 
+    /// Coalesce bursts of window events into one bar refresh.
+    fn schedule_bar_refresh(&self) {
+        if !self.bars.is_empty() {
+            unsafe {
+                SetTimer(self.main, BAR_TIMER, 60, None);
+            }
+        }
+    }
+
     fn unregister_hotkeys(&self) {
         unsafe {
             for i in 0..9 {
@@ -322,6 +335,11 @@ impl App {
             self.apply_layout(saved);
         } else {
             self.config = new;
+        }
+        if self.config.bar && self.bars.is_empty() {
+            self.bars_create();
+        } else if !self.config.bar && !self.bars.is_empty() {
+            self.bars_destroy();
         }
         let failed = self.register_hotkeys();
         if !failed.is_empty() {
@@ -738,7 +756,7 @@ fn message(text: &str, warn: bool) {
     }
 }
 
-fn show_menu(hwnd: HWND) {
+pub(crate) fn show_menu(hwnd: HWND) {
     // Build the model while borrowed, then run the (message-pumping) menu without a borrow.
     let Some(entries) = with_app(|app| {
         app.prune();
@@ -898,12 +916,27 @@ unsafe extern "system" fn main_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
             // whatever monitors exist now (a reconnected monitor gets its workspaces back).
             with_app(|app| {
                 app.overview_close();
+                app.bars_destroy();
                 let saved = layout::load();
                 app.layout_frozen = true;
                 app.reveal_all();
                 app.rebuild_monitors();
                 app.layout_frozen = false;
                 app.apply_layout(saved);
+                app.bars_create();
+            });
+            LRESULT(0)
+        }
+        WM_TIMER if wp.0 == BAR_TIMER => {
+            let _ = KillTimer(hwnd, BAR_TIMER);
+            with_app(|app| app.bars_refresh());
+            LRESULT(0)
+        }
+        WM_TIMER if wp.0 == CLOCK_TIMER => {
+            with_app(|app| {
+                for b in &app.bars {
+                    let _ = InvalidateRect(b.hwnd, None, false);
+                }
             });
             LRESULT(0)
         }
@@ -923,6 +956,7 @@ unsafe extern "system" fn main_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
         }
         WM_DESTROY => {
             with_app(|app| {
+                app.bars_destroy();
                 app.layout_frozen = true;
                 app.reveal_all();
                 let nid = tray_data(app.main);
@@ -968,9 +1002,16 @@ unsafe extern "system" fn win_event(_: HWINEVENTHOOK, event: u32, hwnd: HWND, id
     if event == EVENT_SYSTEM_FOREGROUND {
         let root = GetAncestor(hwnd, GA_ROOT);
         with_app(|app| app.on_foreground(if root.is_invalid() { hwnd } else { root }));
-    } else if event == EVENT_OBJECT_SHOW && id_child == CHILDID_SELF as i32 {
+        with_app(|app| app.schedule_bar_refresh());
+        return;
+    }
+    if id_child != CHILDID_SELF as i32 {
+        return;
+    }
+    if event == EVENT_OBJECT_SHOW {
         with_app(|app| app.on_show(hwnd));
     }
+    with_app(|app| app.schedule_bar_refresh());
 }
 
 fn trace(s: &str) {
@@ -1026,7 +1067,16 @@ fn main() {
             hCursor: LoadCursorW(None, IDC_ARROW).unwrap_or_default(),
             ..Default::default()
         };
-        RegisterClassW(&overview_class); trace("classes");
+        RegisterClassW(&overview_class);
+        let bar_class = WNDCLASSW {
+            lpfnWndProc: Some(bar::bar_proc),
+            hInstance: hinst,
+            lpszClassName: bar::CLASS,
+            hCursor: LoadCursorW(None, IDC_ARROW).unwrap_or_default(),
+            ..Default::default()
+        };
+        RegisterClassW(&bar_class);
+        trace("classes");
 
         let main = CreateWindowExW(WINDOW_EX_STYLE(0), w!("LastDeskMain"), w!("LastDesk"), WS_OVERLAPPED, 0, 0, 0, 0, None, None, hinst, None).unwrap();
         let osd = CreateWindowExW(
@@ -1061,11 +1111,13 @@ fn main() {
             exe_cache: RefCell::new(HashMap::new()),
             seen: HashSet::new(),
             pending: Vec::new(),
+            bars: Vec::new(),
         };
         trace("app"); app.rebuild_monitors(); trace("monitors");
         app.add_tray(); trace("tray");
         app.apply_layout(layout::load());
         trace("layout");
+        app.bars_create();
         // Rules only apply to windows opened from now on.
         app.seen = win::visible_windows().into_iter().map(hwnd_key).collect();
         app.seen.extend(app.mons.iter().flat_map(|m| m.hidden.iter().flatten().copied()));
@@ -1081,7 +1133,12 @@ fn main() {
 
         trace("hotkeys");
         let _hook = SetWinEventHook(EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_FOREGROUND, None, Some(win_event), 0, 0, WINEVENT_OUTOFCONTEXT);
-        let _hook_show = SetWinEventHook(EVENT_OBJECT_SHOW, EVENT_OBJECT_SHOW, None, Some(win_event), 0, 0, WINEVENT_OUTOFCONTEXT);
+        // Window appear/disappear/rename/cloak/minimize/move: keep bars current, apply rules.
+        let _hook_obj = SetWinEventHook(EVENT_OBJECT_DESTROY, EVENT_OBJECT_HIDE, None, Some(win_event), 0, 0, WINEVENT_OUTOFCONTEXT);
+        let _hook_name = SetWinEventHook(EVENT_OBJECT_NAMECHANGE, EVENT_OBJECT_NAMECHANGE, None, Some(win_event), 0, 0, WINEVENT_OUTOFCONTEXT);
+        let _hook_cloak = SetWinEventHook(EVENT_OBJECT_CLOAKED, EVENT_OBJECT_UNCLOAKED, None, Some(win_event), 0, 0, WINEVENT_OUTOFCONTEXT);
+        let _hook_min = SetWinEventHook(EVENT_SYSTEM_MINIMIZESTART, EVENT_SYSTEM_MINIMIZEEND, None, Some(win_event), 0, 0, WINEVENT_OUTOFCONTEXT);
+        let _hook_move = SetWinEventHook(EVENT_SYSTEM_MOVESIZEEND, EVENT_SYSTEM_MOVESIZEEND, None, Some(win_event), 0, 0, WINEVENT_OUTOFCONTEXT);
 
         trace("loop"); let mut msg = MSG::default();
         while GetMessageW(&mut msg, None, 0, 0).as_bool() {

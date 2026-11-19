@@ -20,6 +20,10 @@ pin = alt+shift+p
 overview = alt+`
 # Tip: Windows' own Win+Shift+Left/Right moves a window to the other monitor and works with LastDesk.
 
+[bar]
+# LastDesk's own taskbar on top of every monitor.
+enabled = true
+
 [pinned_apps]
 # Apps shown on every workspace. One exe name per line (without .exe), e.g.:
 # spotify
@@ -53,6 +57,7 @@ pub struct Config {
     pub overview: Hotkey,
     pub pinned_apps: Vec<String>,
     pub rules: Vec<Rule>,
+    pub bar: bool,
     pub errors: Vec<String>,
 }
 
@@ -135,6 +140,7 @@ pub fn parse(text: &str) -> Config {
         overview: parse_hotkey("alt+`").unwrap(),
         pinned_apps: Vec::new(),
         rules: Vec::new(),
+        bar: true,
         errors: Vec::new(),
     };
     let mut section = String::new();
@@ -173,6 +179,11 @@ pub fn parse(text: &str) -> Config {
             ("keys", "overview") => match parse_hotkey(val) {
                 Some(h) => c.overview = h,
                 None => bad(),
+            },
+            ("bar", "enabled") => match val.to_lowercase().as_str() {
+                "true" | "yes" | "on" | "1" => c.bar = true,
+                "false" | "no" | "off" | "0" => c.bar = false,
+                _ => bad(),
             },
             ("pinned_apps", app) => c.pinned_apps.push(app.trim_end_matches(".exe").to_string()),
             ("rules", app) => {
