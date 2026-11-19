@@ -614,6 +614,15 @@ impl App {
     }
 
     /// Right/double click on a tray icon. Returns true if (x, y) was a tray icon.
+    /// The window button under (x, y): (window, monitor).
+    pub fn bar_window_at(&self, hwnd: HWND, x: i32, y: i32) -> Option<(isize, usize)> {
+        let b = &self.bars[self.bar_index(hwnd)?];
+        match b.hit(x, y) {
+            Hit::Window(k) => Some((k, b.mon)),
+            _ => None,
+        }
+    }
+
     pub fn bar_tray_click(&mut self, hwnd: HWND, x: i32, y: i32, kind: crate::tray::Click) -> bool {
         let Some(i) = self.bar_index(hwnd) else { return false };
         if let Hit::TrayIcon(t) = self.bars[i].hit(x, y) {
@@ -745,8 +754,12 @@ pub unsafe extern "system" fn bar_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPA
         }
         WM_RBUTTONUP => {
             let (x, y) = xy();
-            if with_app(|app| app.bar_tray_click(hwnd, x, y, crate::tray::Click::Right)) != Some(true) {
-                crate::show_menu(with_app(|a| a.main).unwrap_or(hwnd));
+            if with_app(|app| app.bar_tray_click(hwnd, x, y, crate::tray::Click::Right)) == Some(true) {
+                return LRESULT(0);
+            }
+            match with_app(|app| app.bar_window_at(hwnd, x, y)).flatten() {
+                Some((k, m)) => window_menu(k, m),
+                None => crate::show_menu(with_app(|a| a.main).unwrap_or(hwnd)),
             }
             LRESULT(0)
         }
@@ -774,5 +787,80 @@ pub unsafe extern "system" fn bar_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPA
             LRESULT(0)
         }
         _ => DefWindowProcW(hwnd, msg, wp, lp),
+    }
+}
+
+/// Right-click menu for a window button. Runs the (message-pumping) menu outside any borrow.
+fn window_menu(k: isize, m: usize) {
+    const CMD_MINRESTORE: usize = 1;
+    const CMD_PIN: usize = 2;
+    const CMD_CLOSE: usize = 3;
+    const CMD_WS: usize = 100; // 100 + workspace index
+    let h = key_hwnd(k);
+    let Some((main, active, pinned)) = with_app(|app| {
+        let active = app.mons.get(m).map(|ms| ms.active).unwrap_or(0);
+        (app.main, active, app.pinned.contains(&k))
+    }) else { return };
+    let wide = |s: &str| -> Vec<u16> { s.encode_utf16().chain(std::iter::once(0)).collect() };
+    unsafe {
+        let Ok(menu) = CreatePopupMenu() else { return };
+        let mut title = win::title(h);
+        if title.chars().count() > 50 {
+            title = title.chars().take(47).collect::<String>() + "…";
+        }
+        let t = wide(&title.replace('&', "&&"));
+        let _ = AppendMenuW(menu, MF_STRING | MF_GRAYED, 0, windows::core::PCWSTR(t.as_ptr()));
+        let _ = AppendMenuW(menu, MF_SEPARATOR, 0, windows::core::PCWSTR::null());
+        let minimized = IsIconic(h).as_bool();
+        let t = wide(if minimized { "Restore" } else { "Minimize" });
+        let _ = AppendMenuW(menu, MF_STRING, CMD_MINRESTORE, windows::core::PCWSTR(t.as_ptr()));
+        let t = wide("Pin to all workspaces");
+        let _ = AppendMenuW(menu, MF_STRING | if pinned { MF_CHECKED } else { MF_UNCHECKED }, CMD_PIN, windows::core::PCWSTR(t.as_ptr()));
+        if let Ok(sub) = CreatePopupMenu() {
+            for w in 0..workspaces() {
+                let t = wide(&format!("Workspace {}", w + 1));
+                let flags = if w == active { MF_STRING | MF_CHECKED | MF_GRAYED } else { MF_STRING };
+                let _ = AppendMenuW(sub, flags, CMD_WS + w, windows::core::PCWSTR(t.as_ptr()));
+            }
+            let t = wide("Move to workspace");
+            let _ = AppendMenuW(menu, MF_POPUP, sub.0 as usize, windows::core::PCWSTR(t.as_ptr()));
+        }
+        let _ = AppendMenuW(menu, MF_SEPARATOR, 0, windows::core::PCWSTR::null());
+        let t = wide("Close");
+        let _ = AppendMenuW(menu, MF_STRING, CMD_CLOSE, windows::core::PCWSTR(t.as_ptr()));
+
+        let pt = cursor();
+        let _ = SetForegroundWindow(main);
+        let cmd = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON, pt.x, pt.y, 0, main, None).0 as usize;
+        let _ = PostMessageW(main, WM_NULL, WPARAM(0), LPARAM(0));
+        let _ = DestroyMenu(menu);
+        match cmd {
+            CMD_MINRESTORE => {
+                if minimized {
+                    SwitchToThisWindow(h, true);
+                } else {
+                    let _ = ShowWindow(h, SW_MINIMIZE);
+                }
+            }
+            CMD_PIN => {
+                with_app(|app| {
+                    if !app.pinned.remove(&k) {
+                        app.pinned.insert(k);
+                    }
+                    app.save();
+                    app.bars_refresh();
+                });
+            }
+            CMD_CLOSE => {
+                let _ = PostMessageW(h, WM_CLOSE, WPARAM(0), LPARAM(0));
+            }
+            c if (CMD_WS..CMD_WS + workspaces()).contains(&c) => {
+                with_app(|app| {
+                    app.move_window(k, (m, active), (m, c - CMD_WS));
+                    app.bars_refresh();
+                });
+            }
+            _ => {}
+        }
     }
 }
