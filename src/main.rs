@@ -14,6 +14,7 @@
 #![windows_subsystem = "windows"]
 
 mod cloak;
+mod layout;
 mod overview;
 mod ui;
 mod win;
@@ -72,6 +73,8 @@ struct App {
     overview: Option<overview::Overview>,
     /// Monitor the mouse was on at the last focus change (see `current_mon`).
     focus_mouse_mon: Option<String>,
+    /// While set, `save()` doesn't touch layout.txt (exit/reveal that should be undone later).
+    layout_frozen: bool,
 }
 
 thread_local! {
@@ -271,6 +274,7 @@ impl App {
         }
         let k = hwnd_key(fg);
         let pinned = if self.pinned.remove(&k) { false } else { self.pinned.insert(k) };
+        self.save();
         let m = self.current_mon();
         self.show_osd(m, Some(if pinned { "Pinned: shown on every workspace".into() } else { "Unpinned".into() }));
     }
@@ -360,6 +364,84 @@ impl App {
         }
     }
 
+    fn save_layout(&self) {
+        if self.layout_frozen {
+            return;
+        }
+        let mut l = layout::Layout::default();
+        let entry = |mon: &str, ws: Option<usize>, k: isize| {
+            let h = key_hwnd(k);
+            layout::Entry {
+                mon: mon.to_string(),
+                ws,
+                hwnd: k,
+                exe: overview::app_name(h),
+                class: win::class_name(h),
+                title: win::title(h),
+            }
+        };
+        for ms in &self.mons {
+            l.active.push((ms.name.clone(), ms.active));
+            for (w, list) in ms.hidden.iter().enumerate() {
+                for k in list {
+                    l.entries.push(entry(&ms.name, Some(w), *k));
+                }
+            }
+        }
+        for k in &self.pinned {
+            let h = key_hwnd(*k);
+            if unsafe { IsWindow(h).as_bool() } {
+                if let Some(mon) = win::monitor_name_of_window(h) {
+                    l.entries.push(entry(&mon, None, *k));
+                }
+            }
+        }
+        layout::save(&l);
+    }
+
+    /// Put windows back on the workspaces recorded in `l` (all windows are visible now).
+    fn apply_layout(&mut self, l: layout::Layout) {
+        for (name, a) in &l.active {
+            if let Some(m) = self.mon_index(name) {
+                if *a < WORKSPACES {
+                    self.mons[m].active = *a;
+                }
+            }
+        }
+        let candidates = win::visible_windows();
+        let mut used: HashSet<isize> = HashSet::new();
+        for e in l.entries {
+            let Some(m) = self.mon_index(&e.mon) else { continue };
+            let same_app = |h: HWND| overview::app_name(h) == e.exe && win::class_name(h) == e.class;
+            let by_hwnd = Some(key_hwnd(e.hwnd)).filter(|h| e.hwnd != 0 && win::is_manageable(*h, false) && same_app(*h));
+            let found = by_hwnd.or_else(|| {
+                candidates.iter().copied().find(|h| !used.contains(&hwnd_key(*h)) && same_app(*h) && win::title(*h) == e.title)
+            });
+            let Some(h) = found else { continue };
+            let k = hwnd_key(h);
+            if !used.insert(k) {
+                continue;
+            }
+            if let Some(cur) = win::monitor_name_of_window(h).and_then(|n| self.mon_index(&n)) {
+                if cur != m {
+                    self.reposition(h, cur, m, true);
+                }
+            }
+            match e.ws {
+                None => {
+                    self.pinned.insert(k);
+                }
+                Some(w) if w < WORKSPACES && w != self.mons[m].active => {
+                    self.hide(h);
+                    self.mons[m].hidden[w].push(k);
+                }
+                _ => {}
+            }
+        }
+        self.save();
+        self.update_tray();
+    }
+
     fn reveal_all(&mut self) {
         let keys: Vec<isize> = self.mons.iter_mut().flat_map(|ms| ms.hidden.iter_mut().flat_map(std::mem::take)).collect();
         for k in keys {
@@ -396,6 +478,7 @@ impl App {
             let _ = std::fs::write(&path, out);
         }
         *PANIC_LIST.lock().unwrap_or_else(|e| e.into_inner()) = list;
+        self.save_layout();
     }
 
     fn counts(&self, m: usize) -> Vec<usize> {
@@ -649,21 +732,31 @@ unsafe extern "system" fn main_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
             LRESULT(0)
         }
         WM_DISPLAYCHANGE => {
+            // Monitors changed: show everything, then re-apply the remembered layout to
+            // whatever monitors exist now (a reconnected monitor gets its workspaces back).
             with_app(|app| {
                 app.overview_close();
+                let saved = layout::load();
+                app.layout_frozen = true;
                 app.reveal_all();
                 app.rebuild_monitors();
-                app.update_tray();
+                app.layout_frozen = false;
+                app.apply_layout(saved);
             });
             LRESULT(0)
         }
         WM_QUERYENDSESSION => LRESULT(1),
         WM_ENDSESSION => {
-            with_app(|app| app.reveal_all());
+            // Logging off / shutting down: keep the layout for next time.
+            with_app(|app| {
+                app.layout_frozen = true;
+                app.reveal_all();
+            });
             LRESULT(0)
         }
         WM_DESTROY => {
             with_app(|app| {
+                app.layout_frozen = true;
                 app.reveal_all();
                 let nid = tray_data(app.main);
                 let _ = Shell_NotifyIconW(NIM_DELETE, &nid);
@@ -789,9 +882,12 @@ fn main() {
             taskbar_created: RegisterWindowMessageW(w!("TaskbarCreated")),
             overview: None,
             focus_mouse_mon: None,
+            layout_frozen: false,
         };
         trace("app"); app.rebuild_monitors(); trace("monitors");
         app.add_tray(); trace("tray");
+        app.apply_layout(layout::load());
+        trace("layout");
         APP.with(|a| *a.borrow_mut() = Some(app));
 
         // Hotkeys.

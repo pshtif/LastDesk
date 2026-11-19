@@ -24,8 +24,19 @@ workspaces and windows, "Show all windows (reset)", "Start with Windows" and "Ex
 Hidden windows are recorded in `%LOCALAPPDATA%\LastDesk\hidden.txt` and restored on exit,
 on panic, on display changes and on the next start, so a crash never leaves windows invisible.
 
-## Build
+## Remembered layout
+
+The workspace of every hidden or pinned window and each monitor's current workspace are kept
+in `%LOCALAPPDATA%\LastDesk\layout.txt`. When LastDesk restarts (update, crash) windows are
+matched by window ID; after a reboot by exact app + window class + title. Anything not matched
+stays visible on the current workspace. Tray > "Show all windows (reset)" clears the layout.
+
+## Install
 
 ```
-cargo build --release
+.\install.ps1              # build, install to %USERPROFILE%\tools\LastDesk, (re)start
+.\install.ps1 -Autostart   # same, and start with Windows
 ```
+
+Updating replaces a running copy gracefully: it saves the layout, exits, and the new copy puts
+every window back.

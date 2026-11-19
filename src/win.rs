@@ -96,7 +96,7 @@ pub fn title(h: HWND) -> String {
     String::from_utf16_lossy(&buf[..n.max(0) as usize])
 }
 
-fn class_name(h: HWND) -> String {
+pub fn class_name(h: HWND) -> String {
     let mut buf = [0u16; 256];
     let n = unsafe { GetClassNameW(h, &mut buf) };
     String::from_utf16_lossy(&buf[..n.max(0) as usize])

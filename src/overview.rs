@@ -75,7 +75,7 @@ fn contains(r: &RECT, p: POINT) -> bool {
     p.x >= r.left && p.x < r.right && p.y >= r.top && p.y < r.bottom
 }
 
-fn app_name(h: HWND) -> String {
+pub(crate) fn app_name(h: HWND) -> String {
     unsafe {
         let mut pid = 0u32;
         GetWindowThreadProcessId(h, Some(&mut pid));
