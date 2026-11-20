@@ -274,12 +274,13 @@ impl App {
             let _ = SetForegroundWindow(focus);
             let _ = SetFocus(focus);
         }
-        self.overview_intro();
+        self.overview_animate(true);
     }
 
-    /// Zoom-in: windows of the shown workspace shrink from where they are into their cards,
-    /// the other workspaces' cards grow and fade in. Blocking, synced to the display.
-    fn overview_intro(&self) {
+    /// Zoom in (opening) or out (closing): windows of the shown workspace move between where
+    /// they are on screen and their cards, the other cards grow/shrink and fade, and the panel
+    /// fades. Blocking, synced to the display.
+    fn overview_animate(&self, opening: bool) {
         let ms = self.config.animation;
         let Some(ov) = self.overview.as_ref() else { return };
         if ms == 0 {
@@ -327,15 +328,17 @@ impl App {
                 set_thumb(t, r, if fade { (255.0 * p.sqrt()) as u8 } else { 255 });
             }
         };
-        frame(0.0);
-        // Paint the panels now: the normal WM_PAINT can't reach us until this returns.
-        unsafe {
-            for o in &ov.overlays {
-                let hdc = GetDC(o.hwnd);
-                self.overview_paint(o.hwnd, hdc);
-                ReleaseDC(o.hwnd, hdc);
+        if opening {
+            frame(0.0);
+            // Paint the panels now: the normal WM_PAINT can't reach us until this returns.
+            unsafe {
+                for o in &ov.overlays {
+                    let hdc = GetDC(o.hwnd);
+                    self.overview_paint(o.hwnd, hdc);
+                    ReleaseDC(o.hwnd, hdc);
+                }
+                let _ = DwmFlush();
             }
-            let _ = DwmFlush();
         }
         let fade_panels = |a: f32| {
             for o in &ov.overlays {
@@ -348,8 +351,14 @@ impl App {
         let total = (ms as f32 / 1000.0).max(0.001);
         loop {
             let t = (start.elapsed().as_secs_f32() / total).min(1.0);
-            frame(1.0 - (1.0 - t).powi(3));
-            fade_panels((t * 1.6).min(1.0));
+            let e = 1.0 - (1.0 - t).powi(3); // ease-out
+            if opening {
+                frame(e);
+                fade_panels((t * 1.6).min(1.0));
+            } else {
+                frame(1.0 - e);
+                fade_panels(1.0 - t);
+            }
             unsafe {
                 let _ = DwmFlush();
             }
@@ -357,10 +366,18 @@ impl App {
                 break;
             }
         }
-        ov.apply_opacity();
+        if opening {
+            ov.apply_opacity();
+        }
     }
 
     pub fn overview_close(&mut self) {
+        if self.overview.is_some() {
+            unsafe {
+                let _ = ReleaseCapture();
+            }
+            self.overview_animate(false);
+        }
         if let Some(mut ov) = self.overview.take() {
             ov.unregister_thumbs();
             unsafe {
@@ -542,12 +559,14 @@ impl App {
     }
 
     fn overview_jump(&mut self, m: usize, w: usize, k: Option<isize>) {
+        // Switch underneath first (no slide while the overview is open), so the zoom-out
+        // lands the chosen workspace's windows where they really are.
+        if m < self.mons.len() && w != self.mons[m].active {
+            self.switch_to(m, w, None);
+        }
         self.overview_close();
         if m >= self.mons.len() {
             return;
-        }
-        if w != self.mons[m].active {
-            self.switch_to(m, w, None);
         }
         if let Some(k) = k {
             let h = key_hwnd(k);
