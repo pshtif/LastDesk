@@ -107,6 +107,8 @@ struct App {
     /// Start was opened from this monitor's bar: (monitor, when, windows that already existed).
     /// New windows appearing soon after go to that monitor.
     launch: Option<(usize, std::time::Instant, HashSet<isize>)>,
+    /// Preferred order of apps on the bar (exe names), from dragging buttons.
+    bar_rank: Vec<String>,
     bars: Vec<bar::Bar>,
     /// LastDesk is keeping the Windows taskbar hidden (its bar sits in the taskbar's strip).
     taskbar_hidden: bool,
@@ -1368,6 +1370,7 @@ fn main() {
             seen: HashSet::new(),
             pending: Vec::new(),
             launch: None,
+            bar_rank: bar::load_rank(),
             bars: Vec::new(),
             taskbar_hidden: false,
         };

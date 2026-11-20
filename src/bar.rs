@@ -163,6 +163,32 @@ pub struct Bar {
     pub edge: crate::config::Edge,
     /// Hidden because a fullscreen window covers this monitor.
     pub fs: bool,
+    /// A window button being pressed / dragged to reorder.
+    pub drag: Option<BarDrag>,
+}
+
+pub struct BarDrag {
+    pub key: isize,
+    pub down_x: i32,
+    pub x: i32,
+    /// Cursor offset inside the button when it was grabbed.
+    pub grab: i32,
+    pub active: bool,
+}
+
+/// Saved preferred order of apps on the bar (exe names), so reopened apps get their slot back.
+fn order_path() -> std::path::PathBuf {
+    crate::config::path().with_file_name("bar_order.txt")
+}
+
+pub fn load_rank() -> Vec<String> {
+    std::fs::read_to_string(order_path())
+        .map(|t| t.lines().map(|l| l.trim().to_string()).filter(|l| !l.is_empty()).collect())
+        .unwrap_or_default()
+}
+
+fn save_rank(rank: &[String]) {
+    let _ = std::fs::write(order_path(), rank.join("\n") + "\n");
 }
 
 /// For each monitor rect: is the top window there (ignoring small always-on-top ones)
@@ -196,12 +222,14 @@ fn fullscreen_monitors(mons: &[RECT]) -> Vec<bool> {
             return TRUE;
         }
         let topmost = ex & WS_EX_TOPMOST.0 != 0;
+        // The monitor the window belongs to (not mere overlap: a maximized window's invisible
+        // border reaches a few pixels into the neighbouring monitor).
+        let mut mi = MONITORINFO { cbSize: std::mem::size_of::<MONITORINFO>() as u32, ..Default::default() };
+        if !GetMonitorInfoW(MonitorFromWindow(h, MONITOR_DEFAULTTONEAREST), &mut mi).as_bool() {
+            return TRUE;
+        }
         for (i, m) in s.mons.iter().enumerate() {
-            if s.result[i].is_some() {
-                continue;
-            }
-            let overlaps = r.left < m.right && r.right > m.left && r.top < m.bottom && r.bottom > m.top;
-            if !overlaps {
+            if s.result[i].is_some() || mi.rcMonitor != *m {
                 continue;
             }
             let covers = r.left <= m.left && r.top <= m.top && r.right >= m.right && r.bottom >= m.bottom;
@@ -443,6 +471,7 @@ impl App {
                 registered: true,
                 edge: self.config.bar_edge,
                 fs: false,
+                drag: None,
             };
             bar.place(r, None);
             self.bars.push(bar);
@@ -550,11 +579,22 @@ impl App {
                 .filter(|h| win::monitor_name_of_window(**h).as_deref() == Some(name.as_str()))
                 .map(|h| hwnd_key(*h))
                 .collect();
+            // Position of each window's app in the saved order (unknown apps go last).
+            let ranks: std::collections::HashMap<isize, usize> = here
+                .iter()
+                .map(|k| {
+                    let e = self.exe(key_hwnd(*k));
+                    (*k, self.bar_rank.iter().position(|r| *r == e).unwrap_or(usize::MAX))
+                })
+                .collect();
             let b = &mut self.bars[bi];
             b.order.retain(|k| here.contains(k));
             for k in &here {
                 if !b.order.contains(k) {
-                    b.order.push(*k);
+                    // New window: before the first button whose app comes later in the saved order.
+                    let r = ranks[k];
+                    let pos = b.order.iter().position(|o| ranks.get(o).copied().unwrap_or(usize::MAX) > r).unwrap_or(b.order.len());
+                    b.order.insert(pos, *k);
                 }
             }
             let s = |v: f32| (v * b.scale).round() as i32;
@@ -677,24 +717,51 @@ impl App {
                 ui::draw_text(mem, &(i + 1).to_string(), &mut tr, color, f_num);
             }
 
-            // Window buttons.
-            for btn in &b.buttons {
+            // Window buttons. While dragging, the dragged one leaves an empty slot and is drawn
+            // last, floating under the cursor.
+            let dragging = b.drag.as_ref().filter(|d| d.active);
+            let draw_button = |btn: &Button, rect: RECT, lifted: bool| {
                 let is_fg = hwnd_key(fg) == btn.hwnd;
-                let bg = if is_fg { ui::rgb(0x2C, 0x3D, 0x5E) } else if b.hover == Hit::Window(btn.hwnd) { hover_bg } else { ui::rgb(0x1F, 0x20, 0x24) };
-                ui::fill_round(mem, btn.rect, s(6.0), bg);
+                let bg = if lifted {
+                    ui::rgb(0x34, 0x36, 0x3D)
+                } else if is_fg {
+                    ui::rgb(0x2C, 0x3D, 0x5E)
+                } else if b.hover == Hit::Window(btn.hwnd) {
+                    hover_bg
+                } else {
+                    ui::rgb(0x1F, 0x20, 0x24)
+                };
+                ui::fill_round(mem, rect, s(6.0), bg);
+                if lifted {
+                    ui::frame_round(mem, rect, s(6.0), s(1.0).max(1), ui::ACCENT);
+                }
                 if is_fg {
-                    let line = RECT { left: btn.rect.left + s(8.0), top: btn.rect.bottom - s(3.0), right: btn.rect.right - s(8.0), bottom: btn.rect.bottom - s(1.0) };
+                    let line = RECT { left: rect.left + s(8.0), top: rect.bottom - s(3.0), right: rect.right - s(8.0), bottom: rect.bottom - s(1.0) };
                     ui::fill_round(mem, line, s(2.0), ui::ACCENT);
                 }
                 let icon = s(16.0);
                 let icons_only = self.config.icons_only;
-                let ix = if icons_only { btn.rect.left + (btn.rect.right - btn.rect.left - icon) / 2 } else { btn.rect.left + s(8.0) };
+                let ix = if icons_only { rect.left + (rect.right - rect.left - icon) / 2 } else { rect.left + s(8.0) };
                 if !btn.icon.is_invalid() {
                     let _ = DrawIconEx(mem, ix, (h - icon) / 2, btn.icon, icon, icon, 0, None, DI_NORMAL);
                 }
-                let mut tr = RECT { left: ix + icon + s(7.0), top: btn.rect.top, right: btn.rect.right - s(6.0), bottom: btn.rect.bottom };
+                let mut tr = RECT { left: ix + icon + s(7.0), top: rect.top, right: rect.right - s(6.0), bottom: rect.bottom };
                 if !icons_only && tr.right - tr.left > s(12.0) {
                     ui::draw_text_left(mem, &btn.title, &mut tr, if btn.minimized { ui::MUTED } else { ui::TEXT }, f_text);
+                }
+            };
+            for btn in &b.buttons {
+                if dragging.is_some_and(|d| d.key == btn.hwnd) {
+                    ui::frame_round(mem, btn.rect, s(6.0), s(1.0).max(1), ui::rgb(0x3A, 0x3C, 0x44));
+                    continue;
+                }
+                draw_button(btn, btn.rect, false);
+            }
+            if let Some(d) = dragging {
+                if let Some(btn) = b.buttons.iter().find(|bt| bt.hwnd == d.key) {
+                    let bw = btn.rect.right - btn.rect.left;
+                    let left = (d.x - d.grab).clamp(0, (w - bw).max(0));
+                    draw_button(btn, RECT { left, right: left + bw, ..btn.rect }, true);
                 }
             }
 
@@ -792,8 +859,95 @@ impl App {
         self.bars.iter().position(|b| b.hwnd == hwnd)
     }
 
+    /// Left button down: remember a window button as a possible drag.
+    pub fn bar_drag_start(&mut self, hwnd: HWND, x: i32, y: i32) {
+        let Some(i) = self.bar_index(hwnd) else { return };
+        let b = &mut self.bars[i];
+        if let Hit::Window(k) = b.hit(x, y) {
+            let left = b.buttons.iter().find(|bt| bt.hwnd == k).map(|bt| bt.rect.left).unwrap_or(x);
+            b.drag = Some(BarDrag { key: k, down_x: x, x, grab: x - left, active: false });
+            unsafe {
+                SetCapture(hwnd);
+            }
+        }
+    }
+
+    /// Mouse moved with a button pressed: once it moves a few pixels it's a drag; the
+    /// dragged button follows the cursor and the others shift into the gap.
+    fn bar_drag_move(&mut self, i: usize, x: i32) -> bool {
+        let b = &mut self.bars[i];
+        let Some(d) = b.drag.as_mut() else { return false };
+        d.x = x;
+        if !d.active {
+            if (x - d.down_x).abs() < (6.0 * b.scale) as i32 {
+                return true;
+            }
+            d.active = true;
+            hide_tip();
+        }
+        let (key, grab) = (d.key, d.grab);
+        let slots: Vec<RECT> = b.buttons.iter().map(|bt| bt.rect).collect();
+        if let (Some(cur), Some(first)) = (b.buttons.iter().position(|bt| bt.hwnd == key), slots.first()) {
+            let width = first.right - first.left;
+            let center = x - grab + width / 2;
+            let target = slots
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, r)| ((r.left + r.right) / 2 - center).abs())
+                .map(|(t, _)| t)
+                .unwrap_or(cur);
+            if target != cur && cur < b.order.len() && target < b.order.len() {
+                let bt = b.buttons.remove(cur);
+                b.buttons.insert(target, bt);
+                for (bt, r) in b.buttons.iter_mut().zip(&slots) {
+                    bt.rect = *r;
+                }
+                let k = b.order.remove(cur);
+                b.order.insert(target, k);
+            }
+        }
+        unsafe {
+            let _ = InvalidateRect(b.hwnd, None, false);
+        }
+        true
+    }
+
+    /// Left button up. Returns true if it ended a drag (so it's not a click).
+    pub fn bar_drag_end(&mut self, hwnd: HWND) -> bool {
+        let Some(i) = self.bar_index(hwnd) else { return false };
+        let Some(d) = self.bars[i].drag.take() else { return false };
+        unsafe {
+            let _ = ReleaseCapture();
+            let _ = InvalidateRect(hwnd, None, false);
+        }
+        if !d.active {
+            return false;
+        }
+        // Remember the new order of apps: the dragged bar's apps take the place of the
+        // earliest of them in the saved order; other apps keep their relative order.
+        let mut seq: Vec<String> = Vec::new();
+        for k in self.bars[i].order.clone() {
+            let e = self.exe(key_hwnd(k));
+            if !e.is_empty() && !seq.contains(&e) {
+                seq.push(e);
+            }
+        }
+        let at = self.bar_rank.iter().position(|r| seq.contains(r)).unwrap_or(self.bar_rank.len());
+        let before = self.bar_rank[..at].iter().filter(|r| !seq.contains(r)).count();
+        self.bar_rank.retain(|r| !seq.contains(r));
+        let at = before.min(self.bar_rank.len());
+        for (n, e) in seq.into_iter().enumerate() {
+            self.bar_rank.insert(at + n, e);
+        }
+        save_rank(&self.bar_rank);
+        true
+    }
+
     pub fn bar_mouse_move(&mut self, hwnd: HWND, x: i32, y: i32) {
         let Some(i) = self.bar_index(hwnd) else { return };
+        if self.bar_drag_move(i, x) {
+            return;
+        }
         let b = &mut self.bars[i];
         if !b.tracking {
             let mut tme = TRACKMOUSEEVENT { cbSize: std::mem::size_of::<TRACKMOUSEEVENT>() as u32, dwFlags: TME_LEAVE, hwndTrack: hwnd, dwHoverTime: 0 };
@@ -910,8 +1064,21 @@ pub unsafe extern "system" fn bar_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPA
             with_app(|app| app.bar_mouse_leave(hwnd));
             LRESULT(0)
         }
+        WM_LBUTTONDOWN => {
+            let (x, y) = xy();
+            with_app(|app| app.bar_drag_start(hwnd, x, y));
+            LRESULT(0)
+        }
+        WM_CAPTURECHANGED => {
+            // Capture lost mid-drag (Alt+Tab, a popup…): drop where it is.
+            with_app(|app| app.bar_drag_end(hwnd));
+            LRESULT(0)
+        }
         WM_LBUTTONUP | WM_MBUTTONUP => {
             let (x, y) = xy();
+            if msg == WM_LBUTTONUP && with_app(|app| app.bar_drag_end(hwnd)) == Some(true) {
+                return LRESULT(0);
+            }
             let keys = with_app(|app| app.bar_click(hwnd, x, y, msg == WM_MBUTTONUP)).flatten();
             if let Some(k) = keys {
                 press(&k);
