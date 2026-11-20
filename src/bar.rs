@@ -161,6 +161,63 @@ pub struct Bar {
     /// Registered as an app bar (normal mode) vs sitting in the hidden taskbar's strip.
     pub registered: bool,
     pub edge: crate::config::Edge,
+    /// Hidden because a fullscreen window covers this monitor.
+    pub fs: bool,
+}
+
+/// For each monitor rect: is the top window there (ignoring small always-on-top ones)
+/// a fullscreen window covering the whole monitor?
+fn fullscreen_monitors(mons: &[RECT]) -> Vec<bool> {
+    struct Scan<'a> {
+        mons: &'a [RECT],
+        result: Vec<Option<bool>>,
+        own_pid: u32,
+    }
+    unsafe extern "system" fn cb(h: HWND, data: LPARAM) -> BOOL {
+        let s = &mut *(data.0 as *mut Scan);
+        if !IsWindowVisible(h).as_bool() || IsIconic(h).as_bool() || crate::cloak::is_cloaked(h) {
+            return TRUE;
+        }
+        let mut pid = 0u32;
+        GetWindowThreadProcessId(h, Some(&mut pid));
+        if pid == s.own_pid {
+            return TRUE; // our bar, overview, slide panel…
+        }
+        let ex = GetWindowLongW(h, GWL_EXSTYLE) as u32;
+        if ex & WS_EX_TRANSPARENT.0 != 0 || ex & WS_EX_NOACTIVATE.0 != 0 && ex & WS_EX_TOOLWINDOW.0 != 0 {
+            return TRUE; // click-through overlays, notification toasts
+        }
+        let class = crate::win::class_name(h);
+        if matches!(class.as_str(), "Progman" | "WorkerW" | "Shell_TrayWnd" | "Shell_SecondaryTrayWnd") {
+            return TRUE;
+        }
+        let mut r = RECT::default();
+        if GetWindowRect(h, &mut r).is_err() || r.right - r.left < 50 {
+            return TRUE;
+        }
+        let topmost = ex & WS_EX_TOPMOST.0 != 0;
+        for (i, m) in s.mons.iter().enumerate() {
+            if s.result[i].is_some() {
+                continue;
+            }
+            let overlaps = r.left < m.right && r.right > m.left && r.top < m.bottom && r.bottom > m.top;
+            if !overlaps {
+                continue;
+            }
+            let covers = r.left <= m.left && r.top <= m.top && r.right >= m.right && r.bottom >= m.bottom;
+            if covers {
+                s.result[i] = Some(true);
+            } else if !topmost {
+                s.result[i] = Some(false); // a normal window on top: not fullscreen
+            }
+        }
+        if s.result.iter().all(|r| r.is_some()) { FALSE } else { TRUE }
+    }
+    let mut s = Scan { mons, result: vec![None; mons.len()], own_pid: unsafe { windows::Win32::System::Threading::GetCurrentProcessId() } };
+    unsafe {
+        let _ = EnumWindows(Some(cb), LPARAM(&mut s as *mut _ as isize));
+    }
+    s.result.into_iter().map(|r| r.unwrap_or(false)).collect()
 }
 
 fn contains(r: &RECT, x: i32, y: i32) -> bool {
@@ -289,6 +346,11 @@ impl Bar {
         }
     }
 
+    /// Don't re-show a bar that's hidden for a fullscreen window.
+    fn show_flags(&self) -> SET_WINDOW_POS_FLAGS {
+        if self.fs { SWP_NOACTIVATE } else { SWP_NOACTIVATE | SWP_SHOWWINDOW }
+    }
+
     /// Sit in strip (the hidden taskbar's reserved area) or, without one, reserve our own
     /// strip at the top of the monitor as an app bar.
     fn place(&mut self, monitor: RECT, strip: Option<RECT>) {
@@ -302,7 +364,7 @@ impl Bar {
             }
             self.rect = s;
             unsafe {
-                let _ = SetWindowPos(self.hwnd, HWND_TOPMOST, s.left, s.top, s.right - s.left, s.bottom - s.top, SWP_NOACTIVATE | SWP_SHOWWINDOW);
+                let _ = SetWindowPos(self.hwnd, HWND_TOPMOST, s.left, s.top, s.right - s.left, s.bottom - s.top, self.show_flags());
             }
             return;
         }
@@ -331,7 +393,7 @@ impl Bar {
             }
             SHAppBarMessage(ABM_SETPOS, &mut abd);
             self.rect = abd.rc;
-            let _ = SetWindowPos(self.hwnd, HWND_TOPMOST, abd.rc.left, abd.rc.top, abd.rc.right - abd.rc.left, h, SWP_NOACTIVATE | SWP_SHOWWINDOW);
+            let _ = SetWindowPos(self.hwnd, HWND_TOPMOST, abd.rc.left, abd.rc.top, abd.rc.right - abd.rc.left, h, self.show_flags());
         }
     }
 }
@@ -380,6 +442,7 @@ impl App {
                 tracking: false,
                 registered: true,
                 edge: self.config.bar_edge,
+                fs: false,
             };
             bar.place(r, None);
             self.bars.push(bar);
@@ -442,10 +505,24 @@ impl App {
         self.bars_refresh();
     }
 
-    pub fn bar_fullscreen(&mut self, fullscreen: bool) {
-        for b in &self.bars {
+    /// Hide each monitor's bar while a fullscreen window (browser F11, video player, game)
+    /// is on top there; bring it back when that's no longer so.
+    pub fn bars_fullscreen_check(&mut self) {
+        let mons: Vec<RECT> = self.bars.iter().map(|b| self.monitors.get(b.mon).map(|m| m.rect).unwrap_or_default()).collect();
+        let fs = fullscreen_monitors(&mons);
+        for (b, on) in self.bars.iter_mut().zip(fs) {
+            if b.fs == on {
+                continue;
+            }
+            b.fs = on;
             unsafe {
-                let _ = SetWindowPos(b.hwnd, if fullscreen { HWND_BOTTOM } else { HWND_TOPMOST }, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+                if on {
+                    hide_tip();
+                    let _ = ShowWindow(b.hwnd, SW_HIDE);
+                } else {
+                    let r = b.rect;
+                    let _ = SetWindowPos(b.hwnd, HWND_TOPMOST, r.left, r.top, r.right - r.left, r.bottom - r.top, SWP_NOACTIVATE | SWP_SHOWWINDOW);
+                }
             }
         }
     }
@@ -869,7 +946,7 @@ pub unsafe extern "system" fn bar_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPA
                     with_app(|app| app.bar_reposition(hwnd));
                 }
                 ABN_FULLSCREENAPP => {
-                    with_app(|app| app.bar_fullscreen(lp.0 != 0));
+                    with_app(|app| app.bars_fullscreen_check());
                 }
                 _ => {}
             }

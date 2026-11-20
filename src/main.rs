@@ -68,6 +68,7 @@ const CLOCK_TIMER: usize = 3;
 const BAR_TIMER: usize = 4;
 const PLACE_TIMER: usize = 5;
 const TRAY_TIMER: usize = 6;
+const FS_TIMER: usize = 7;
 const OSD_MS: u32 = 900;
 const RUN_KEY: PCWSTR = w!("Software\\Microsoft\\Windows\\CurrentVersion\\Run");
 const APP_NAME: PCWSTR = w!("LastDesk");
@@ -1088,7 +1089,13 @@ unsafe extern "system" fn main_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
             with_app(|app| {
                 app.bars_refresh();
                 app.taskbar_enforce();
+                app.bars_fullscreen_check();
             });
+            LRESULT(0)
+        }
+        WM_TIMER if wp.0 == FS_TIMER => {
+            let _ = KillTimer(hwnd, FS_TIMER);
+            with_app(|app| app.bars_fullscreen_check());
             LRESULT(0)
         }
         WM_TIMER if wp.0 == TRAY_TIMER => {
@@ -1195,6 +1202,23 @@ unsafe extern "system" fn win_event(_: HWINEVENTHOOK, event: u32, hwnd: HWND, id
     }
     with_app(|app| app.schedule_bar_refresh());
 }
+
+/// A top-level window moved or resized (e.g. F11 fullscreen, which sends no move/size-end):
+/// re-check fullscreen soon. Only arms a timer, so the flood of these events stays cheap.
+unsafe extern "system" fn location_event(_: HWINEVENTHOOK, _: u32, hwnd: HWND, id_object: i32, id_child: i32, _: u32, _: u32) {
+    if id_object != OBJID_WINDOW.0 || id_child != CHILDID_SELF as i32 || hwnd.is_invalid() {
+        return;
+    }
+    if GetAncestor(hwnd, GA_ROOT) != hwnd {
+        return;
+    }
+    let main = MAIN_HWND.load(std::sync::atomic::Ordering::Relaxed);
+    if main != 0 {
+        SetTimer(HWND(main as *mut _), FS_TIMER, 120, None);
+    }
+}
+
+static MAIN_HWND: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(0);
 
 fn trace(s: &str) {
     if std::env::var_os("LASTDESK_TRACE").is_some() {
@@ -1310,6 +1334,7 @@ fn main() {
         trace("classes");
 
         let main = CreateWindowExW(WINDOW_EX_STYLE(0), w!("LastDeskMain"), w!("LastDesk"), WS_OVERLAPPED, 0, 0, 0, 0, None, None, hinst, None).unwrap();
+        MAIN_HWND.store(main.0 as isize, std::sync::atomic::Ordering::Relaxed);
         let osd = CreateWindowExW(
             WS_EX_LAYERED | WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_TRANSPARENT,
             w!("LastDeskOSD"),
@@ -1374,6 +1399,7 @@ fn main() {
         let _hook_cloak = SetWinEventHook(EVENT_OBJECT_CLOAKED, EVENT_OBJECT_UNCLOAKED, None, Some(win_event), 0, 0, WINEVENT_OUTOFCONTEXT);
         let _hook_min = SetWinEventHook(EVENT_SYSTEM_MINIMIZESTART, EVENT_SYSTEM_MINIMIZEEND, None, Some(win_event), 0, 0, WINEVENT_OUTOFCONTEXT);
         let _hook_move = SetWinEventHook(EVENT_SYSTEM_MOVESIZEEND, EVENT_SYSTEM_MOVESIZEEND, None, Some(win_event), 0, 0, WINEVENT_OUTOFCONTEXT);
+        let _hook_loc = SetWinEventHook(EVENT_OBJECT_LOCATIONCHANGE, EVENT_OBJECT_LOCATIONCHANGE, None, Some(location_event), 0, 0, WINEVENT_OUTOFCONTEXT);
 
         trace("loop"); let mut msg = MSG::default();
         while GetMessageW(&mut msg, None, 0, 0).as_bool() {
