@@ -184,25 +184,53 @@ fn press(keys: &[VIRTUAL_KEY]) {
 /// so while it's closed (cloaked), move it onto `work` (that monitor's work area) and the
 /// Win key then opens it there.
 fn place_start_menu(work: RECT) {
+    place_flyout(w!("Start"), work); // fills the work area
+    place_flyout(w!("Search"), work); // what Start turns into once you type
+}
+
+/// Move a closed shell flyout (Start, Search, Notification Centre…) onto the monitor with
+/// work area `work`, keeping how it sits in its current monitor's work area: full width or
+/// height, centred, or anchored to an edge (with the gap scaled to the new monitor's DPI).
+pub(crate) fn place_flyout(title: windows::core::PCWSTR, work: RECT) {
+    const FLAGS: SET_WINDOW_POS_FLAGS = SET_WINDOW_POS_FLAGS(SWP_NOZORDER.0 | SWP_NOACTIVATE.0 | SWP_NOOWNERZORDER.0);
     unsafe {
-        let Ok(s) = FindWindowW(w!("Windows.UI.Core.CoreWindow"), w!("Start")) else { return };
-        if !crate::cloak::is_cloaked(s) {
-            return; // already open: the Win key will just close it
+        let Ok(h) = FindWindowW(w!("Windows.UI.Core.CoreWindow"), title) else { return };
+        if !crate::cloak::is_cloaked(h) {
+            return; // open right now: leave it alone
         }
         let mut cur = RECT::default();
-        let _ = GetWindowRect(s, &mut cur);
-        if cur == work {
+        if GetWindowRect(h, &mut cur).is_err() {
             return;
         }
-        let _ = SetWindowPos(
-            s,
-            None,
-            work.left,
-            work.top,
-            work.right - work.left,
-            work.bottom - work.top,
-            SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOOWNERZORDER,
-        );
+        let mut mi = MONITORINFO { cbSize: std::mem::size_of::<MONITORINFO>() as u32, ..Default::default() };
+        if !GetMonitorInfoW(MonitorFromWindow(h, MONITOR_DEFAULTTONEAREST), &mut mi).as_bool() {
+            return;
+        }
+        let from = mi.rcWork;
+        if from == work {
+            return;
+        }
+        // Step 1: move it over and let it rescale itself for the new monitor's DPI.
+        let _ = SetWindowPos(h, None, work.left, work.top, 0, 0, FLAGS | SWP_NOSIZE);
+        let mut moved = RECT::default();
+        let _ = GetWindowRect(h, &mut moved);
+        let k = (moved.right - moved.left) as f32 / (cur.right - cur.left).max(1) as f32;
+        // Step 2: place it in the same relative spot, per axis.
+        let axis = |c0: i32, c1: i32, f0: i32, f1: i32, t0: i32, t1: i32, size: i32| -> (i32, i32) {
+            let (g0, g1) = (c0 - f0, f1 - c1);
+            if g0.abs() <= 2 && g1.abs() <= 2 {
+                (t0, t1 - t0) // fills that axis
+            } else if (g0 - g1).abs() <= 4 {
+                (t0 + (t1 - t0 - size) / 2, size) // centred
+            } else if g0 < g1 {
+                (t0 + (g0 as f32 * k) as i32, size)
+            } else {
+                (t1 - (g1 as f32 * k) as i32 - size, size)
+            }
+        };
+        let (x, w) = axis(cur.left, cur.right, from.left, from.right, work.left, work.right, moved.right - moved.left);
+        let (y, hgt) = axis(cur.top, cur.bottom, from.top, from.bottom, work.top, work.bottom, moved.bottom - moved.top);
+        let _ = SetWindowPos(h, None, x, y, w, hgt, FLAGS);
     }
 }
 
@@ -747,7 +775,11 @@ impl App {
                 return Some(vec![VK_LWIN, VIRTUAL_KEY('B' as u16)]);
             }
             Hit::Battery if !middle => return Some(vec![VK_LWIN, VIRTUAL_KEY('A' as u16)]),
-            Hit::Clock if !middle => return Some(vec![VK_LWIN, VIRTUAL_KEY('N' as u16)]),
+            Hit::Clock if !middle => {
+                place_flyout(w!("Notification Centre"), self.monitors[m].work);
+                place_flyout(w!("Notification Center"), self.monitors[m].work);
+                return Some(vec![VK_LWIN, VIRTUAL_KEY('N' as u16)]);
+            }
             _ => {}
         }
         None
