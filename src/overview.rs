@@ -272,6 +272,82 @@ impl App {
             let _ = SetForegroundWindow(focus);
             let _ = SetFocus(focus);
         }
+        self.overview_intro();
+    }
+
+    /// Zoom-in: windows of the shown workspace shrink from where they are into their cards,
+    /// the other workspaces' cards grow and fade in. Blocking, synced to the display.
+    fn overview_intro(&self) {
+        let ms = self.config.animation;
+        let Some(ov) = self.overview.as_ref() else { return };
+        if ms == 0 {
+            return;
+        }
+        // (thumb, from, to, fade)
+        let mut items: Vec<(isize, RECT, RECT, bool)> = Vec::new();
+        for o in &ov.overlays {
+            let active = self.mons.get(o.mon).map(|m| m.active).unwrap_or(0);
+            for col in &o.columns {
+                for c in &col.cards {
+                    if c.thumb == 0 {
+                        continue;
+                    }
+                    let to = c.thumb_rect;
+                    let h = key_hwnd(c.hwnd);
+                    let mut wr = RECT::default();
+                    let live = col.ws == active
+                        && unsafe { !IsIconic(h).as_bool() && GetWindowRect(h, &mut wr).is_ok() };
+                    if live {
+                        let from = RECT {
+                            left: wr.left - o.origin.x,
+                            top: wr.top - o.origin.y,
+                            right: wr.right - o.origin.x,
+                            bottom: wr.bottom - o.origin.y,
+                        };
+                        items.push((c.thumb, from, to, false));
+                    } else {
+                        let (cx, cy) = ((to.left + to.right) / 2, (to.top + to.bottom) / 2);
+                        let (hw, hh) = ((to.right - to.left) * 2 / 5, (to.bottom - to.top) * 2 / 5);
+                        items.push((c.thumb, RECT { left: cx - hw, top: cy - hh, right: cx + hw, bottom: cy + hh }, to, true));
+                    }
+                }
+            }
+        }
+        let lerp = |a: i32, b: i32, p: f32| a + ((b - a) as f32 * p).round() as i32;
+        let frame = |p: f32| {
+            for &(t, a, b, fade) in &items {
+                let r = RECT {
+                    left: lerp(a.left, b.left, p),
+                    top: lerp(a.top, b.top, p),
+                    right: lerp(a.right, b.right, p),
+                    bottom: lerp(a.bottom, b.bottom, p),
+                };
+                set_thumb(t, r, if fade { (255.0 * p) as u8 } else { 255 });
+            }
+        };
+        frame(0.0);
+        // Paint the panels now: the normal WM_PAINT can't reach us until this returns.
+        unsafe {
+            for o in &ov.overlays {
+                let hdc = GetDC(o.hwnd);
+                self.overview_paint(o.hwnd, hdc);
+                ReleaseDC(o.hwnd, hdc);
+            }
+            let _ = DwmFlush();
+        }
+        let start = std::time::Instant::now();
+        let total = (ms as f32 / 1000.0).max(0.001);
+        loop {
+            let t = (start.elapsed().as_secs_f32() / total).min(1.0);
+            frame(1.0 - (1.0 - t).powi(3));
+            unsafe {
+                let _ = DwmFlush();
+            }
+            if t >= 1.0 {
+                break;
+            }
+        }
+        ov.apply_opacity();
     }
 
     pub fn overview_close(&mut self) {
