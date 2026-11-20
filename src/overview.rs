@@ -56,6 +56,28 @@ pub struct Drag {
     pub cur: POINT,
     pub active: bool,
     pub label: String,
+    /// The card's own thumbnail and where it sits (overlay-local), dimmed while dragging.
+    pub orig_thumb: isize,
+    pub orig_rect: RECT,
+    /// Cursor offset inside the thumbnail, and its size.
+    pub grab: POINT,
+    pub size: SIZE,
+    /// Live thumbnail following the cursor, registered on the overlay under it.
+    pub ghost: isize,
+    pub ghost_on: HWND,
+    pub target: Option<(usize, usize)>,
+}
+
+impl Drag {
+    fn drop_ghost(&mut self) {
+        if self.ghost != 0 {
+            unsafe {
+                let _ = DwmUnregisterThumbnail(self.ghost);
+            }
+            self.ghost = 0;
+            self.ghost_on = HWND::default();
+        }
+    }
 }
 
 pub struct Overview {
@@ -69,6 +91,13 @@ enum Hit {
     Header(usize, usize),
     Column(usize, usize),
     None,
+}
+
+fn drop_target(h: Hit) -> Option<(usize, usize)> {
+    match h {
+        Hit::Card(m, w, _) | Hit::Header(m, w) | Hit::Column(m, w) => Some((m, w)),
+        Hit::None => None,
+    }
 }
 
 fn contains(r: &RECT, p: POINT) -> bool {
@@ -372,7 +401,10 @@ impl App {
     }
 
     pub fn overview_close(&mut self) {
-        if self.overview.is_some() {
+        if let Some(ov) = self.overview.as_mut() {
+            if let Some(mut d) = ov.drag.take() {
+                d.drop_ghost();
+            }
             unsafe {
                 let _ = ReleaseCapture();
             }
@@ -537,7 +569,7 @@ impl App {
             }
 
             // Drag ghost follows the cursor on whichever monitor it is.
-            if let Some(d) = ov.drag.as_ref().filter(|d| d.active) {
+            if let Some(d) = ov.drag.as_ref().filter(|d| d.active && d.ghost == 0) {
                 let lx = d.cur.x - o.origin.x;
                 let ly = d.cur.y - o.origin.y;
                 if lx >= 0 && ly >= 0 && lx < o.w && ly < o.h {
@@ -579,14 +611,41 @@ impl App {
         let Some(ov) = self.overview.as_mut() else { return };
         match ov.hit(p) {
             Hit::Card(m, w, k) => {
-                let label = ov
+                let found = ov
                     .overlays
                     .iter()
-                    .flat_map(|o| o.columns.iter().flat_map(|c| c.cards.iter()))
-                    .find(|c| c.hwnd == k)
-                    .map(|c| if c.app.is_empty() { c.title.clone() } else { c.app.clone() })
-                    .unwrap_or_default();
-                ov.drag = Some(Drag { hwnd: k, from: (m, w), start: p, cur: p, active: false, label });
+                    .flat_map(|o| o.columns.iter().flat_map(move |c| c.cards.iter().map(move |card| (o.origin, card))))
+                    .find(|(_, c)| c.hwnd == k);
+                let mut d = Drag {
+                    hwnd: k,
+                    from: (m, w),
+                    start: p,
+                    cur: p,
+                    active: false,
+                    label: String::new(),
+                    orig_thumb: 0,
+                    orig_rect: RECT::default(),
+                    grab: POINT::default(),
+                    size: SIZE::default(),
+                    ghost: 0,
+                    ghost_on: HWND::default(),
+                    target: None,
+                };
+                if let Some((origin, c)) = found {
+                    d.label = if c.app.is_empty() { c.title.clone() } else { c.app.clone() };
+                    if c.thumb != 0 {
+                        let r = c.thumb_rect;
+                        d.orig_thumb = c.thumb;
+                        d.orig_rect = r;
+                        d.size = SIZE { cx: r.right - r.left, cy: r.bottom - r.top };
+                        // Keep the grab point inside the thumbnail even if the click was on the title.
+                        d.grab = POINT {
+                            x: (p.x - origin.x - r.left).clamp(0, d.size.cx),
+                            y: (p.y - origin.y - r.top).clamp(0, d.size.cy),
+                        };
+                    }
+                }
+                ov.drag = Some(d);
                 unsafe {
                     SetCapture(overlay);
                 }
@@ -599,13 +658,60 @@ impl App {
 
     pub fn overview_mouse_move(&mut self, p: POINT) {
         let Some(ov) = self.overview.as_mut() else { return };
-        let Some(d) = ov.drag.as_mut() else { return };
+        if ov.drag.is_none() {
+            return;
+        }
+        let target = drop_target(ov.hit(p));
+        let at = ov
+            .overlays
+            .iter()
+            .find(|o| p.x >= o.origin.x && p.y >= o.origin.y && p.x < o.origin.x + o.w && p.y < o.origin.y + o.h)
+            .map(|o| (o.hwnd, o.origin));
+        let d = ov.drag.as_mut().unwrap();
         d.cur = p;
         if !d.active && ((p.x - d.start.x).abs() > 8 || (p.y - d.start.y).abs() > 8) {
             d.active = true;
+            if d.orig_thumb != 0 {
+                set_thumb(d.orig_thumb, d.orig_rect, 50); // leave a faint placeholder
+            }
         }
-        if d.active {
+        if !d.active {
+            return;
+        }
+        let mut repaint = d.target != target;
+        d.target = target;
+        if d.size.cx > 0 {
+            if let Some((oh, origin)) = at {
+                if d.ghost_on != oh {
+                    d.drop_ghost();
+                    if let Ok(t) = unsafe { DwmRegisterThumbnail(oh, key_hwnd(d.hwnd)) } {
+                        d.ghost = t;
+                        d.ghost_on = oh;
+                    }
+                }
+                if d.ghost != 0 {
+                    let (l, t) = (p.x - origin.x - d.grab.x, p.y - origin.y - d.grab.y);
+                    set_thumb(d.ghost, RECT { left: l, top: t, right: l + d.size.cx, bottom: t + d.size.cy }, 225);
+                }
+            }
+        } else {
+            repaint = true; // text ghost is painted
+        }
+        if repaint {
             ov.invalidate();
+        }
+    }
+
+    /// Paint every overlay right away (WM_PAINT can't run while we animate).
+    fn overview_paint_now(&self) {
+        let Some(ov) = self.overview.as_ref() else { return };
+        unsafe {
+            for o in &ov.overlays {
+                let hdc = GetDC(o.hwnd);
+                self.overview_paint(o.hwnd, hdc);
+                ReleaseDC(o.hwnd, hdc);
+                let _ = ValidateRect(o.hwnd, None);
+            }
         }
     }
 
@@ -614,19 +720,66 @@ impl App {
             let _ = ReleaseCapture();
         }
         let Some(ov) = self.overview.as_mut() else { return };
-        let Some(d) = ov.drag.take() else { return };
+        let Some(mut d) = ov.drag.take() else { return };
         if !d.active {
             self.overview_jump(d.from.0, d.from.1, Some(d.hwnd));
             return;
         }
-        let to = match ov.hit(p) {
-            Hit::Card(m, w, _) | Hit::Header(m, w) | Hit::Column(m, w) => Some((m, w)),
-            Hit::None => None,
-        };
-        if let Some(to) = to {
+        if let Some(to) = drop_target(ov.hit(p)) {
             self.move_window(d.hwnd, d.from, to);
         }
         self.overview_layout();
+        self.overview_land(&mut d);
+    }
+
+    /// Fly the dragged thumbnail into its (new or old) card, then hand over to the card.
+    fn overview_land(&self, d: &mut Drag) {
+        let Some(ov) = self.overview.as_ref() else { return d.drop_ghost() };
+        let card = ov
+            .overlays
+            .iter()
+            .filter(|o| o.hwnd == d.ghost_on)
+            .flat_map(|o| o.columns.iter().flat_map(|c| c.cards.iter()))
+            .find(|c| c.hwnd == d.hwnd && c.thumb != 0)
+            .map(|c| (c.thumb, c.thumb_rect));
+        let ms = self.config.animation.min(180);
+        let (Some((thumb, to)), true, true) = (card, d.ghost != 0, ms > 0) else { return d.drop_ghost() };
+        // Re-register the ghost so it draws above the freshly laid-out cards.
+        let from = {
+            let o = ov.overlays.iter().find(|o| o.hwnd == d.ghost_on).unwrap();
+            let (l, t) = (d.cur.x - o.origin.x - d.grab.x, d.cur.y - o.origin.y - d.grab.y);
+            RECT { left: l, top: t, right: l + d.size.cx, bottom: t + d.size.cy }
+        };
+        let on = d.ghost_on;
+        d.drop_ghost();
+        let Ok(g) = (unsafe { DwmRegisterThumbnail(on, key_hwnd(d.hwnd)) }) else { return };
+        set_thumb(g, from, 225);
+        set_thumb(thumb, to, 0);
+        self.overview_paint_now();
+        let lerp = |a: i32, b: i32, p: f32| a + ((b - a) as f32 * p).round() as i32;
+        let start = std::time::Instant::now();
+        let total = ms as f32 / 1000.0;
+        loop {
+            let t = (start.elapsed().as_secs_f32() / total).min(1.0);
+            let e = 1.0 - (1.0 - t).powi(3);
+            let r = RECT {
+                left: lerp(from.left, to.left, e),
+                top: lerp(from.top, to.top, e),
+                right: lerp(from.right, to.right, e),
+                bottom: lerp(from.bottom, to.bottom, e),
+            };
+            set_thumb(g, r, (225.0 + 30.0 * e) as u8);
+            unsafe {
+                let _ = DwmFlush();
+            }
+            if t >= 1.0 {
+                break;
+            }
+        }
+        unsafe {
+            let _ = DwmUnregisterThumbnail(g);
+        }
+        ov.apply_opacity();
     }
 
     pub fn overview_key(&mut self, vk: u32) {
