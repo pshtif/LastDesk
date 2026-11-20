@@ -179,6 +179,33 @@ fn press(keys: &[VIRTUAL_KEY]) {
     }
 }
 
+/// Windows opens Start on the monitor whose taskbar was clicked last; with those taskbars
+/// hidden it always picks the main monitor. Start's host window keeps wherever it was put,
+/// so while it's closed (cloaked), move it onto `work` (that monitor's work area) and the
+/// Win key then opens it there.
+fn place_start_menu(work: RECT) {
+    unsafe {
+        let Ok(s) = FindWindowW(w!("Windows.UI.Core.CoreWindow"), w!("Start")) else { return };
+        if !crate::cloak::is_cloaked(s) {
+            return; // already open: the Win key will just close it
+        }
+        let mut cur = RECT::default();
+        let _ = GetWindowRect(s, &mut cur);
+        if cur == work {
+            return;
+        }
+        let _ = SetWindowPos(
+            s,
+            None,
+            work.left,
+            work.top,
+            work.right - work.left,
+            work.bottom - work.top,
+            SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOOWNERZORDER,
+        );
+    }
+}
+
 fn appbar_data(hwnd: HWND, rc: RECT) -> APPBARDATA {
     APPBARDATA {
         cbSize: std::mem::size_of::<APPBARDATA>() as u32,
@@ -694,7 +721,10 @@ impl App {
         let i = self.bar_index(hwnd)?;
         let m = self.bars[i].mon;
         match self.bars[i].hit(x, y) {
-            Hit::Start if !middle => return Some(vec![VK_LWIN]),
+            Hit::Start if !middle => {
+                place_start_menu(self.monitors[m].work);
+                return Some(vec![VK_LWIN]);
+            }
             Hit::Workspace(w) if !middle => self.switch_to(m, w, None),
             Hit::Window(k) => unsafe {
                 let h = key_hwnd(k);
