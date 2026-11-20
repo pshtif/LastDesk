@@ -234,13 +234,15 @@ impl App {
             for (m, mon) in self.monitors.iter().enumerate() {
                 let r = mon.rect;
                 let Ok(hwnd) = CreateWindowExW(
-                    WS_EX_TOPMOST | WS_EX_TOOLWINDOW,
+                    WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_LAYERED,
                     CLASS,
                     w!("LastDesk overview"),
                     WS_POPUP,
                     r.left, r.top, r.right - r.left, r.bottom - r.top,
                     None, None, hinst, None,
                 ) else { continue };
+                // Layered so the whole panel can fade in; fully opaque straight away if animation is off.
+                let _ = SetLayeredWindowAttributes(hwnd, COLORREF(0), if self.config.animation > 0 { 0 } else { 255 }, LWA_ALPHA);
                 let (mut dx, mut dy) = (96u32, 96u32);
                 let hm = MonitorFromPoint(POINT { x: (r.left + r.right) / 2, y: (r.top + r.bottom) / 2 }, MONITOR_DEFAULTTONEAREST);
                 let _ = GetDpiForMonitor(hm, MDT_EFFECTIVE_DPI, &mut dx, &mut dy);
@@ -322,7 +324,7 @@ impl App {
                     right: lerp(a.right, b.right, p),
                     bottom: lerp(a.bottom, b.bottom, p),
                 };
-                set_thumb(t, r, if fade { (255.0 * p) as u8 } else { 255 });
+                set_thumb(t, r, if fade { (255.0 * p.sqrt()) as u8 } else { 255 });
             }
         };
         frame(0.0);
@@ -335,11 +337,19 @@ impl App {
             }
             let _ = DwmFlush();
         }
+        let fade_panels = |a: f32| {
+            for o in &ov.overlays {
+                unsafe {
+                    let _ = SetLayeredWindowAttributes(o.hwnd, COLORREF(0), (255.0 * a) as u8, LWA_ALPHA);
+                }
+            }
+        };
         let start = std::time::Instant::now();
         let total = (ms as f32 / 1000.0).max(0.001);
         loop {
             let t = (start.elapsed().as_secs_f32() / total).min(1.0);
             frame(1.0 - (1.0 - t).powi(3));
+            fade_panels((t * 1.6).min(1.0));
             unsafe {
                 let _ = DwmFlush();
             }
