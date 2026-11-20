@@ -43,6 +43,7 @@ const ID_RULES: i32 = 113;
 const ID_STATUS: i32 = 114;
 const ID_NEXT: i32 = 115;
 const ID_PREV: i32 = 116;
+const ID_ANIM: i32 = 117;
 
 const EN_KILLFOCUS: u32 = 0x0200;
 const WM_MOUSELEAVE: u32 = 0x02A3;
@@ -132,8 +133,9 @@ fn seg_value(id: i32) -> String {
 fn gather() -> Config {
     let lines = |id: i32| text_of(id).lines().map(|l| l.trim().to_string()).filter(|l| !l.is_empty()).collect::<Vec<_>>().join("\n");
     let text = format!(
-        "workspaces = {}\n[keys]\nswitch = {}\nmove = {}\npin = {}\noverview = {}\nnext = {}\nprev = {}\n[bar]\nenabled = {}\nposition = {}\nbuttons = {}\nalign = {}\nhide_taskbar = {}\ntray = {}\n[pinned_apps]\n{}\n[rules]\n{}\n",
+        "workspaces = {}\nanimation = {}\n[keys]\nswitch = {}\nmove = {}\npin = {}\noverview = {}\nnext = {}\nprev = {}\n[bar]\nenabled = {}\nposition = {}\nbuttons = {}\nalign = {}\nhide_taskbar = {}\ntray = {}\n[pinned_apps]\n{}\n[rules]\n{}\n",
         seg_value(ID_WORKSPACES),
+        seg_value(ID_ANIM),
         seg_value(ID_SWITCH),
         seg_value(ID_MOVE),
         text_of(ID_PIN).trim(),
@@ -460,6 +462,13 @@ pub fn open() {
         let nums: Vec<(String, String)> = (1..=9).map(|n| (n.to_string(), n.to_string())).collect();
         let nums_ref: Vec<(&str, &str)> = nums.iter().map(|(a, b)| (a.as_str(), b.as_str())).collect();
         seg(ID_WORKSPACES, &nums_ref, &cfg.workspaces.to_string(), y);
+        y += 40;
+        label("Switch animation", y);
+        let anim_sel = match config::anim_name(cfg.animation).as_str() {
+            n @ ("off" | "fast" | "normal" | "slow") => n.to_string(),
+            _ => "normal".to_string(),
+        };
+        seg(ID_ANIM, &[("Off", "off"), ("Fast", "fast"), ("Normal", "normal"), ("Slow", "slow")], &anim_sel, y);
         y += 50;
 
         header("Shortcuts", y);
@@ -558,7 +567,7 @@ pub unsafe extern "system" fn settings_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp
                     let p = wide(&config::path().display().to_string());
                     ShellExecuteW(None, w!("open"), w!("notepad.exe"), PCWSTR(p.as_ptr()), None, SW_SHOWNORMAL);
                 }
-                ID_WORKSPACES | ID_SWITCH | ID_MOVE | ID_BAR | ID_EDGE | ID_BUTTONS | ID_ALIGN | ID_HIDE_TASKBAR | ID_TRAY => apply(),
+                ID_WORKSPACES | ID_ANIM | ID_SWITCH | ID_MOVE | ID_BAR | ID_EDGE | ID_BUTTONS | ID_ALIGN | ID_HIDE_TASKBAR | ID_TRAY => apply(),
                 ID_PIN | ID_OVERVIEW | ID_NEXT | ID_PREV | ID_PINNED | ID_RULES if code == EN_KILLFOCUS => apply(),
                 _ => {}
             }

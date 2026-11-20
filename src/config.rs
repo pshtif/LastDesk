@@ -36,6 +36,8 @@ pub enum Align {
 #[derive(Clone)]
 pub struct Config {
     pub workspaces: usize,
+    /// Workspace switch slide duration in ms; 0 = off.
+    pub animation: u32,
     pub switch: HOT_KEY_MODIFIERS,
     pub switch_text: String,
     pub move_: HOT_KEY_MODIFIERS,
@@ -135,6 +137,26 @@ pub fn save(c: &Config) -> std::io::Result<()> {
     std::fs::write(p, render(c))
 }
 
+pub fn anim_ms(v: &str) -> Option<u32> {
+    match v.trim().to_lowercase().as_str() {
+        "off" | "none" | "false" | "0" => Some(0),
+        "fast" => Some(130),
+        "normal" | "on" | "true" => Some(200),
+        "slow" => Some(320),
+        n => n.trim_end_matches("ms").trim().parse::<u32>().ok().filter(|v| *v <= 2000),
+    }
+}
+
+pub fn anim_name(ms: u32) -> String {
+    match ms {
+        0 => "off".into(),
+        130 => "fast".into(),
+        200 => "normal".into(),
+        320 => "slow".into(),
+        n => n.to_string(),
+    }
+}
+
 fn bool_of(v: &str) -> Option<bool> {
     match v.to_lowercase().as_str() {
         "true" | "yes" | "on" | "1" => Some(true),
@@ -146,6 +168,7 @@ fn bool_of(v: &str) -> Option<bool> {
 pub fn parse(text: &str) -> Config {
     let mut c = Config {
         workspaces: 4,
+        animation: 200,
         switch: MOD_ALT,
         switch_text: "alt".into(),
         move_: MOD_ALT | MOD_SHIFT,
@@ -183,6 +206,10 @@ pub fn parse(text: &str) -> Config {
             ("", "workspaces") => match val.parse::<usize>() {
                 Ok(v) if (1..=9).contains(&v) => c.workspaces = v,
                 _ => bad(),
+            },
+            ("", "animation") => match anim_ms(val) {
+                Some(v) => c.animation = v,
+                None => bad(),
             },
             ("keys", "switch") => match parse_mods(val) {
                 Some(m) => (c.switch, c.switch_text) = (m, val.to_lowercase()),
@@ -269,7 +296,9 @@ pub fn render(c: &Config) -> String {
     s.push_str("# LastDesk configuration. Use tray > Settings, or edit this file and use tray > \"Reload config\".\n");
     s.push_str("# Lines starting with # are comments.\n\n");
     s.push_str("# Workspaces per monitor (1-9).\n");
-    s.push_str(&format!("workspaces = {}\n\n", c.workspaces));
+    s.push_str(&format!("workspaces = {}\n", c.workspaces));
+    s.push_str("# Slide when switching workspaces: off | fast | normal | slow (or milliseconds).\n");
+    s.push_str(&format!("animation = {}\n\n", anim_name(c.animation)));
     s.push_str("[keys]\n");
     s.push_str("# Switch workspace:            <switch>+1..N\n");
     s.push_str(&format!("switch = {}\n", c.switch_text));

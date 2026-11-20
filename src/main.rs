@@ -13,6 +13,7 @@
 
 #![windows_subsystem = "windows"]
 
+mod anim;
 mod bar;
 mod cloak;
 mod config;
@@ -459,6 +460,19 @@ impl App {
             return;
         }
         let leaving = self.visible_on(m);
+        let slide = if self.config.animation > 0 && self.overview.is_none() {
+            let dir = if target > self.mons[m].active { 1 } else { -1 };
+            let inn: Vec<HWND> = self.mons[m].hidden[target].iter().map(|k| key_hwnd(*k)).collect();
+            let name = self.mons[m].name.clone();
+            let still: Vec<HWND> = win::visible_windows()
+                .into_iter()
+                .filter(|h| self.pinned.contains(&hwnd_key(*h)) || self.is_pinned_app(*h))
+                .filter(|h| win::monitor_name_of_window(*h).as_deref() == Some(name.as_str()))
+                .collect();
+            anim::Slide::begin(self.monitors[m].work, dir, self.config.animation, &leaving, &inn, &still)
+        } else {
+            None
+        };
         // Show the target first, then hide the old one: less desktop flash.
         let to_show = std::mem::take(&mut self.mons[m].hidden[target]);
         let mut first = None;
@@ -482,6 +496,9 @@ impl App {
                 let _ = SetForegroundWindow(h);
             },
             None => self.focus_empty(m),
+        }
+        if let Some(s) = slide {
+            s.run();
         }
         self.save();
         self.update_tray();
