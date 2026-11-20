@@ -192,10 +192,20 @@ fn place_start_menu(work: RECT) {
 /// work area `work`, keeping how it sits in its current monitor's work area: full width or
 /// height, centred, or anchored to an edge (with the gap scaled to the new monitor's DPI).
 pub(crate) fn place_flyout(title: windows::core::PCWSTR, work: RECT) {
+    place_window(w!("Windows.UI.Core.CoreWindow"), title, work);
+}
+
+/// Same, for any shell window by class + title. "Closed" = cloaked or hidden.
+fn place_window(class: windows::core::PCWSTR, title: windows::core::PCWSTR, work: RECT) {
+    place_window_ex(class, title, work, false);
+}
+
+/// `open_ok`: also move it while it is showing (for flyouts Windows re-places on open).
+fn place_window_ex(class: windows::core::PCWSTR, title: windows::core::PCWSTR, work: RECT, open_ok: bool) {
     const FLAGS: SET_WINDOW_POS_FLAGS = SET_WINDOW_POS_FLAGS(SWP_NOZORDER.0 | SWP_NOACTIVATE.0 | SWP_NOOWNERZORDER.0);
     unsafe {
-        let Ok(h) = FindWindowW(w!("Windows.UI.Core.CoreWindow"), title) else { return };
-        if !crate::cloak::is_cloaked(h) {
+        let Ok(h) = FindWindowW(class, title) else { return };
+        if !open_ok && !crate::cloak::is_cloaked(h) && IsWindowVisible(h).as_bool() {
             return; // open right now: leave it alone
         }
         let mut cur = RECT::default();
@@ -775,7 +785,23 @@ impl App {
                 crate::taskbar::peek();
                 return Some(vec![VK_LWIN, VIRTUAL_KEY('B' as u16)]);
             }
-            Hit::Battery if !middle => return Some(vec![VK_LWIN, VIRTUAL_KEY('A' as u16)]),
+            Hit::Battery if !middle => {
+                // Windows puts Quick settings back by the main taskbar every time it opens,
+                // so wait for it to appear and move it then.
+                let work = self.monitors[m].work;
+                std::thread::spawn(move || unsafe {
+                    for _ in 0..150 {
+                        std::thread::sleep(std::time::Duration::from_millis(4));
+                        if let Ok(h) = FindWindowW(w!("ControlCenterWindow"), w!("Quick settings")) {
+                            if IsWindowVisible(h).as_bool() {
+                                place_window_ex(w!("ControlCenterWindow"), w!("Quick settings"), work, true);
+                                return;
+                            }
+                        }
+                    }
+                });
+                return Some(vec![VK_LWIN, VIRTUAL_KEY(b'A' as u16)]);
+            }
             Hit::Clock if !middle => {
                 place_flyout(w!("Notification Centre"), self.monitors[m].work);
                 place_flyout(w!("Notification Center"), self.monitors[m].work);
