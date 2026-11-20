@@ -103,6 +103,9 @@ struct App {
     seen: HashSet<isize>,
     /// New windows waiting for the rule timer (the shell needs a moment before it can cloak them).
     pending: Vec<isize>,
+    /// Start was opened from this monitor's bar: (monitor, when, windows that already existed).
+    /// New windows appearing soon after go to that monitor.
+    launch: Option<(usize, std::time::Instant, HashSet<isize>)>,
     bars: Vec<bar::Bar>,
     /// LastDesk is keeping the Windows taskbar hidden (its bar sits in the taskbar's strip).
     taskbar_hidden: bool,
@@ -249,7 +252,10 @@ impl App {
     /// A window was shown: queue it for the rule check if it's new.
     fn on_show(&mut self, h: HWND) {
         let k = hwnd_key(h);
-        if self.config.rules.is_empty() || self.seen.contains(&k) || !win::is_manageable(h, false) {
+        if (self.config.rules.is_empty() && self.launch_target(k).is_none())
+            || self.seen.contains(&k)
+            || !win::is_manageable(h, false)
+        {
             return;
         }
         self.seen.insert(k);
@@ -262,28 +268,53 @@ impl App {
     fn run_pending_rules(&mut self) {
         for k in std::mem::take(&mut self.pending) {
             let h = key_hwnd(k);
-            if win::is_manageable(h, false) {
-                self.apply_rule(h);
+            if win::is_manageable(h, false) && !self.apply_rule(h) {
+                self.apply_launch(h);
             }
         }
     }
 
-    /// Send window h to the workspace its app rule names.
-    fn apply_rule(&mut self, h: HWND) {
+    /// Monitor a new window should open on because Start was just opened from that
+    /// monitor's bar (Windows itself always opens them on the main monitor).
+    fn launch_target(&self, k: isize) -> Option<usize> {
+        const WINDOW: std::time::Duration = std::time::Duration::from_secs(20);
+        match &self.launch {
+            Some((m, at, existing)) if at.elapsed() < WINDOW && !existing.contains(&k) => Some(*m),
+            _ => None,
+        }
+    }
+
+    fn apply_launch(&mut self, h: HWND) {
+        let k = hwnd_key(h);
+        let Some(to) = self.launch_target(k) else { return };
+        let Some(cur) = win::monitor_name_of_window(h).and_then(|n| self.mon_index(&n)) else { return };
+        if cur != to && to < self.mons.len() {
+            self.move_window(k, (cur, self.mons[cur].active), (to, self.mons[to].active));
+        }
+    }
+
+    /// Remember that Start was opened from monitor `m`'s bar.
+    pub(crate) fn note_start_opened(&mut self, m: usize) {
+        self.launch = Some((m, std::time::Instant::now(), win::all_top_level().into_iter().map(hwnd_key).collect()));
+    }
+
+    /// Send window h to the workspace its app rule names. Returns whether a rule matched.
+    fn apply_rule(&mut self, h: HWND) -> bool {
         let k = hwnd_key(h);
         let exe = self.exe(h);
-        let Some(rule) = self.config.rules.iter().find(|r| r.app == exe) else { return };
+        let Some(rule) = self.config.rules.iter().find(|r| r.app == exe) else { return false };
         let to = (rule.monitor.min(self.mons.len().saturating_sub(1)), rule.workspace.min(workspaces() - 1));
-        let Some(cur) = win::monitor_name_of_window(h).and_then(|n| self.mon_index(&n)) else { return };
+        let Some(cur) = win::monitor_name_of_window(h).and_then(|n| self.mon_index(&n)) else { return true };
         let from = (cur, self.mons[cur].active);
         if from == to {
-            return;
+            return true;
         }
         self.move_window(k, from, to);
         if to.1 != self.mons[to.0].active {
             let labels = monitor_labels(self.mons.len());
             self.show_osd(to.0, Some(format!("{} → {}, workspace {}", overview::app_name(h), labels[to.0], to.1 + 1)));
         }
+        true
     }
 
     /// Hide or restore the Windows taskbar to match the config.
@@ -1311,6 +1342,7 @@ fn main() {
             exe_cache: RefCell::new(HashMap::new()),
             seen: HashSet::new(),
             pending: Vec::new(),
+            launch: None,
             bars: Vec::new(),
             taskbar_hidden: false,
         };

@@ -751,6 +751,7 @@ impl App {
         match self.bars[i].hit(x, y) {
             Hit::Start if !middle => {
                 place_start_menu(self.monitors[m].work);
+                self.note_start_opened(m);
                 return Some(vec![VK_LWIN]);
             }
             Hit::Workspace(w) if !middle => self.switch_to(m, w, None),

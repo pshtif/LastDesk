@@ -163,6 +163,19 @@ pub fn is_manageable(h: HWND, allow_cloaked: bool) -> bool {
     }
 }
 
+/// Every top-level window, visible or not.
+pub fn all_top_level() -> Vec<HWND> {
+    unsafe extern "system" fn cb(h: HWND, data: LPARAM) -> BOOL {
+        (*(data.0 as *mut Vec<HWND>)).push(h);
+        TRUE
+    }
+    let mut v: Vec<HWND> = Vec::new();
+    unsafe {
+        let _ = EnumWindows(Some(cb), LPARAM(&mut v as *mut _ as isize));
+    }
+    v
+}
+
 /// Visible, manageable top-level windows in z-order (topmost first).
 pub fn visible_windows() -> Vec<HWND> {
     unsafe extern "system" fn cb(h: HWND, data: LPARAM) -> BOOL {
