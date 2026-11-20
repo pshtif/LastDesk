@@ -42,6 +42,8 @@ pub struct Config {
     pub move_text: String,
     pub pin: Hotkey,
     pub overview: Hotkey,
+    pub next: Hotkey,
+    pub prev: Hotkey,
     pub pinned_apps: Vec<String>,
     pub rules: Vec<Rule>,
     pub bar: bool,
@@ -150,6 +152,8 @@ pub fn parse(text: &str) -> Config {
         move_text: "alt+shift".into(),
         pin: parse_hotkey("alt+shift+p").unwrap(),
         overview: parse_hotkey("alt+`").unwrap(),
+        next: parse_hotkey("ctrl+alt+right").unwrap(),
+        prev: parse_hotkey("ctrl+alt+left").unwrap(),
         pinned_apps: Vec::new(),
         rules: Vec::new(),
         bar: true,
@@ -194,6 +198,14 @@ pub fn parse(text: &str) -> Config {
             },
             ("keys", "overview") => match parse_hotkey(val) {
                 Some(h) => c.overview = h,
+                None => bad(),
+            },
+            ("keys", "next") => match parse_hotkey(val) {
+                Some(h) => c.next = h,
+                None => bad(),
+            },
+            ("keys", "prev") => match parse_hotkey(val) {
+                Some(h) => c.prev = h,
                 None => bad(),
             },
             ("bar", "enabled") => match bool_of(val) {

@@ -41,6 +41,8 @@ const ID_TRAY: i32 = 111;
 const ID_PINNED: i32 = 112;
 const ID_RULES: i32 = 113;
 const ID_STATUS: i32 = 114;
+const ID_NEXT: i32 = 115;
+const ID_PREV: i32 = 116;
 
 const EN_KILLFOCUS: u32 = 0x0200;
 const WM_MOUSELEAVE: u32 = 0x02A3;
@@ -130,12 +132,14 @@ fn seg_value(id: i32) -> String {
 fn gather() -> Config {
     let lines = |id: i32| text_of(id).lines().map(|l| l.trim().to_string()).filter(|l| !l.is_empty()).collect::<Vec<_>>().join("\n");
     let text = format!(
-        "workspaces = {}\n[keys]\nswitch = {}\nmove = {}\npin = {}\noverview = {}\n[bar]\nenabled = {}\nposition = {}\nbuttons = {}\nalign = {}\nhide_taskbar = {}\ntray = {}\n[pinned_apps]\n{}\n[rules]\n{}\n",
+        "workspaces = {}\n[keys]\nswitch = {}\nmove = {}\npin = {}\noverview = {}\nnext = {}\nprev = {}\n[bar]\nenabled = {}\nposition = {}\nbuttons = {}\nalign = {}\nhide_taskbar = {}\ntray = {}\n[pinned_apps]\n{}\n[rules]\n{}\n",
         seg_value(ID_WORKSPACES),
         seg_value(ID_SWITCH),
         seg_value(ID_MOVE),
         text_of(ID_PIN).trim(),
         text_of(ID_OVERVIEW).trim(),
+        text_of(ID_NEXT).trim(),
+        text_of(ID_PREV).trim(),
         toggle_on(ID_BAR),
         seg_value(ID_EDGE),
         seg_value(ID_BUTTONS),
@@ -471,6 +475,12 @@ pub fn open() {
         y += 38;
         label("Overview", y);
         edit(ID_OVERVIEW, &cfg.overview.text, 232, y + 3, 300, 26, false);
+        y += 38;
+        label("Next workspace", y);
+        edit(ID_NEXT, &cfg.next.text, 232, y + 3, 300, 26, false);
+        y += 38;
+        label("Previous workspace", y);
+        edit(ID_PREV, &cfg.prev.text, 232, y + 3, 300, 26, false);
         y += 50;
 
         header("Bar", y);
@@ -549,7 +559,7 @@ pub unsafe extern "system" fn settings_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp
                     ShellExecuteW(None, w!("open"), w!("notepad.exe"), PCWSTR(p.as_ptr()), None, SW_SHOWNORMAL);
                 }
                 ID_WORKSPACES | ID_SWITCH | ID_MOVE | ID_BAR | ID_EDGE | ID_BUTTONS | ID_ALIGN | ID_HIDE_TASKBAR | ID_TRAY => apply(),
-                ID_PIN | ID_OVERVIEW | ID_PINNED | ID_RULES if code == EN_KILLFOCUS => apply(),
+                ID_PIN | ID_OVERVIEW | ID_NEXT | ID_PREV | ID_PINNED | ID_RULES if code == EN_KILLFOCUS => apply(),
                 _ => {}
             }
             LRESULT(0)

@@ -58,6 +58,8 @@ const HK_FOCUS: i32 = 1; // ids 1..=9
 const HK_MOVE: i32 = 101; // ids 101..=109
 const HK_PIN: i32 = 200;
 const HK_OVERVIEW: i32 = 300;
+const HK_NEXT: i32 = 301;
+const HK_PREV: i32 = 302;
 const OSD_TIMER: usize = 1;
 const RULE_TIMER: usize = 2;
 const RULE_DELAY_MS: u32 = 250;
@@ -360,6 +362,8 @@ impl App {
             }
             let _ = UnregisterHotKey(self.main, HK_PIN);
             let _ = UnregisterHotKey(self.main, HK_OVERVIEW);
+            let _ = UnregisterHotKey(self.main, HK_NEXT);
+            let _ = UnregisterHotKey(self.main, HK_PREV);
         }
     }
 
@@ -382,6 +386,12 @@ impl App {
             }
             if RegisterHotKey(self.main, HK_OVERVIEW, c.overview.mods | MOD_NOREPEAT, c.overview.vk).is_err() {
                 failed.push(format!("{} (overview)", c.overview.text));
+            }
+            if RegisterHotKey(self.main, HK_NEXT, c.next.mods | MOD_NOREPEAT, c.next.vk).is_err() {
+                failed.push(format!("{} (next)", c.next.text));
+            }
+            if RegisterHotKey(self.main, HK_PREV, c.prev.mods | MOD_NOREPEAT, c.prev.vk).is_err() {
+                failed.push(format!("{} (previous)", c.prev.text));
             }
         }
         failed
@@ -987,6 +997,12 @@ unsafe extern "system" fn main_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
                     app.move_focused((id - HK_MOVE) as usize);
                 } else if id == HK_PIN {
                     app.toggle_pin();
+                } else if id == HK_NEXT || id == HK_PREV {
+                    // Step one workspace, stopping at the ends (like Windows' desktops).
+                    let m = app.current_mon();
+                    let a = app.mons[m].active;
+                    let t = if id == HK_NEXT { (a + 1).min(workspaces() - 1) } else { a.saturating_sub(1) };
+                    app.switch_to(m, t, None);
                 }
             });
             LRESULT(0)
