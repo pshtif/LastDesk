@@ -103,7 +103,8 @@ struct App {
     /// Windows that existed already / were checked against app rules.
     seen: HashSet<isize>,
     /// New windows waiting for the rule timer (the shell needs a moment before it can cloak them).
-    pending: Vec<isize>,
+    /// New windows waiting for the rule / launch check: (window, tries so far).
+    pending: Vec<(isize, u8)>,
     /// Start was opened from this monitor's bar: (monitor, when, windows that already existed).
     /// New windows appearing soon after go to that monitor.
     launch: Option<(usize, std::time::Instant, HashSet<isize>)>,
@@ -257,22 +258,39 @@ impl App {
         let k = hwnd_key(h);
         if (self.config.rules.is_empty() && self.launch_target(k).is_none())
             || self.seen.contains(&k)
-            || !win::is_manageable(h, false)
+            || self.pending.iter().any(|(p, _)| *p == k)
         {
             return;
         }
-        self.seen.insert(k);
-        self.pending.push(k);
+        // Not checked for "manageable" yet: many apps show the window first and give it a
+        // title a moment later. The pending check retries for a while.
+        self.pending.push((k, 0));
         unsafe {
             SetTimer(self.main, RULE_TIMER, RULE_DELAY_MS, None);
         }
     }
 
     fn run_pending_rules(&mut self) {
-        for k in std::mem::take(&mut self.pending) {
+        const TRIES: u8 = 12; // ~3 s at 250 ms
+        let mut again = Vec::new();
+        for (k, tries) in std::mem::take(&mut self.pending) {
             let h = key_hwnd(k);
-            if win::is_manageable(h, false) && !self.apply_rule(h) {
-                self.apply_launch(h);
+            if unsafe { !IsWindow(h).as_bool() } {
+                continue;
+            }
+            if win::is_manageable(h, false) {
+                self.seen.insert(k);
+                if !self.apply_rule(h) {
+                    self.apply_launch(h);
+                }
+            } else if tries + 1 < TRIES && unsafe { IsWindowVisible(h).as_bool() } {
+                again.push((k, tries + 1));
+            }
+        }
+        if !again.is_empty() {
+            self.pending = again;
+            unsafe {
+                SetTimer(self.main, RULE_TIMER, RULE_DELAY_MS, None);
             }
         }
     }
@@ -298,7 +316,19 @@ impl App {
 
     /// Remember that Start was opened from monitor `m`'s bar.
     pub(crate) fn note_start_opened(&mut self, m: usize) {
-        self.launch = Some((m, std::time::Instant::now(), win::all_top_level().into_iter().map(hwnd_key).collect()));
+        // "Existing" = windows on screen now (incl. ones on other workspaces). Hidden windows
+        // don't count: many apps keep a pre-created invisible window and just show it.
+        let mut existing: HashSet<isize> = win::all_top_level()
+            .into_iter()
+            .filter(|h| unsafe { IsWindowVisible(*h).as_bool() })
+            .map(hwnd_key)
+            .collect();
+        for ms in &self.mons {
+            for ws in &ms.hidden {
+                existing.extend(ws.iter().copied());
+            }
+        }
+        self.launch = Some((m, std::time::Instant::now(), existing));
     }
 
     /// Send window h to the workspace its app rule names. Returns whether a rule matched.
@@ -1201,6 +1231,18 @@ unsafe extern "system" fn win_event(_: HWINEVENTHOOK, event: u32, hwnd: HWND, id
     }
     if event == EVENT_OBJECT_SHOW {
         with_app(|app| app.on_show(hwnd));
+    }
+    if event == EVENT_OBJECT_UNCLOAKED && win::class_name(hwnd) == "Windows.UI.Core.CoreWindow" {
+        // Start or Search opened (bar button or Win key): apps launched from it should
+        // open on the monitor it's on.
+        let t = win::title(hwnd);
+        if t == "Start" || t == "Search" {
+            with_app(|app| {
+                if let Some(m) = win::monitor_name_of_window(hwnd).and_then(|n| app.mon_index(&n)) {
+                    app.note_start_opened(m);
+                }
+            });
+        }
     }
     with_app(|app| app.schedule_bar_refresh());
 }
