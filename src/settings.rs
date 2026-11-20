@@ -79,6 +79,8 @@ struct State {
     bg: HBRUSH,
     field: HBRUSH,
     status: (String, bool),
+    /// Not editable in the dialog; carried through so saving keeps it.
+    launch_ignore: Vec<String>,
 }
 
 thread_local! {
@@ -133,9 +135,10 @@ fn seg_value(id: i32) -> String {
 fn gather() -> Config {
     let lines = |id: i32| text_of(id).lines().map(|l| l.trim().to_string()).filter(|l| !l.is_empty()).collect::<Vec<_>>().join("\n");
     let text = format!(
-        "workspaces = {}\nanimation = {}\n[keys]\nswitch = {}\nmove = {}\npin = {}\noverview = {}\nnext = {}\nprev = {}\n[bar]\nenabled = {}\nposition = {}\nbuttons = {}\nalign = {}\nhide_taskbar = {}\ntray = {}\n[pinned_apps]\n{}\n[rules]\n{}\n",
+        "workspaces = {}\nanimation = {}\nlaunch_ignore = {}\n[keys]\nswitch = {}\nmove = {}\npin = {}\noverview = {}\nnext = {}\nprev = {}\n[bar]\nenabled = {}\nposition = {}\nbuttons = {}\nalign = {}\nhide_taskbar = {}\ntray = {}\n[pinned_apps]\n{}\n[rules]\n{}\n",
         seg_value(ID_WORKSPACES),
         seg_value(ID_ANIM),
+        SETTINGS.with(|s| s.borrow().as_ref().map(|s| s.launch_ignore.join(", ")).unwrap_or_default()),
         seg_value(ID_SWITCH),
         seg_value(ID_MOVE),
         text_of(ID_PIN).trim(),
@@ -388,7 +391,7 @@ pub fn open() {
         let font = mk_font(13.0, 400);
         let bold = mk_font(14.5, 600);
         SETTINGS.with(|st| {
-            *st.borrow_mut() = Some(State { hwnd, font, bold, bg: CreateSolidBrush(BG), field: CreateSolidBrush(FIELD), status: (String::new(), true) })
+            *st.borrow_mut() = Some(State { hwnd, font, bold, bg: CreateSolidBrush(BG), field: CreateSolidBrush(FIELD), status: (String::new(), true), launch_ignore: cfg.launch_ignore.clone() })
         });
 
         let native = |class: PCWSTR, text: &str, style: u32, x: i32, y: i32, w: i32, h: i32, id: i32, f: HFONT| -> HWND {

@@ -283,7 +283,12 @@ impl App {
             }
             if win::is_manageable(h, false) {
                 self.seen.insert(k);
-                if !self.apply_rule(h) {
+                if self.apply_rule(h) {
+                    // An app rule placed it; if it was the app just launched, it used up the launch.
+                    if self.launch_target(k).is_some() {
+                        self.launch = None;
+                    }
+                } else {
                     self.apply_launch(h);
                 }
             } else if tries + 1 < TRIES && unsafe { IsWindowVisible(h).as_bool() } {
@@ -301,16 +306,23 @@ impl App {
     /// Monitor a new window should open on because Start was just opened from that
     /// monitor's bar (Windows itself always opens them on the main monitor).
     fn launch_target(&self, k: isize) -> Option<usize> {
-        const WINDOW: std::time::Duration = std::time::Duration::from_secs(20);
+        const WINDOW: std::time::Duration = std::time::Duration::from_secs(10);
         match &self.launch {
             Some((m, at, existing)) if at.elapsed() < WINDOW && !existing.contains(&k) => Some(*m),
             _ => None,
         }
     }
 
+    /// Move the launched app's window to the monitor Start was opened on. Only the first new
+    /// window after opening Start is claimed; later ones (other windows of a session restore,
+    /// popups from other apps) are left where their app puts them.
     fn apply_launch(&mut self, h: HWND) {
         let k = hwnd_key(h);
         let Some(to) = self.launch_target(k) else { return };
+        self.launch = None;
+        if self.config.launch_ignore.contains(&self.exe(h)) {
+            return;
+        }
         let Some(cur) = win::monitor_name_of_window(h).and_then(|n| self.mon_index(&n)) else { return };
         if to >= self.mons.len() {
             return;
@@ -326,7 +338,7 @@ impl App {
     /// restore), undoing apply_launch. Put such windows back for a few seconds after launch.
     /// Runs from the location-change timer.
     fn recheck_launched(&mut self) {
-        const WATCH: std::time::Duration = std::time::Duration::from_secs(6);
+        const WATCH: std::time::Duration = std::time::Duration::from_secs(3);
         self.launched.retain(|(k, _, at)| at.elapsed() < WATCH && unsafe { IsWindow(key_hwnd(*k)).as_bool() });
         if self.launched.is_empty() || unsafe { GetAsyncKeyState(VK_LBUTTON.0 as i32) } < 0 {
             return; // the user may be dragging it

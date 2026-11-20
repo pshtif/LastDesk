@@ -38,6 +38,8 @@ pub struct Config {
     pub workspaces: usize,
     /// Workspace switch slide duration in ms; 0 = off.
     pub animation: u32,
+    /// Apps (exe names) that keep their own window position when launched from Start.
+    pub launch_ignore: Vec<String>,
     pub switch: HOT_KEY_MODIFIERS,
     pub switch_text: String,
     pub move_: HOT_KEY_MODIFIERS,
@@ -169,6 +171,7 @@ pub fn parse(text: &str) -> Config {
     let mut c = Config {
         workspaces: 4,
         animation: 200,
+        launch_ignore: Vec::new(),
         switch: MOD_ALT,
         switch_text: "alt".into(),
         move_: MOD_ALT | MOD_SHIFT,
@@ -207,6 +210,9 @@ pub fn parse(text: &str) -> Config {
                 Ok(v) if (1..=9).contains(&v) => c.workspaces = v,
                 _ => bad(),
             },
+            ("", "launch_ignore") => {
+                c.launch_ignore = val.split(',').map(|s| s.trim().trim_end_matches(".exe").to_lowercase()).filter(|s| !s.is_empty()).collect()
+            }
             ("", "animation") => match anim_ms(val) {
                 Some(v) => c.animation = v,
                 None => bad(),
@@ -298,7 +304,9 @@ pub fn render(c: &Config) -> String {
     s.push_str("# Workspaces per monitor (1-9).\n");
     s.push_str(&format!("workspaces = {}\n", c.workspaces));
     s.push_str("# Slide when switching workspaces: off | fast | normal | slow (or milliseconds).\n");
-    s.push_str(&format!("animation = {}\n\n", anim_name(c.animation)));
+    s.push_str(&format!("animation = {}\n", anim_name(c.animation)));
+    s.push_str("# Apps launched from Start open on that monitor. List apps that should keep their own\n# window position instead, e.g. launch_ignore = steam, vlc\n");
+    s.push_str(&format!("launch_ignore = {}\n\n", c.launch_ignore.join(", ")));
     s.push_str("[keys]\n");
     s.push_str("# Switch workspace:            <switch>+1..N\n");
     s.push_str(&format!("switch = {}\n", c.switch_text));
