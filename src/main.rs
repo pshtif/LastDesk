@@ -108,6 +108,9 @@ struct App {
     /// Start was opened from this monitor's bar: (monitor, when, windows that already existed).
     /// New windows appearing soon after go to that monitor.
     launch: Option<(usize, std::time::Instant, HashSet<isize>)>,
+    /// Windows just placed by apply_launch, watched briefly in case the app moves itself
+    /// back (Firefox session restore does).
+    launched: Vec<(isize, usize, std::time::Instant)>,
     /// Preferred order of apps on the bar (exe names), from dragging buttons.
     bar_rank: Vec<String>,
     bars: Vec<bar::Bar>,
@@ -271,7 +274,7 @@ impl App {
     }
 
     fn run_pending_rules(&mut self) {
-        const TRIES: u8 = 12; // ~3 s at 250 ms
+        const TRIES: u8 = 32; // ~8 s at 250 ms (cold starts can be slow)
         let mut again = Vec::new();
         for (k, tries) in std::mem::take(&mut self.pending) {
             let h = key_hwnd(k);
@@ -309,8 +312,34 @@ impl App {
         let k = hwnd_key(h);
         let Some(to) = self.launch_target(k) else { return };
         let Some(cur) = win::monitor_name_of_window(h).and_then(|n| self.mon_index(&n)) else { return };
-        if cur != to && to < self.mons.len() {
+        if to >= self.mons.len() {
+            return;
+        }
+        if cur != to {
             self.move_window(k, (cur, self.mons[cur].active), (to, self.mons[to].active));
+        }
+        self.launched.retain(|(x, _, _)| *x != k);
+        self.launched.push((k, to, std::time::Instant::now()));
+    }
+
+    /// Some apps restore their saved position a moment after opening (Firefox session
+    /// restore), undoing apply_launch. Put such windows back for a few seconds after launch.
+    /// Runs from the location-change timer.
+    fn recheck_launched(&mut self) {
+        const WATCH: std::time::Duration = std::time::Duration::from_secs(6);
+        self.launched.retain(|(k, _, at)| at.elapsed() < WATCH && unsafe { IsWindow(key_hwnd(*k)).as_bool() });
+        if self.launched.is_empty() || unsafe { GetAsyncKeyState(VK_LBUTTON.0 as i32) } < 0 {
+            return; // the user may be dragging it
+        }
+        for (k, to, _) in self.launched.clone() {
+            let h = key_hwnd(k);
+            if unsafe { !IsWindowVisible(h).as_bool() } {
+                continue;
+            }
+            let Some(cur) = win::monitor_name_of_window(h).and_then(|n| self.mon_index(&n)) else { continue };
+            if cur != to && to < self.mons.len() {
+                self.move_window(k, (cur, self.mons[cur].active), (to, self.mons[to].active));
+            }
         }
     }
 
@@ -1127,7 +1156,10 @@ unsafe extern "system" fn main_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
         }
         WM_TIMER if wp.0 == FS_TIMER => {
             let _ = KillTimer(hwnd, FS_TIMER);
-            with_app(|app| app.bars_fullscreen_check());
+            with_app(|app| {
+                app.recheck_launched();
+                app.bars_fullscreen_check();
+            });
             LRESULT(0)
         }
         WM_TIMER if wp.0 == TRAY_TIMER => {
@@ -1231,6 +1263,11 @@ unsafe extern "system" fn win_event(_: HWINEVENTHOOK, event: u32, hwnd: HWND, id
     }
     if event == EVENT_OBJECT_SHOW {
         with_app(|app| app.on_show(hwnd));
+    }
+    if event == EVENT_SYSTEM_MOVESIZEEND {
+        // The user moved it themselves: stop holding it on the launch monitor.
+        let k = hwnd_key(hwnd);
+        with_app(|app| app.launched.retain(|(x, _, _)| *x != k));
     }
     if event == EVENT_OBJECT_UNCLOAKED && win::class_name(hwnd) == "Windows.UI.Core.CoreWindow" {
         // Start or Search opened (bar button or Win key): apps launched from it should
@@ -1412,6 +1449,7 @@ fn main() {
             seen: HashSet::new(),
             pending: Vec::new(),
             launch: None,
+            launched: Vec::new(),
             bar_rank: bar::load_rank(),
             bars: Vec::new(),
             taskbar_hidden: false,
