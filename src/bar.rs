@@ -147,6 +147,15 @@ pub struct Button {
     pub title: String,
     pub icon: HICON,
     pub minimized: bool,
+    /// The pinned app (index into config.launchers) this window belongs to.
+    pub pin: Option<usize>,
+}
+
+/// Something laid out in the bar's app area: a pinned app's icon or a window button.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum Item {
+    Pin(usize),
+    Win(isize),
 }
 
 pub struct Bar {
@@ -358,6 +367,37 @@ fn appbar_data(hwnd: HWND, rc: RECT) -> APPBARDATA {
 }
 
 impl Bar {
+    /// The app area left to right: (item, rect, pinned app it belongs to).
+    fn items(&self) -> Vec<(Item, RECT, Option<usize>)> {
+        let mut v: Vec<(Item, RECT, Option<usize>)> = self.pins.iter().map(|(li, r)| (Item::Pin(*li), *r, Some(*li))).collect();
+        v.extend(self.buttons.iter().map(|bt| (Item::Win(bt.hwnd), bt.rect, bt.pin)));
+        v.sort_by_key(|(_, r, _)| r.left);
+        v
+    }
+
+    /// Put items (reordered / moved by a drag) back into pins, buttons and order.
+    fn set_items(&mut self, items: &[(Item, RECT, Option<usize>)]) {
+        let mut buttons = std::mem::take(&mut self.buttons);
+        self.pins.clear();
+        let mut shown: Vec<isize> = Vec::new();
+        for (it, r, _) in items {
+            match *it {
+                Item::Pin(li) => self.pins.push((li, *r)),
+                Item::Win(k) => {
+                    if let Some(p) = buttons.iter().position(|bt| bt.hwnd == k) {
+                        let mut bt = buttons.remove(p);
+                        bt.rect = *r;
+                        self.buttons.push(bt);
+                        shown.push(k);
+                    }
+                }
+            }
+        }
+        // Windows that didn't fit keep their place after the shown ones.
+        let rest: Vec<isize> = self.order.iter().copied().filter(|k| !shown.contains(k)).collect();
+        self.order = shown.into_iter().chain(rest).collect();
+    }
+
     fn hit(&self, x: i32, y: i32) -> Hit {
         if contains(&self.start, x, y) {
             return Hit::Start;
@@ -649,10 +689,9 @@ impl App {
         }
     }
 
-    /// A pinned app was dragged on bar `i`: the pins shown there take their new order in the
-    /// config (in the places those pins held; pins not shown there stay where they are).
-    fn apply_pin_order(&mut self, i: usize) {
-        let seq: Vec<usize> = self.bars[i].pins.iter().map(|(li, _)| *li).collect();
+    /// A pinned app was dragged: the pinned apps in `seq` (indices into config.launchers, in
+    /// their new order) take that order in the config, in the places they held; others stay.
+    fn apply_pin_order(&mut self, seq: Vec<usize>) {
         let mut places = seq.clone();
         places.sort_unstable();
         if places == seq || places.iter().any(|&p| p >= self.config.launchers.len()) {
@@ -716,14 +755,12 @@ impl App {
                 })
                 .collect();
             // Pinned apps with no window in this bar get a launcher button.
-            let mut pins: Vec<usize> = (0..self.config.launchers.len())
-                .filter(|li| !here.iter().any(|k| self.launcher_matches(*li, *k)))
-                .collect();
+            let n_pins = self.config.launchers.len();
+            let pins: Vec<usize> = (0..n_pins).filter(|li| !here.iter().any(|k| self.launcher_matches(*li, *k))).collect();
+            // The pinned app each window belongs to (first match).
+            let pin_of: std::collections::HashMap<isize, usize> =
+                here.iter().filter_map(|k| (0..n_pins).find(|li| self.launcher_matches(*li, *k)).map(|li| (*k, li))).collect();
             let b = &mut self.bars[bi];
-            // Mid-drag of a pinned app: keep the order being dragged into.
-            if b.drag.as_ref().is_some_and(|d| d.pin && d.active) {
-                pins.sort_by_key(|li| b.pins.iter().position(|(l, _)| l == li).unwrap_or(usize::MAX));
-            }
             b.order.retain(|k| here.contains(k));
             for k in &here {
                 if !b.order.contains(k) {
@@ -775,7 +812,7 @@ impl App {
             let gap = s(4.0);
             // Launchers sit first, icon-sized, then the window buttons.
             let pw = s(36.0);
-            let pins_w = if pins.is_empty() { 0 } else { pins.len() as i32 * (pw + gap) + s(4.0) };
+            let pins_w = pins.len() as i32 * (pw + gap);
             let avail_btn = (avail - pins_w).max(0);
             let bw = if count == 0 {
                 0
@@ -793,40 +830,65 @@ impl App {
                 crate::config::Align::Center => (w / 2 - total / 2).clamp(start_x, (start_x + avail - total).max(start_x)),
                 crate::config::Align::Right => (start_x + avail - total).max(start_x),
             };
-            b.pins = pins
-                .iter()
-                .map(|li| {
-                    let r = RECT { left: bx, top: s(3.0), right: bx + pw, bottom: h - s(3.0) };
-                    bx += pw + gap;
-                    (*li, r)
-                })
-                .collect();
-            if !pins.is_empty() {
-                bx += s(4.0);
+            // Pinned apps first, in their pinned order, each as its icon or (when running
+            // here) its windows; then the other windows.
+            let mut seq: Vec<Item> = Vec::new();
+            for li in 0..n_pins {
+                if pins.contains(&li) {
+                    seq.push(Item::Pin(li));
+                } else {
+                    seq.extend(b.order.iter().filter(|k| pin_of.get(k) == Some(&li)).map(|k| Item::Win(*k)));
+                }
+            }
+            seq.extend(b.order.iter().filter(|k| !pin_of.contains_key(k)).map(|k| Item::Win(*k)));
+            // Mid-drag: keep the order being dragged into.
+            if b.drag.as_ref().is_some_and(|d| d.active) {
+                let old: Vec<Item> = b.items().into_iter().map(|(it, _, _)| it).collect();
+                seq.sort_by_key(|it| old.iter().position(|o| o == it).unwrap_or(usize::MAX));
+            }
+            let mut placed = 0;
+            b.pins.clear();
+            b.buttons.clear();
+            for it in seq {
+                match it {
+                    Item::Pin(li) => {
+                        b.pins.push((li, RECT { left: bx, top: s(3.0), right: bx + pw, bottom: h - s(3.0) }));
+                        bx += pw + gap;
+                    }
+                    Item::Win(k) => {
+                        if placed >= shown {
+                            continue; // no room
+                        }
+                        placed += 1;
+                        let hw = key_hwnd(k);
+                        b.buttons.push(Button {
+                            hwnd: k,
+                            rect: RECT { left: bx, top: s(3.0), right: bx + bw, bottom: h - s(3.0) },
+                            title: win::title(hw),
+                            icon: crate::overview::window_icon(hw),
+                            minimized: unsafe { IsIconic(hw).as_bool() },
+                            pin: pin_of.get(&k).copied(),
+                        });
+                        bx += bw + gap;
+                    }
+                }
             }
             if !b.pins.is_empty() {
                 crate::trace(&format!("pins mon{} {:?}", b.mon, b.pins.iter().map(|(li, r)| (*li, r.left, r.right)).collect::<Vec<_>>()));
             }
-            let limit = bx + total_btn;
-            b.buttons = b
-                .order
-                .iter()
-                .filter_map(|k| {
-                    if bx + bw > limit {
-                        return None;
-                    }
-                    let hw = key_hwnd(*k);
-                    let r = RECT { left: bx, top: s(3.0), right: bx + bw, bottom: h - s(3.0) };
-                    bx += bw + s(4.0);
-                    Some(Button {
-                        hwnd: *k,
-                        rect: r,
-                        title: win::title(hw),
-                        icon: crate::overview::window_icon(hw),
-                        minimized: unsafe { IsIconic(hw).as_bool() },
+            if n_pins > 0 {
+                // Kinds only (no titles): P1 = icon of pinned app 1, W0 = window of pinned app 0, W = other window.
+                let kinds: Vec<String> = b
+                    .items()
+                    .iter()
+                    .map(|(it, r, g)| match (it, g) {
+                        (Item::Pin(li), _) => format!("P{li}@{}", r.left),
+                        (Item::Win(_), Some(li)) => format!("W{li}@{}", r.left),
+                        (Item::Win(_), None) => format!("W@{}", r.left),
                     })
-                })
-                .collect();
+                    .collect();
+                crate::trace(&format!("items mon{} {}", b.mon, kinds.join(" ")));
+            }
             unsafe {
                 let _ = InvalidateRect(b.hwnd, None, false);
             }
@@ -907,7 +969,7 @@ impl App {
                 }
                 draw_pin(*li, *r, (b.hover == Hit::Launcher(*li) && pin_drag.is_none()).then_some(hover_bg));
             }
-            if let Some(d) = pin_drag {
+            let draw_lifted_pin = || if let Some(d) = pin_drag {
                 if let Some((li, r)) = b.pins.iter().find(|(l, _)| *l as isize == d.key) {
                     let pw = r.right - r.left;
                     let left = (d.x - d.grab).clamp(0, (w - pw).max(0));
@@ -915,11 +977,12 @@ impl App {
                     draw_pin(*li, lifted, Some(ui::rgb(0x34, 0x36, 0x3D)));
                     ui::frame_round(mem, lifted, s(6.0), s(1.0).max(1), ui::ACCENT);
                 }
-            }
+            };
 
             // Window buttons. While dragging, the dragged one leaves an empty slot and is drawn
             // last, floating under the cursor.
             let dragging = b.drag.as_ref().filter(|d| d.active && !d.pin);
+            let f_pin = ui::icon_font(s(10.0));
             let draw_button = |btn: &Button, rect: RECT, lifted: bool| {
                 let is_fg = hwnd_key(fg) == btn.hwnd;
                 let bg = if lifted {
@@ -947,7 +1010,13 @@ impl App {
                 if !btn.icon.is_invalid() {
                     let _ = DrawIconEx(mem, ix, (h - icon) / 2, btn.icon, icon, icon, 0, None, DI_NORMAL);
                 }
-                let mut tr = RECT { left: ix + icon + s(7.0), top: rect.top, right: rect.right - s(6.0), bottom: rect.bottom };
+                // Pinned app: a small pin in the top-right corner.
+                let pin_w = if btn.pin.is_some() { s(13.0) } else { 0 };
+                if btn.pin.is_some() {
+                    let mut pr = RECT { left: rect.right - s(15.0), top: rect.top + s(2.0), right: rect.right - s(2.0), bottom: rect.top + s(15.0) };
+                    ui::draw_text(mem, "\u{E840}", &mut pr, ui::MUTED, f_pin);
+                }
+                let mut tr = RECT { left: ix + icon + s(7.0), top: rect.top, right: rect.right - s(6.0) - pin_w, bottom: rect.bottom };
                 if !icons_only && tr.right - tr.left > s(12.0) {
                     ui::draw_text_left(mem, &btn.title, &mut tr, if btn.minimized { ui::MUTED } else { ui::TEXT }, f_text);
                 }
@@ -966,6 +1035,8 @@ impl App {
                     draw_button(btn, RECT { left, right: left + bw, ..btn.rect }, true);
                 }
             }
+            draw_lifted_pin();
+            let _ = DeleteObject(f_pin);
 
             // Tray icons (drawn from the live list: icons can change between refreshes).
             if !b.tray_icons.is_empty() {
@@ -1220,15 +1291,10 @@ impl App {
         }
     }
 
-    /// Which slot (by centre) the dragged item's centre is nearest to.
-    fn drag_target(slots: &[RECT], x: i32, grab: i32) -> Option<usize> {
-        let first = slots.first()?;
-        let center = x - grab + (first.right - first.left) / 2;
-        slots.iter().enumerate().min_by_key(|(_, r)| ((r.left + r.right) / 2 - center).abs()).map(|(t, _)| t)
-    }
-
     /// Mouse moved with a button pressed: once it moves a few pixels it's a drag; the
-    /// dragged button follows the cursor and the others shift into the gap.
+    /// dragged item follows the cursor and the others shift into the gap. Pinned apps
+    /// (icons and their windows) are one group, other windows another; an item moves
+    /// within its own group.
     fn bar_drag_move(&mut self, i: usize, x: i32) -> bool {
         let b = &mut self.bars[i];
         let Some(d) = b.drag.as_mut() else { return false };
@@ -1240,35 +1306,29 @@ impl App {
             d.active = true;
             hide_tip();
         }
-        let (key, grab) = (d.key, d.grab);
-        if d.pin {
-            // Pinned apps: the slots stay put, the apps in them change places.
-            let slots: Vec<RECT> = b.pins.iter().map(|(_, r)| *r).collect();
-            if let (Some(cur), Some(target)) = (b.pins.iter().position(|(l, _)| *l as isize == key), Self::drag_target(&slots, x, grab)) {
-                if target != cur {
-                    let p = b.pins.remove(cur);
-                    b.pins.insert(target, p);
-                    for (p, r) in b.pins.iter_mut().zip(&slots) {
-                        p.1 = *r;
-                    }
-                }
+        let me = if d.pin { Item::Pin(d.key as usize) } else { Item::Win(d.key) };
+        let grab = d.grab;
+        let mut items = b.items();
+        if let Some(cur) = items.iter().position(|(it, _, _)| *it == me) {
+            let (_, r, group) = items.remove(cur);
+            let w = r.right - r.left;
+            let center = x - grab + w / 2;
+            // Its new place: after every other item whose centre is left of its centre,
+            // kept inside its group (pinned ones come first).
+            let pinned = items.iter().filter(|(_, _, g)| g.is_some()).count();
+            let (lo, hi) = if group.is_some() { (0, pinned) } else { (pinned, items.len()) };
+            let at = items.iter().filter(|(_, r, _)| (r.left + r.right) / 2 < center).count().clamp(lo, hi);
+            let start = items.iter().map(|(_, r, _)| r.left).chain(std::iter::once(r.left)).min().unwrap_or(r.left);
+            items.insert(at, (me, r, group));
+            let gap = (4.0 * b.scale).round() as i32;
+            let mut bx = start;
+            for (_, r, _) in items.iter_mut() {
+                let w = r.right - r.left;
+                r.left = bx;
+                r.right = bx + w;
+                bx += w + gap;
             }
-            unsafe {
-                let _ = InvalidateRect(b.hwnd, None, false);
-            }
-            return true;
-        }
-        let slots: Vec<RECT> = b.buttons.iter().map(|bt| bt.rect).collect();
-        if let (Some(cur), Some(target)) = (b.buttons.iter().position(|bt| bt.hwnd == key), Self::drag_target(&slots, x, grab)) {
-            if target != cur && cur < b.order.len() && target < b.order.len() {
-                let bt = b.buttons.remove(cur);
-                b.buttons.insert(target, bt);
-                for (bt, r) in b.buttons.iter_mut().zip(&slots) {
-                    bt.rect = *r;
-                }
-                let k = b.order.remove(cur);
-                b.order.insert(target, k);
-            }
+            b.set_items(&items);
         }
         unsafe {
             let _ = InvalidateRect(b.hwnd, None, false);
@@ -1287,8 +1347,17 @@ impl App {
         if !d.active {
             return false;
         }
-        if d.pin {
-            self.apply_pin_order(i);
+        // A pinned app (icon or window) moved: save the pinned apps' new order.
+        let items = self.bars[i].items();
+        let me = if d.pin { Item::Pin(d.key as usize) } else { Item::Win(d.key) };
+        if items.iter().any(|(it, _, g)| *it == me && g.is_some()) {
+            let mut seq: Vec<usize> = Vec::new();
+            for li in items.iter().filter_map(|(_, _, g)| *g) {
+                if !seq.contains(&li) {
+                    seq.push(li);
+                }
+            }
+            self.apply_pin_order(seq);
             return true;
         }
         // Remember the new order of apps: the dragged bar's apps take the place of the
