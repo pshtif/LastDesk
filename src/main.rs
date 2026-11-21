@@ -27,6 +27,7 @@ mod taskbar;
 mod tray;
 mod ui;
 mod win;
+mod winkey;
 
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
@@ -1215,6 +1216,10 @@ unsafe extern "system" fn main_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
             });
             LRESULT(0)
         }
+        winkey::WM_WINKEY => {
+            with_app(|app| app.start_follow());
+            LRESULT(0)
+        }
         status::WM_STATUS => {
             with_app(|app| {
                 if wp.0 == status::STATUS_NET && !app.status.refresh_net() {
@@ -1541,6 +1546,7 @@ fn main() {
         }
         APP.with(|a| *a.borrow_mut() = Some(app));
         let _ = RegisterShellHookWindow(main);
+        winkey::start(main);
         if !problems.is_empty() {
             message(&problems.join("\n"), true);
         }

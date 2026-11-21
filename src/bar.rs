@@ -182,7 +182,10 @@ pub struct Bar {
 }
 
 pub struct BarDrag {
+    /// Window key, or launcher index when `pin`.
     pub key: isize,
+    /// Dragging a pinned app (launcher) rather than a window button.
+    pub pin: bool,
     pub down_x: i32,
     pub x: i32,
     /// Cursor offset inside the button when it was grabbed.
@@ -646,6 +649,30 @@ impl App {
         }
     }
 
+    /// A pinned app was dragged on bar `i`: the pins shown there take their new order in the
+    /// config (in the places those pins held; pins not shown there stay where they are).
+    fn apply_pin_order(&mut self, i: usize) {
+        let seq: Vec<usize> = self.bars[i].pins.iter().map(|(li, _)| *li).collect();
+        let mut places = seq.clone();
+        places.sort_unstable();
+        if places == seq || places.iter().any(|&p| p >= self.config.launchers.len()) {
+            return;
+        }
+        let old = self.config.launchers.clone();
+        let mut perm: Vec<usize> = (0..old.len()).collect();
+        for (place, from) in places.iter().zip(&seq) {
+            perm[*place] = *from;
+        }
+        self.config.launchers = perm.iter().map(|&f| old[f].clone()).collect();
+        // Same move for the cached icons, so they needn't be loaded again.
+        if self.launcher_icons.len() == old.len() {
+            let icons = std::mem::take(&mut self.launcher_icons);
+            self.launcher_icons = perm.iter().map(|&f| icons[f].clone()).collect();
+        }
+        let _ = crate::config::save(&self.config);
+        self.bars_refresh();
+    }
+
     /// Show the hover preview for window button `k` of bar `i`.
     fn show_preview(&self, i: usize, k: isize) {
         let b = &self.bars[i];
@@ -689,10 +716,14 @@ impl App {
                 })
                 .collect();
             // Pinned apps with no window in this bar get a launcher button.
-            let pins: Vec<usize> = (0..self.config.launchers.len())
+            let mut pins: Vec<usize> = (0..self.config.launchers.len())
                 .filter(|li| !here.iter().any(|k| self.launcher_matches(*li, *k)))
                 .collect();
             let b = &mut self.bars[bi];
+            // Mid-drag of a pinned app: keep the order being dragged into.
+            if b.drag.as_ref().is_some_and(|d| d.pin && d.active) {
+                pins.sort_by_key(|li| b.pins.iter().position(|(l, _)| l == li).unwrap_or(usize::MAX));
+            }
             b.order.retain(|k| here.contains(k));
             for k in &here {
                 if !b.order.contains(k) {
@@ -855,22 +886,40 @@ impl App {
                 ui::draw_text(mem, &(i + 1).to_string(), &mut tr, color, f_num);
             }
 
-            // Pinned apps that aren't running here: icon only.
-            for (li, r) in &b.pins {
-                if b.hover == Hit::Launcher(*li) {
-                    ui::fill_round(mem, *r, s(6.0), hover_bg);
+            // Pinned apps that aren't running here: icon only. A dragged one leaves an empty
+            // slot and floats under the cursor.
+            let pin_drag = b.drag.as_ref().filter(|d| d.active && d.pin);
+            let draw_pin = |li: usize, r: RECT, bg: Option<COLORREF>| {
+                if let Some(bg) = bg {
+                    ui::fill_round(mem, r, s(6.0), bg);
                 }
-                if let Some((_, icon)) = self.launcher_icons.get(*li) {
+                if let Some((_, icon)) = self.launcher_icons.get(li) {
                     if !icon.is_invalid() {
                         let sz = s(18.0);
                         let _ = DrawIconEx(mem, r.left + (r.right - r.left - sz) / 2, (h - sz) / 2, *icon, sz, sz, 0, None, DI_NORMAL);
                     }
                 }
+            };
+            for (li, r) in &b.pins {
+                if pin_drag.is_some_and(|d| d.key == *li as isize) {
+                    ui::frame_round(mem, *r, s(6.0), s(1.0).max(1), ui::rgb(0x3A, 0x3C, 0x44));
+                    continue;
+                }
+                draw_pin(*li, *r, (b.hover == Hit::Launcher(*li) && pin_drag.is_none()).then_some(hover_bg));
+            }
+            if let Some(d) = pin_drag {
+                if let Some((li, r)) = b.pins.iter().find(|(l, _)| *l as isize == d.key) {
+                    let pw = r.right - r.left;
+                    let left = (d.x - d.grab).clamp(0, (w - pw).max(0));
+                    let lifted = RECT { left, right: left + pw, ..*r };
+                    draw_pin(*li, lifted, Some(ui::rgb(0x34, 0x36, 0x3D)));
+                    ui::frame_round(mem, lifted, s(6.0), s(1.0).max(1), ui::ACCENT);
+                }
             }
 
             // Window buttons. While dragging, the dragged one leaves an empty slot and is drawn
             // last, floating under the cursor.
-            let dragging = b.drag.as_ref().filter(|d| d.active);
+            let dragging = b.drag.as_ref().filter(|d| d.active && !d.pin);
             let draw_button = |btn: &Button, rect: RECT, lifted: bool| {
                 let is_fg = hwnd_key(fg) == btn.hwnd;
                 let bg = if lifted {
@@ -1160,13 +1209,22 @@ impl App {
         crate::preview::hide();
         let Some(i) = self.bar_index(hwnd) else { return };
         let b = &mut self.bars[i];
-        if let Hit::Window(k) = b.hit(x, y) {
-            let left = b.buttons.iter().find(|bt| bt.hwnd == k).map(|bt| bt.rect.left).unwrap_or(x);
-            b.drag = Some(BarDrag { key: k, down_x: x, x, grab: x - left, active: false });
-            unsafe {
-                SetCapture(hwnd);
-            }
+        let (key, pin, left) = match b.hit(x, y) {
+            Hit::Window(k) => (k, false, b.buttons.iter().find(|bt| bt.hwnd == k).map(|bt| bt.rect.left).unwrap_or(x)),
+            Hit::Launcher(li) => (li as isize, true, b.pins.iter().find(|(l, _)| *l == li).map(|(_, r)| r.left).unwrap_or(x)),
+            _ => return,
+        };
+        b.drag = Some(BarDrag { key, pin, down_x: x, x, grab: x - left, active: false });
+        unsafe {
+            SetCapture(hwnd);
         }
+    }
+
+    /// Which slot (by centre) the dragged item's centre is nearest to.
+    fn drag_target(slots: &[RECT], x: i32, grab: i32) -> Option<usize> {
+        let first = slots.first()?;
+        let center = x - grab + (first.right - first.left) / 2;
+        slots.iter().enumerate().min_by_key(|(_, r)| ((r.left + r.right) / 2 - center).abs()).map(|(t, _)| t)
     }
 
     /// Mouse moved with a button pressed: once it moves a few pixels it's a drag; the
@@ -1183,16 +1241,25 @@ impl App {
             hide_tip();
         }
         let (key, grab) = (d.key, d.grab);
+        if d.pin {
+            // Pinned apps: the slots stay put, the apps in them change places.
+            let slots: Vec<RECT> = b.pins.iter().map(|(_, r)| *r).collect();
+            if let (Some(cur), Some(target)) = (b.pins.iter().position(|(l, _)| *l as isize == key), Self::drag_target(&slots, x, grab)) {
+                if target != cur {
+                    let p = b.pins.remove(cur);
+                    b.pins.insert(target, p);
+                    for (p, r) in b.pins.iter_mut().zip(&slots) {
+                        p.1 = *r;
+                    }
+                }
+            }
+            unsafe {
+                let _ = InvalidateRect(b.hwnd, None, false);
+            }
+            return true;
+        }
         let slots: Vec<RECT> = b.buttons.iter().map(|bt| bt.rect).collect();
-        if let (Some(cur), Some(first)) = (b.buttons.iter().position(|bt| bt.hwnd == key), slots.first()) {
-            let width = first.right - first.left;
-            let center = x - grab + width / 2;
-            let target = slots
-                .iter()
-                .enumerate()
-                .min_by_key(|(_, r)| ((r.left + r.right) / 2 - center).abs())
-                .map(|(t, _)| t)
-                .unwrap_or(cur);
+        if let (Some(cur), Some(target)) = (b.buttons.iter().position(|bt| bt.hwnd == key), Self::drag_target(&slots, x, grab)) {
             if target != cur && cur < b.order.len() && target < b.order.len() {
                 let bt = b.buttons.remove(cur);
                 b.buttons.insert(target, bt);
@@ -1219,6 +1286,10 @@ impl App {
         }
         if !d.active {
             return false;
+        }
+        if d.pin {
+            self.apply_pin_order(i);
+            return true;
         }
         // Remember the new order of apps: the dragged bar's apps take the place of the
         // earliest of them in the saved order; other apps keep their relative order.
@@ -1297,6 +1368,19 @@ impl App {
                 self.show_preview(i, k);
             }
         }
+    }
+
+    /// The Win key went down: put the closed Start (and Search, Notification Centre) on the
+    /// monitor you're on, so it opens there. Only needed while Windows' taskbars are hidden.
+    pub fn start_follow(&mut self) {
+        if !self.taskbar_hidden || self.bars.is_empty() {
+            return;
+        }
+        let Some(mon) = self.monitors.get(self.current_mon()) else { return };
+        let work = mon.work;
+        place_start_menu(work);
+        place_flyout(w!("Notification Centre"), work);
+        place_flyout(w!("Notification Center"), work);
     }
 
     pub fn bar_mouse_leave(&mut self, hwnd: HWND) {
