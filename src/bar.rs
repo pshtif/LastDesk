@@ -1,10 +1,11 @@
 //! LastDesk bar: a thin taskbar on top of every monitor.
 //!
-//!   [Start] [1][2][3][4] | window buttons of THIS monitor + workspace ...   battery  clock
+//!   [Start] [1][2][3][4] | window buttons of THIS monitor + workspace ...   net vol battery  clock
 //!
 //! Registered as an app bar (SHAppBarMessage) so maximized windows stop below it. Window
 //! buttons: click = focus (or minimize if already focused), middle-click = close.
-//! Clicking the clock opens notifications/calendar (Win+N), battery opens quick settings (Win+A).
+//! Clicking the clock opens notifications/calendar (Win+N); network, volume and battery open
+//! quick settings (Win+A). Wheel over them changes the volume; middle-click on volume mutes.
 
 use windows::core::w;
 use windows::Win32::Foundation::*;
@@ -128,6 +129,8 @@ pub enum Hit {
     Window(isize),
     TrayIcon(usize),
     Tray,
+    Network,
+    Volume,
     Battery,
     Clock,
     None,
@@ -152,6 +155,8 @@ pub struct Bar {
     /// Tray icons shown in this bar: (owner hwnd, uid, rect).
     pub tray_icons: Vec<(u32, u32, RECT)>,
     pub tray: RECT,
+    pub net: RECT,
+    pub vol: RECT,
     pub battery: RECT,
     pub clock: RECT,
     /// Button order: first-seen, so buttons don't jump around with z-order.
@@ -357,6 +362,12 @@ impl Bar {
         if contains(&self.tray, x, y) {
             return Hit::Tray;
         }
+        if contains(&self.net, x, y) {
+            return Hit::Network;
+        }
+        if contains(&self.vol, x, y) {
+            return Hit::Volume;
+        }
         if contains(&self.battery, x, y) {
             return Hit::Battery;
         }
@@ -463,6 +474,8 @@ impl App {
                 buttons: Vec::new(),
                 tray_icons: Vec::new(),
                 tray: RECT::default(),
+                net: RECT::default(),
+                vol: RECT::default(),
                 battery: RECT::default(),
                 clock: RECT::default(),
                 order: Vec::new(),
@@ -616,7 +629,10 @@ impl App {
             b.clock = RECT { left: w - pad - right_w, top: s(3.0), right: w - pad, bottom: h - s(3.0) };
             b.battery = RECT { left: b.clock.left - batt_w, top: s(3.0), right: b.clock.left - s(4.0), bottom: h - s(3.0) };
             let iw = s(28.0);
-            let mut ix = b.battery.left - s(4.0);
+            let icon_w = s(30.0);
+            b.vol = RECT { left: b.battery.left - icon_w, top: s(3.0), right: b.battery.left, bottom: h - s(3.0) };
+            b.net = RECT { left: b.vol.left - icon_w, top: s(3.0), right: b.vol.left, bottom: h - s(3.0) };
+            let mut ix = b.net.left - s(4.0);
             let mut tray_icons: Vec<(u32, u32, RECT)> = icons
                 .iter()
                 .rev()
@@ -788,6 +804,43 @@ impl App {
                 ui::draw_text(mem, "^", &mut r, ui::TEXT, f_num);
             }
 
+            // Network and volume icons. Wi-Fi bars are drawn over a dim full fan, like Windows.
+            let f_icon = ui::icon_font(s(16.0));
+            let dim = ui::rgb(0x5A, 0x5D, 0x64);
+            let glyph = |c: u32| char::from_u32(c).map(String::from).unwrap_or_default();
+            if b.hover == Hit::Network {
+                ui::fill_round(mem, b.net, s(6.0), hover_bg);
+            }
+            match self.status.net {
+                crate::status::Net::Ethernet => ui::draw_text(mem, &glyph(0xE839), &mut b.net.clone(), ui::TEXT, f_icon),
+                crate::status::Net::Wifi(q) => {
+                    let bars = match q {
+                        0..=24 => 0xE872,
+                        25..=49 => 0xE873,
+                        50..=74 => 0xE874,
+                        _ => 0xE701,
+                    };
+                    if bars != 0xE701 {
+                        ui::draw_text(mem, &glyph(0xE701), &mut b.net.clone(), dim, f_icon);
+                    }
+                    ui::draw_text(mem, &glyph(bars), &mut b.net.clone(), ui::TEXT, f_icon);
+                }
+                crate::status::Net::Offline => ui::draw_text(mem, &glyph(0xF384), &mut b.net.clone(), ui::MUTED, f_icon),
+            }
+            if b.hover == Hit::Volume {
+                ui::fill_round(mem, b.vol, s(6.0), hover_bg);
+            }
+            let (vg, vc) = match self.status.volume() {
+                None => (0xE74F, dim),
+                Some((_, true)) => (0xE74F, ui::TEXT),
+                Some((v, false)) if v <= 0.005 => (0xE992, ui::TEXT),
+                Some((v, false)) if v < 0.34 => (0xE993, ui::TEXT),
+                Some((v, false)) if v < 0.67 => (0xE994, ui::TEXT),
+                Some(_) => (0xE995, ui::TEXT),
+            };
+            ui::draw_text(mem, &glyph(vg), &mut b.vol.clone(), vc, f_icon);
+            let _ = DeleteObject(f_icon);
+
             // Battery.
             let mut ps = SYSTEM_POWER_STATUS::default();
             if GetSystemPowerStatus(&mut ps).is_ok() && ps.BatteryLifePercent <= 100 {
@@ -843,8 +896,70 @@ impl App {
         false
     }
 
+    fn status_tip(&self, hit: Hit) -> Option<String> {
+        use crate::status::Net;
+        match hit {
+            Hit::Volume => Some(match self.status.volume() {
+                None => "No audio output".into(),
+                Some((v, m)) => format!("Volume {}%{}", (v * 100.0).round() as i32, if m { " (muted)" } else { "" }),
+            }),
+            Hit::Network => Some(match self.status.net {
+                Net::Ethernet => "Ethernet".into(),
+                Net::Wifi(_) if self.status.ssid.is_empty() => "Wi-Fi".into(),
+                Net::Wifi(q) => format!("Wi-Fi: {} ({}%)", self.status.ssid, q),
+                Net::Offline => "Not connected".into(),
+            }),
+            _ => None,
+        }
+    }
+
+    fn show_status_tip(&self, i: usize, hit: Hit) {
+        let b = &self.bars[i];
+        let r = match hit {
+            Hit::Volume => b.vol,
+            Hit::Network => b.net,
+            _ => return,
+        };
+        if let Some(text) = self.status_tip(hit) {
+            let above = b.edge == crate::config::Edge::Bottom;
+            let y = if above { b.rect.top } else { b.rect.top + b.height() };
+            show_tip(&text, POINT { x: b.rect.left + (r.left + r.right) / 2, y }, b.scale, above);
+        }
+    }
+
+    /// Volume or network changed: repaint, and refresh an open status tooltip.
+    pub fn bars_status_changed(&mut self) {
+        for i in 0..self.bars.len() {
+            unsafe {
+                let _ = InvalidateRect(self.bars[i].hwnd, None, false);
+            }
+            if matches!(self.bars[i].hover, Hit::Volume | Hit::Network) && TIP.with(|t| unsafe { IsWindowVisible(t.borrow().0).as_bool() }) {
+                self.show_status_tip(i, self.bars[i].hover);
+            }
+        }
+    }
+
+    /// Mouse wheel over the volume, network or battery area changes the volume (2% per notch, like Windows).
+    pub fn bar_wheel(&mut self, hwnd: HWND, x: i32, y: i32, delta: i16) -> bool {
+        let Some(i) = self.bar_index(hwnd) else { return false };
+        if !matches!(self.bars[i].hit(x, y), Hit::Volume | Hit::Network | Hit::Battery) {
+            return false;
+        }
+        let Some((v, _)) = self.status.volume() else { return true };
+        let steps = delta as f32 / 120.0;
+        let nv = ((v * 50.0).round() + steps).clamp(0.0, 50.0) / 50.0;
+        self.status.set_volume(nv);
+        self.bars_status_changed();
+        self.show_status_tip(i, Hit::Volume);
+        true
+    }
+
     pub fn bar_show_tip(&mut self, hwnd: HWND) {
         let Some(i) = self.bar_index(hwnd) else { return };
+        if matches!(self.bars[i].hover, Hit::Volume | Hit::Network) {
+            self.show_status_tip(i, self.bars[i].hover);
+            return;
+        }
         let b = &self.bars[i];
         if let Hit::TrayIcon(t) = b.hover {
             let (hw, uid, r) = b.tray_icons[t];
@@ -966,6 +1081,10 @@ impl App {
                 unsafe {
                     SetTimer(hwnd, TIP_TIMER, 450, None);
                 }
+            } else if matches!(hit, Hit::Volume | Hit::Network) {
+                unsafe {
+                    SetTimer(hwnd, TIP_TIMER, 450, None);
+                }
             }
             unsafe {
                 let _ = InvalidateRect(hwnd, None, false);
@@ -1016,7 +1135,12 @@ impl App {
                 crate::taskbar::peek();
                 return Some(vec![VK_LWIN, VIRTUAL_KEY('B' as u16)]);
             }
-            Hit::Battery if !middle => {
+            Hit::Volume if middle => {
+                self.status.toggle_mute();
+                self.bars_status_changed();
+            }
+            Hit::Network | Hit::Volume | Hit::Battery if !middle => {
+                hide_tip();
                 // Windows puts Quick settings back by the main taskbar every time it opens,
                 // so wait for it to appear and move it then.
                 let work = self.monitors[m].work;
@@ -1100,6 +1224,16 @@ pub unsafe extern "system" fn bar_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPA
             let (x, y) = xy();
             with_app(|app| app.bar_tray_click(hwnd, x, y, crate::tray::Click::Double));
             LRESULT(0)
+        }
+        WM_MOUSEWHEEL => {
+            // Wheel coordinates are screen-relative.
+            let mut p = POINT { x: (lp.0 & 0xFFFF) as i16 as i32, y: ((lp.0 >> 16) & 0xFFFF) as i16 as i32 };
+            let _ = ScreenToClient(hwnd, &mut p);
+            let delta = ((wp.0 >> 16) & 0xFFFF) as i16;
+            if with_app(|app| app.bar_wheel(hwnd, p.x, p.y, delta)) == Some(true) {
+                return LRESULT(0);
+            }
+            DefWindowProcW(hwnd, msg, wp, lp)
         }
         WM_TIMER if wp.0 == TIP_TIMER => {
             let _ = KillTimer(hwnd, TIP_TIMER);

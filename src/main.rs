@@ -20,6 +20,7 @@ mod config;
 mod layout;
 mod overview;
 mod settings;
+mod status;
 mod taskbar;
 mod tray;
 mod ui;
@@ -113,6 +114,7 @@ struct App {
     launched: Vec<(isize, usize, std::time::Instant)>,
     /// Preferred order of apps on the bar (exe names), from dragging buttons.
     bar_rank: Vec<String>,
+    status: status::Status,
     bars: Vec<bar::Bar>,
     /// LastDesk is keeping the Windows taskbar hidden (its bar sits in the taskbar's strip).
     taskbar_hidden: bool,
@@ -1189,9 +1191,22 @@ unsafe extern "system" fn main_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
         WM_TIMER if wp.0 == CLOCK_TIMER => {
             with_app(|app| {
                 app.taskbar_enforce();
+                if !app.bars.is_empty() {
+                    app.status.refresh_audio();
+                    app.status.refresh_net();
+                }
                 for b in &app.bars {
                     let _ = InvalidateRect(b.hwnd, None, false);
                 }
+            });
+            LRESULT(0)
+        }
+        status::WM_STATUS => {
+            with_app(|app| {
+                if wp.0 == status::STATUS_NET && !app.status.refresh_net() {
+                    return;
+                }
+                app.bars_status_changed();
             });
             LRESULT(0)
         }
@@ -1463,6 +1478,7 @@ fn main() {
             launch: None,
             launched: Vec::new(),
             bar_rank: bar::load_rank(),
+            status: status::Status::new(main),
             bars: Vec::new(),
             taskbar_hidden: false,
         };

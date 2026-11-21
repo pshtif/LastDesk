@@ -34,6 +34,28 @@ pub(crate) unsafe fn font(height: i32, bold: bool) -> HFONT {
     )
 }
 
+/// Windows 11's icon font (Segoe Fluent Icons; Windows 10's Segoe MDL2 has the same codes).
+pub(crate) unsafe fn icon_font(height: i32) -> HFONT {
+    let face = wide(if has_fluent_icons() { "Segoe Fluent Icons" } else { "Segoe MDL2 Assets" });
+    CreateFontW(
+        -height, 0, 0, 0, 400, 0, 0, 0,
+        DEFAULT_CHARSET.0 as u32,
+        OUT_DEFAULT_PRECIS.0 as u32,
+        CLIP_DEFAULT_PRECIS.0 as u32,
+        ANTIALIASED_QUALITY.0 as u32,
+        (DEFAULT_PITCH.0 | FF_DONTCARE.0) as u32,
+        PCWSTR(face.as_ptr()),
+    )
+}
+
+fn has_fluent_icons() -> bool {
+    static HAS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *HAS.get_or_init(|| {
+        let dir = std::env::var("WINDIR").unwrap_or_else(|_| "C:\\Windows".into());
+        std::path::Path::new(&dir).join("Fonts").join("SegoeIcons.ttf").exists()
+    })
+}
+
 pub(crate) unsafe fn draw_text(hdc: HDC, s: &str, r: &mut RECT, color: COLORREF, f: HFONT) {
     // DrawTextW reads through the (dangling) pointer of an empty slice: skip empty text.
     if s.is_empty() {
