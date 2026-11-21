@@ -17,8 +17,10 @@ mod anim;
 mod bar;
 mod cloak;
 mod config;
+mod launcher;
 mod layout;
 mod overview;
+mod preview;
 mod settings;
 mod status;
 mod taskbar;
@@ -101,6 +103,10 @@ struct App {
     config: config::Config,
     /// Lower-case exe name per window (process lookups are not free).
     exe_cache: RefCell<HashMap<isize, String>>,
+    /// AppUserModelID per window (matching Store apps to launchers).
+    aumid_cache: RefCell<HashMap<isize, String>>,
+    /// Icons of config.launchers, by target (rebuilt when the list changes).
+    launcher_icons: Vec<(String, HICON)>,
     /// Windows that existed already / were checked against app rules.
     seen: HashSet<isize>,
     /// New windows waiting for the rule timer (the shell needs a moment before it can cloak them).
@@ -260,6 +266,7 @@ impl App {
         self.seen.retain(|k| unsafe { IsWindow(key_hwnd(*k)).as_bool() });
         self.flashing.retain(|k| unsafe { IsWindow(key_hwnd(*k)).as_bool() });
         self.exe_cache.borrow_mut().retain(|k, _| unsafe { IsWindow(key_hwnd(*k)).as_bool() });
+        self.aumid_cache.borrow_mut().retain(|k, _| unsafe { IsWindow(key_hwnd(*k)).as_bool() });
     }
 
     /// A window was shown: queue it for the rule check if it's new.
@@ -1468,6 +1475,8 @@ fn main() {
         RegisterClassW(&ctl_class);
         let tip_class = WNDCLASSW { lpfnWndProc: Some(bar::tip_proc), hInstance: hinst, lpszClassName: bar::TIP_CLASS, ..Default::default() };
         RegisterClassW(&tip_class);
+        let preview_class = WNDCLASSW { lpfnWndProc: Some(preview::preview_proc), hInstance: hinst, lpszClassName: preview::CLASS, ..Default::default() };
+        RegisterClassW(&preview_class);
         trace("classes");
 
         let main = CreateWindowExW(WINDOW_EX_STYLE(0), w!("LastDeskMain"), w!("LastDesk"), WS_OVERLAPPED, 0, 0, 0, 0, None, None, hinst, None).unwrap();
@@ -1502,6 +1511,8 @@ fn main() {
             layout_frozen: false,
             config: cfg,
             exe_cache: RefCell::new(HashMap::new()),
+            aumid_cache: RefCell::new(HashMap::new()),
+            launcher_icons: Vec::new(),
             seen: HashSet::new(),
             pending: Vec::new(),
             launch: None,

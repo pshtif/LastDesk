@@ -27,6 +27,7 @@ pub const WM_APPBAR: u32 = WM_APP + 2;
 const BASE_HEIGHT: f32 = 34.0;
 const WM_MOUSELEAVE: u32 = 0x02A3;
 const TIP_TIMER: usize = 1;
+const PREVIEW_TIMER: usize = 2;
 pub const TIP_CLASS: windows::core::PCWSTR = w!("LastDeskTip");
 /// Button colour for a window asking for attention (FlashWindow), as on the Windows taskbar.
 const ATTENTION: COLORREF = ui::rgb(0xC8, 0x5A, 0x14);
@@ -128,6 +129,7 @@ pub unsafe extern "system" fn tip_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPA
 pub enum Hit {
     Start,
     Workspace(usize),
+    Launcher(usize),
     Window(isize),
     TrayIcon(usize),
     Tray,
@@ -154,6 +156,8 @@ pub struct Bar {
     pub scale: f32,
     pub start: RECT,
     pub cells: Vec<RECT>,
+    /// Pinned apps without a window in this bar: (index into config.launchers, rect).
+    pub pins: Vec<(usize, RECT)>,
     pub buttons: Vec<Button>,
     /// Tray icons shown in this bar: (owner hwnd, uid, rect).
     pub tray_icons: Vec<(u32, u32, RECT)>,
@@ -358,6 +362,9 @@ impl Bar {
         if let Some(i) = self.cells.iter().position(|r| contains(r, x, y)) {
             return Hit::Workspace(i);
         }
+        if let Some((li, _)) = self.pins.iter().find(|(_, r)| contains(r, x, y)) {
+            return Hit::Launcher(*li);
+        }
         if let Some(b) = self.buttons.iter().find(|b| contains(&b.rect, x, y)) {
             return Hit::Window(b.hwnd);
         }
@@ -479,6 +486,7 @@ impl App {
                 scale: dx as f32 / 96.0,
                 start: RECT::default(),
                 cells: Vec::new(),
+                pins: Vec::new(),
                 buttons: Vec::new(),
                 tray_icons: Vec::new(),
                 tray: RECT::default(),
@@ -579,10 +587,81 @@ impl App {
     }
 
     /// Recompute buttons and layout for every bar, then repaint.
+    fn aumid(&self, h: HWND) -> String {
+        let k = hwnd_key(h);
+        if let Some(a) = self.aumid_cache.borrow().get(&k) {
+            return a.clone();
+        }
+        let a = crate::launcher::window_aumid(h);
+        self.aumid_cache.borrow_mut().insert(k, a.clone());
+        a
+    }
+
+    /// Does window `k` belong to pinned app `li`? Store apps by AppUserModelID, others by exe.
+    pub(crate) fn launcher_matches(&self, li: usize, k: isize) -> bool {
+        let Some(l) = self.config.launchers.get(li) else { return false };
+        let h = key_hwnd(k);
+        match l.target.strip_prefix(crate::launcher::APPS_FOLDER) {
+            Some(aumid) => self.aumid(h).eq_ignore_ascii_case(aumid),
+            None => crate::launcher::stem(&l.target) == self.exe(h),
+        }
+    }
+
+    /// Keep launcher_icons in step with config.launchers.
+    fn sync_launcher_icons(&mut self) {
+        let want: Vec<&String> = self.config.launchers.iter().map(|l| &l.target).collect();
+        if self.launcher_icons.len() == want.len() && self.launcher_icons.iter().zip(&want).all(|((t, _), w)| t == *w) {
+            return;
+        }
+        for (_, i) in self.launcher_icons.drain(..) {
+            if !i.is_invalid() {
+                unsafe {
+                    let _ = DestroyIcon(i);
+                }
+            }
+        }
+        self.launcher_icons = self.config.launchers.iter().map(|l| (l.target.clone(), crate::launcher::icon(&l.target))).collect();
+    }
+
+    /// Pin or unpin window `k`'s app; saves the config.
+    pub(crate) fn toggle_launcher(&mut self, k: isize) {
+        let matching: Vec<usize> = (0..self.config.launchers.len()).filter(|li| self.launcher_matches(*li, k)).collect();
+        if matching.is_empty() {
+            let Some(l) = crate::launcher::for_window(key_hwnd(k)) else { return };
+            self.config.launchers.push(l);
+        } else {
+            for li in matching.into_iter().rev() {
+                self.config.launchers.remove(li);
+            }
+        }
+        let _ = crate::config::save(&self.config);
+        self.bars_refresh();
+    }
+
+    pub(crate) fn remove_launcher(&mut self, li: usize) {
+        if li < self.config.launchers.len() {
+            self.config.launchers.remove(li);
+            let _ = crate::config::save(&self.config);
+            self.bars_refresh();
+        }
+    }
+
+    /// Show the hover preview for window button `k` of bar `i`.
+    fn show_preview(&self, i: usize, k: isize) {
+        let b = &self.bars[i];
+        let Some(btn) = b.buttons.iter().find(|bt| bt.hwnd == k) else { return };
+        hide_tip();
+        let above = b.edge == crate::config::Edge::Bottom;
+        let mon = self.monitors.get(b.mon).map(|m| m.rect).unwrap_or(b.rect);
+        let screen_bar = RECT { left: b.rect.left, top: b.rect.top, right: b.rect.right, bottom: b.rect.top + b.height() };
+        crate::preview::show(key_hwnd(k), &btn.title, btn.icon, b.rect.left + (btn.rect.left + btn.rect.right) / 2, screen_bar, above, mon, b.scale);
+    }
+
     pub fn bars_refresh(&mut self) {
         if self.bars.is_empty() {
             return;
         }
+        self.sync_launcher_icons();
         let all = win::visible_windows();
         let n = workspaces();
         let icons_only = self.config.icons_only;
@@ -608,6 +687,10 @@ impl App {
                     let e = self.exe(key_hwnd(*k));
                     (*k, self.bar_rank.iter().position(|r| *r == e).unwrap_or(usize::MAX))
                 })
+                .collect();
+            // Pinned apps with no window in this bar get a launcher button.
+            let pins: Vec<usize> = (0..self.config.launchers.len())
+                .filter(|li| !here.iter().any(|k| self.launcher_matches(*li, *k)))
                 .collect();
             let b = &mut self.bars[bi];
             b.order.retain(|k| here.contains(k));
@@ -659,22 +742,41 @@ impl App {
             let avail = (b.tray.left - s(10.0) - start_x).max(0);
             let count = b.order.len() as i32;
             let gap = s(4.0);
+            // Launchers sit first, icon-sized, then the window buttons.
+            let pw = s(36.0);
+            let pins_w = if pins.is_empty() { 0 } else { pins.len() as i32 * (pw + gap) + s(4.0) };
+            let avail_btn = (avail - pins_w).max(0);
             let bw = if count == 0 {
                 0
             } else if icons_only {
                 s(40.0)
             } else {
-                s(220.0).min((avail - gap * (count - 1)) / count).max(s(34.0))
+                s(220.0).min((avail_btn - gap * (count - 1)) / count).max(s(34.0))
             };
-            let shown = if bw == 0 { 0 } else { ((avail + gap) / (bw + gap)).min(count) };
-            let total = (shown * bw + (shown - 1).max(0) * gap).max(0);
+            let shown = if bw == 0 { 0 } else { ((avail_btn + gap) / (bw + gap)).min(count) };
+            let total_btn = (shown * bw + (shown - 1).max(0) * gap).max(0);
+            let total = pins_w + total_btn;
             let mut bx = match align {
                 crate::config::Align::Left => start_x,
                 // Centered on the whole bar (like Windows 11), kept inside the free area.
                 crate::config::Align::Center => (w / 2 - total / 2).clamp(start_x, (start_x + avail - total).max(start_x)),
                 crate::config::Align::Right => (start_x + avail - total).max(start_x),
             };
-            let limit = bx + total;
+            b.pins = pins
+                .iter()
+                .map(|li| {
+                    let r = RECT { left: bx, top: s(3.0), right: bx + pw, bottom: h - s(3.0) };
+                    bx += pw + gap;
+                    (*li, r)
+                })
+                .collect();
+            if !pins.is_empty() {
+                bx += s(4.0);
+            }
+            if !b.pins.is_empty() {
+                crate::trace(&format!("pins mon{} {:?}", b.mon, b.pins.iter().map(|(li, r)| (*li, r.left, r.right)).collect::<Vec<_>>()));
+            }
+            let limit = bx + total_btn;
             b.buttons = b
                 .order
                 .iter()
@@ -697,6 +799,11 @@ impl App {
             unsafe {
                 let _ = InvalidateRect(b.hwnd, None, false);
             }
+        }
+        // The previewed window went away (closed, moved, other workspace): drop the preview.
+        let t = crate::preview::target();
+        if t != 0 && !self.bars.iter().any(|b| b.buttons.iter().any(|bt| bt.hwnd == t)) {
+            crate::preview::hide();
         }
     }
 
@@ -746,6 +853,19 @@ impl App {
                 let color = if active || occupied { ui::TEXT } else { ui::rgb(0x60, 0x63, 0x6A) };
                 let mut tr = *r;
                 ui::draw_text(mem, &(i + 1).to_string(), &mut tr, color, f_num);
+            }
+
+            // Pinned apps that aren't running here: icon only.
+            for (li, r) in &b.pins {
+                if b.hover == Hit::Launcher(*li) {
+                    ui::fill_round(mem, *r, s(6.0), hover_bg);
+                }
+                if let Some((_, icon)) = self.launcher_icons.get(*li) {
+                    if !icon.is_invalid() {
+                        let sz = s(18.0);
+                        let _ = DrawIconEx(mem, r.left + (r.right - r.left - sz) / 2, (h - sz) / 2, *icon, sz, sz, 0, None, DI_NORMAL);
+                    }
+                }
             }
 
             // Window buttons. While dragging, the dragged one leaves an empty slot and is drawn
@@ -907,6 +1027,14 @@ impl App {
         }
     }
 
+    /// The launcher button under (x, y): index into config.launchers.
+    pub fn bar_launcher_at(&self, hwnd: HWND, x: i32, y: i32) -> Option<usize> {
+        match self.bars[self.bar_index(hwnd)?].hit(x, y) {
+            Hit::Launcher(li) => Some(li),
+            _ => None,
+        }
+    }
+
     /// Right/double click on a tray icon. Returns true if (x, y) was a tray icon.
     /// The window button under (x, y): (window, monitor).
     pub fn bar_window_at(&self, hwnd: HWND, x: i32, y: i32) -> Option<(isize, usize)> {
@@ -1003,6 +1131,16 @@ impl App {
             self.show_status_tip(i, self.bars[i].hover);
             return;
         }
+        if let Hit::Launcher(li) = self.bars[i].hover {
+            let b = &self.bars[i];
+            let (Some((_, r)), Some(l)) = (b.pins.iter().find(|(x, _)| *x == li), self.config.launchers.get(li)) else { return };
+            let mut c = l.name.chars();
+            let name = c.next().map(|f| f.to_uppercase().collect::<String>() + c.as_str()).unwrap_or_default();
+            let above = b.edge == crate::config::Edge::Bottom;
+            let y = if above { b.rect.top } else { b.rect.top + b.height() };
+            show_tip(&name, POINT { x: b.rect.left + (r.left + r.right) / 2, y }, b.scale, above);
+            return;
+        }
         let b = &self.bars[i];
         if let Hit::TrayIcon(t) = b.hover {
             let (hw, uid, r) = b.tray_icons[t];
@@ -1019,6 +1157,7 @@ impl App {
 
     /// Left button down: remember a window button as a possible drag.
     pub fn bar_drag_start(&mut self, hwnd: HWND, x: i32, y: i32) {
+        crate::preview::hide();
         let Some(i) = self.bar_index(hwnd) else { return };
         let b = &mut self.bars[i];
         if let Hit::Window(k) = b.hit(x, y) {
@@ -1124,13 +1263,38 @@ impl App {
                 unsafe {
                     SetTimer(hwnd, TIP_TIMER, 450, None);
                 }
-            } else if matches!(hit, Hit::Volume | Hit::Network | Hit::Privacy) {
+            } else if matches!(hit, Hit::Volume | Hit::Network | Hit::Privacy | Hit::Launcher(_)) {
                 unsafe {
                     SetTimer(hwnd, TIP_TIMER, 450, None);
                 }
             }
+            // Window preview: after a short hover, then follows the mouse between buttons at once.
+            if let Hit::Window(k) = hit {
+                if crate::preview::visible() {
+                    self.show_preview(i, k);
+                } else {
+                    unsafe {
+                        SetTimer(hwnd, PREVIEW_TIMER, 500, None);
+                    }
+                }
+            } else {
+                unsafe {
+                    let _ = KillTimer(hwnd, PREVIEW_TIMER);
+                }
+                crate::preview::hide();
+            }
             unsafe {
                 let _ = InvalidateRect(hwnd, None, false);
+            }
+        }
+    }
+
+    /// The preview delay elapsed: show it if the mouse is still on a window button.
+    pub fn bar_preview_timer(&mut self, hwnd: HWND) {
+        let Some(i) = self.bar_index(hwnd) else { return };
+        if let Hit::Window(k) = self.bars[i].hover {
+            if self.bars[i].drag.is_none() {
+                self.show_preview(i, k);
             }
         }
     }
@@ -1142,8 +1306,10 @@ impl App {
         b.hover = Hit::None;
         hide_tip();
         unsafe {
+            let _ = KillTimer(hwnd, PREVIEW_TIMER);
             let _ = InvalidateRect(hwnd, None, false);
         }
+        crate::preview::hide();
     }
 
     /// Returns a key combo to press after the borrow ends (SendInput is fine either way,
@@ -1151,7 +1317,16 @@ impl App {
     pub fn bar_click(&mut self, hwnd: HWND, x: i32, y: i32, middle: bool) -> Option<Vec<VIRTUAL_KEY>> {
         let i = self.bar_index(hwnd)?;
         let m = self.bars[i].mon;
+        crate::preview::hide();
         match self.bars[i].hit(x, y) {
+            Hit::Launcher(li) if !middle => {
+                hide_tip();
+                if let Some(l) = self.config.launchers.get(li).cloned() {
+                    // Open it on this bar's monitor, like Start does.
+                    self.note_start_opened(m);
+                    crate::launcher::launch(&l.target);
+                }
+            }
             Hit::Start if !middle => {
                 place_start_menu(self.monitors[m].work);
                 self.note_start_opened(m);
@@ -1262,6 +1437,12 @@ pub unsafe extern "system" fn bar_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPA
             if with_app(|app| app.bar_tray_click(hwnd, x, y, crate::tray::Click::Right)) == Some(true) {
                 return LRESULT(0);
             }
+            crate::preview::hide();
+            hide_tip();
+            if let Some(li) = with_app(|app| app.bar_launcher_at(hwnd, x, y)).flatten() {
+                launcher_menu(li);
+                return LRESULT(0);
+            }
             match with_app(|app| app.bar_window_at(hwnd, x, y)).flatten() {
                 Some((k, m)) => window_menu(k, m),
                 None => crate::show_menu(with_app(|a| a.main).unwrap_or(hwnd)),
@@ -1288,6 +1469,11 @@ pub unsafe extern "system" fn bar_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPA
             with_app(|app| app.bar_show_tip(hwnd));
             LRESULT(0)
         }
+        WM_TIMER if wp.0 == PREVIEW_TIMER => {
+            let _ = KillTimer(hwnd, PREVIEW_TIMER);
+            with_app(|app| app.bar_preview_timer(hwnd));
+            LRESULT(0)
+        }
         WM_MOUSEACTIVATE => LRESULT(MA_NOACTIVATE as isize),
         m if m == WM_APPBAR => {
             match wp.0 as u32 {
@@ -1310,11 +1496,13 @@ fn window_menu(k: isize, m: usize) {
     const CMD_MINRESTORE: usize = 1;
     const CMD_PIN: usize = 2;
     const CMD_CLOSE: usize = 3;
+    const CMD_LAUNCHER: usize = 4;
     const CMD_WS: usize = 100; // 100 + workspace index
     let h = key_hwnd(k);
-    let Some((main, active, pinned)) = with_app(|app| {
+    let Some((main, active, pinned, on_bar)) = with_app(|app| {
         let active = app.mons.get(m).map(|ms| ms.active).unwrap_or(0);
-        (app.main, active, app.pinned.contains(&k))
+        let on_bar = (0..app.config.launchers.len()).any(|li| app.launcher_matches(li, k));
+        (app.main, active, app.pinned.contains(&k), on_bar)
     }) else { return };
     let wide = |s: &str| -> Vec<u16> { s.encode_utf16().chain(std::iter::once(0)).collect() };
     unsafe {
@@ -1331,6 +1519,8 @@ fn window_menu(k: isize, m: usize) {
         let _ = AppendMenuW(menu, MF_STRING, CMD_MINRESTORE, windows::core::PCWSTR(t.as_ptr()));
         let t = wide("Pin to all workspaces");
         let _ = AppendMenuW(menu, MF_STRING | if pinned { MF_CHECKED } else { MF_UNCHECKED }, CMD_PIN, windows::core::PCWSTR(t.as_ptr()));
+        let t = wide(if on_bar { "Unpin from bar" } else { "Pin to bar" });
+        let _ = AppendMenuW(menu, MF_STRING, CMD_LAUNCHER, windows::core::PCWSTR(t.as_ptr()));
         if let Ok(sub) = CreatePopupMenu() {
             for w in 0..workspaces() {
                 let t = wide(&format!("Workspace {}", w + 1));
@@ -1369,11 +1559,49 @@ fn window_menu(k: isize, m: usize) {
             CMD_CLOSE => {
                 let _ = PostMessageW(h, WM_CLOSE, WPARAM(0), LPARAM(0));
             }
+            CMD_LAUNCHER => {
+                with_app(|app| app.toggle_launcher(k));
+            }
             c if (CMD_WS..CMD_WS + workspaces()).contains(&c) => {
                 with_app(|app| {
                     app.move_window(k, (m, active), (m, c - CMD_WS));
                     app.bars_refresh();
                 });
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Right-click menu for a pinned app's launcher button.
+fn launcher_menu(li: usize) {
+    const CMD_OPEN: usize = 1;
+    const CMD_UNPIN: usize = 2;
+    let Some(main) = with_app(|app| app.main) else { return };
+    let wide = |s: &str| -> Vec<u16> { s.encode_utf16().chain(std::iter::once(0)).collect() };
+    unsafe {
+        let Ok(menu) = CreatePopupMenu() else { return };
+        let t = wide("Open");
+        let _ = AppendMenuW(menu, MF_STRING, CMD_OPEN, windows::core::PCWSTR(t.as_ptr()));
+        let t = wide("Unpin from bar");
+        let _ = AppendMenuW(menu, MF_STRING, CMD_UNPIN, windows::core::PCWSTR(t.as_ptr()));
+        let pt = cursor();
+        let _ = SetForegroundWindow(main);
+        let cmd = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON, pt.x, pt.y, 0, main, None).0 as usize;
+        let _ = PostMessageW(main, WM_NULL, WPARAM(0), LPARAM(0));
+        let _ = DestroyMenu(menu);
+        match cmd {
+            CMD_OPEN => {
+                with_app(|app| {
+                    let m = crate::win::monitor_name_at_cursor().and_then(|n| app.mon_index(&n)).unwrap_or(0);
+                    if let Some(l) = app.config.launchers.get(li).cloned() {
+                        app.note_start_opened(m);
+                        crate::launcher::launch(&l.target);
+                    }
+                });
+            }
+            CMD_UNPIN => {
+                with_app(|app| app.remove_launcher(li));
             }
             _ => {}
         }

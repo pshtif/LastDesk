@@ -81,6 +81,8 @@ struct State {
     status: (String, bool),
     /// Not editable in the dialog; carried through so saving keeps it.
     launch_ignore: Vec<String>,
+    /// Launchers when the dialog opened (fallback; normally read live from the app).
+    launchers: Vec<crate::config::Launcher>,
 }
 
 thread_local! {
@@ -135,7 +137,7 @@ fn seg_value(id: i32) -> String {
 fn gather() -> Config {
     let lines = |id: i32| text_of(id).lines().map(|l| l.trim().to_string()).filter(|l| !l.is_empty()).collect::<Vec<_>>().join("\n");
     let text = format!(
-        "workspaces = {}\nanimation = {}\nlaunch_ignore = {}\n[keys]\nswitch = {}\nmove = {}\npin = {}\noverview = {}\nnext = {}\nprev = {}\n[bar]\nenabled = {}\nposition = {}\nbuttons = {}\nalign = {}\nhide_taskbar = {}\ntray = {}\n[pinned_apps]\n{}\n[rules]\n{}\n",
+        "workspaces = {}\nanimation = {}\nlaunch_ignore = {}\n[keys]\nswitch = {}\nmove = {}\npin = {}\noverview = {}\nnext = {}\nprev = {}\n[bar]\nenabled = {}\nposition = {}\nbuttons = {}\nalign = {}\nhide_taskbar = {}\ntray = {}\n[pinned_apps]\n{}\n[launchers]\n{}\n[rules]\n{}\n",
         seg_value(ID_WORKSPACES),
         seg_value(ID_ANIM),
         SETTINGS.with(|s| s.borrow().as_ref().map(|s| s.launch_ignore.join(", ")).unwrap_or_default()),
@@ -152,6 +154,14 @@ fn gather() -> Config {
         toggle_on(ID_HIDE_TASKBAR),
         toggle_on(ID_TRAY),
         lines(ID_PINNED),
+        // Not edited here (pin/unpin from the bar): keep the app's current list.
+        with_app(|a| a.config.launchers.clone())
+            .or_else(|| SETTINGS.with(|s| s.borrow().as_ref().map(|s| s.launchers.clone())))
+            .unwrap_or_default()
+            .iter()
+            .map(|l| format!("{} = {}", l.name, l.target))
+            .collect::<Vec<_>>()
+            .join("\n"),
         lines(ID_RULES),
     );
     config::parse(&text)
@@ -391,7 +401,7 @@ pub fn open() {
         let font = mk_font(13.0, 400);
         let bold = mk_font(14.5, 600);
         SETTINGS.with(|st| {
-            *st.borrow_mut() = Some(State { hwnd, font, bold, bg: CreateSolidBrush(BG), field: CreateSolidBrush(FIELD), status: (String::new(), true), launch_ignore: cfg.launch_ignore.clone() })
+            *st.borrow_mut() = Some(State { hwnd, font, bold, bg: CreateSolidBrush(BG), field: CreateSolidBrush(FIELD), status: (String::new(), true), launch_ignore: cfg.launch_ignore.clone(), launchers: cfg.launchers.clone() })
         });
 
         let native = |class: PCWSTR, text: &str, style: u32, x: i32, y: i32, w: i32, h: i32, id: i32, f: HFONT| -> HWND {

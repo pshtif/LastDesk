@@ -20,6 +20,13 @@ pub struct Rule {
     pub workspace: usize,
 }
 
+/// A pinned app button on the bar. `target` is an exe path or "shell:AppsFolder\<AUMID>".
+#[derive(Clone, PartialEq, Debug)]
+pub struct Launcher {
+    pub name: String,
+    pub target: String,
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Edge {
     Top,
@@ -49,6 +56,7 @@ pub struct Config {
     pub next: Hotkey,
     pub prev: Hotkey,
     pub pinned_apps: Vec<String>,
+    pub launchers: Vec<Launcher>,
     pub rules: Vec<Rule>,
     pub bar: bool,
     pub bar_edge: Edge,
@@ -181,6 +189,7 @@ pub fn parse(text: &str) -> Config {
         next: parse_hotkey("ctrl+alt+right").unwrap(),
         prev: parse_hotkey("ctrl+alt+left").unwrap(),
         pinned_apps: Vec::new(),
+        launchers: Vec::new(),
         rules: Vec::new(),
         bar: true,
         bar_edge: Edge::Top,
@@ -270,6 +279,7 @@ pub fn parse(text: &str) -> Config {
                 None => bad(),
             },
             ("pinned_apps", app) => c.pinned_apps.push(app.trim_end_matches(".exe").to_string()),
+            ("launchers", name) if !val.is_empty() => c.launchers.push(Launcher { name: name.to_string(), target: val.to_string() }),
             ("rules", app) => {
                 let nums: Vec<Option<usize>> = val.split(',').map(|s| s.trim().parse().ok()).collect();
                 match nums.as_slice() {
@@ -332,6 +342,12 @@ pub fn render(c: &Config) -> String {
     s.push_str("# Apps shown on every workspace. One exe name per line (without .exe), e.g. spotify\n");
     for a in &c.pinned_apps {
         s.push_str(&format!("{a}\n"));
+    }
+    s.push_str("\n[launchers]\n");
+    s.push_str("# Pinned app buttons on the bar (right-click a window button > Pin to bar).\n");
+    s.push_str("# name = exe path   or   name = shell:AppsFolder\\<app id>\n");
+    for l in &c.launchers {
+        s.push_str(&format!("{} = {}\n", l.name, l.target));
     }
     s.push_str("\n[rules]\n");
     s.push_str("# New windows of an app open on a given monitor and workspace (monitor 1 = leftmost):\n");
