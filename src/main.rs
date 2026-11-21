@@ -14,6 +14,7 @@
 #![windows_subsystem = "windows"]
 
 mod anim;
+mod asus;
 mod bar;
 mod cloak;
 mod config;
@@ -26,6 +27,7 @@ mod status;
 mod taskbar;
 mod tray;
 mod ui;
+mod tailscale;
 mod win;
 mod winkey;
 
@@ -983,7 +985,7 @@ enum MenuAction {
     Exit,
 }
 
-fn message(text: &str, warn: bool) {
+pub(crate) fn message(text: &str, warn: bool) {
     let w = wide(text);
     unsafe {
         MessageBoxW(None, PCWSTR(w.as_ptr()), w!("LastDesk"), MB_OK | if warn { MB_ICONWARNING } else { MB_ICONINFORMATION });
@@ -1209,6 +1211,7 @@ unsafe extern "system" fn main_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
                 if !app.bars.is_empty() {
                     app.status.refresh_audio();
                     app.status.refresh_net();
+                    app.bars_ensure_work_areas();
                 }
                 for b in &app.bars {
                     let _ = InvalidateRect(b.hwnd, None, false);
@@ -1224,6 +1227,10 @@ unsafe extern "system" fn main_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
             with_app(|app| {
                 if wp.0 == status::STATUS_NET && !app.status.refresh_net() {
                     return;
+                }
+                if wp.0 == status::STATUS_TAILSCALE {
+                    let st = tailscale::status().unwrap_or_default();
+                    trace(&format!("tailscale {:?} exit_nodes={} using_exit={}", st.state, st.exit_nodes.len(), st.exit_node().is_some()));
                 }
                 if wp.0 == status::STATUS_PRIVACY {
                     if app.status.refresh_privacy() {
@@ -1547,6 +1554,12 @@ fn main() {
         APP.with(|a| *a.borrow_mut() = Some(app));
         let _ = RegisterShellHookWindow(main);
         winkey::start(main);
+        if tailscale::installed() {
+            let m = main.0 as isize;
+            tailscale::start(move || {
+                let _ = PostMessageW(HWND(m as *mut _), status::WM_STATUS, WPARAM(status::STATUS_TAILSCALE), LPARAM(0));
+            });
+        }
         if !problems.is_empty() {
             message(&problems.join("\n"), true);
         }

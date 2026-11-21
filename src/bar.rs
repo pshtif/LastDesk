@@ -130,6 +130,7 @@ pub enum Hit {
     Start,
     Workspace(usize),
     Launcher(usize),
+    Tailscale,
     Window(isize),
     TrayIcon(usize),
     Tray,
@@ -173,6 +174,8 @@ pub struct Bar {
     pub tray: RECT,
     /// Microphone / camera in-use icons (zero width when nothing is in use).
     pub privacy: RECT,
+    /// Tailscale icon (zero width when Tailscale isn't installed).
+    pub ts: RECT,
     pub net: RECT,
     pub vol: RECT,
     pub battery: RECT,
@@ -188,6 +191,8 @@ pub struct Bar {
     pub fs: bool,
     /// A window button being pressed / dragged to reorder.
     pub drag: Option<BarDrag>,
+    /// We set this monitor's work area ourselves (Windows ignored the app bar); undo on exit.
+    pub forced_work: bool,
 }
 
 pub struct BarDrag {
@@ -246,6 +251,18 @@ fn fullscreen_monitors(mons: &[RECT]) -> Vec<bool> {
         let mut r = RECT::default();
         if GetWindowRect(h, &mut r).is_err() || r.right - r.left < 50 {
             return TRUE;
+        }
+        // An ordinary maximized window (title bar and all) isn't fullscreen, even when it covers
+        // the monitor because the bar's strip wasn't reserved; counting it would keep the bar
+        // hidden for good.
+        let style = GetWindowLongW(h, GWL_STYLE) as u32;
+        if IsZoomed(h).as_bool() && style & WS_CAPTION.0 == WS_CAPTION.0 {
+            if let Some(i) = s.mons.iter().position(|m| contains(m, (r.left + r.right) / 2, (r.top + r.bottom) / 2)) {
+                if s.result[i].is_none() {
+                    s.result[i] = Some(false);
+                }
+            }
+            return if s.result.iter().all(|r| r.is_some()) { FALSE } else { TRUE };
         }
         let topmost = ex & WS_EX_TOPMOST.0 != 0;
         // The monitor the window belongs to (not mere overlap: a maximized window's invisible
@@ -420,6 +437,9 @@ impl Bar {
         if contains(&self.privacy, x, y) {
             return Hit::Privacy;
         }
+        if contains(&self.ts, x, y) {
+            return Hit::Tailscale;
+        }
         if contains(&self.net, x, y) {
             return Hit::Network;
         }
@@ -492,6 +512,40 @@ impl Bar {
             self.rect = abd.rc;
             let _ = SetWindowPos(self.hwnd, HWND_TOPMOST, abd.rc.left, abd.rc.top, abd.rc.right - abd.rc.left, h, self.show_flags());
         }
+        self.ensure_work_area(monitor);
+    }
+
+    /// Make sure the monitor's work area leaves out the bar. Windows sometimes ignores an app
+    /// bar's reservation on a monitor (seen after the main display changed, with maximized
+    /// windows covering it), and then maximized windows go over the bar. If so, set the work
+    /// area directly.
+    fn ensure_work_area(&mut self, monitor: RECT) {
+        if !self.registered || self.rect.bottom <= self.rect.top {
+            return; // in the hidden taskbar's strip: the taskbar reserves it
+        }
+        unsafe {
+            let mut mi = MONITORINFO { cbSize: std::mem::size_of::<MONITORINFO>() as u32, ..Default::default() };
+            if !GetMonitorInfoW(MonitorFromRect(&monitor, MONITOR_DEFAULTTONEAREST), &mut mi).as_bool() || mi.rcMonitor != monitor {
+                return;
+            }
+            let mut work = mi.rcWork;
+            let bottom = self.edge == crate::config::Edge::Bottom;
+            if bottom {
+                if work.bottom <= self.rect.top {
+                    return;
+                }
+                work.bottom = self.rect.top;
+            } else {
+                if work.top >= self.rect.bottom {
+                    return;
+                }
+                work.top = self.rect.bottom;
+            }
+            if SystemParametersInfoW(SPI_SETWORKAREA, 0, Some(&mut work as *mut RECT as _), SPIF_SENDCHANGE).is_ok() {
+                self.forced_work = true;
+                crate::trace(&format!("work area forced on mon{}", self.mon));
+            }
+        }
     }
 }
 
@@ -534,6 +588,7 @@ impl App {
                 tray_icons: Vec::new(),
                 tray: RECT::default(),
                 privacy: RECT::default(),
+                ts: RECT::default(),
                 net: RECT::default(),
                 vol: RECT::default(),
                 battery: RECT::default(),
@@ -545,6 +600,7 @@ impl App {
                 edge: self.config.bar_edge,
                 fs: false,
                 drag: None,
+                forced_work: false,
             };
             bar.place(r, None);
             self.bars.push(bar);
@@ -564,9 +620,36 @@ impl App {
                     SHAppBarMessage(ABM_REMOVE, &mut abd);
                 }
                 let _ = DestroyWindow(b.hwnd);
+                // We set the work area ourselves: give the bar's strip back.
+                if b.forced_work {
+                    if let Some(m) = self.monitors.get(b.mon) {
+                        let mut mi = MONITORINFO { cbSize: std::mem::size_of::<MONITORINFO>() as u32, ..Default::default() };
+                        if GetMonitorInfoW(MonitorFromRect(&m.rect, MONITOR_DEFAULTTONEAREST), &mut mi).as_bool() {
+                            let mut work = mi.rcWork;
+                            if b.edge == crate::config::Edge::Bottom {
+                                work.bottom = work.bottom.max(b.rect.bottom).min(mi.rcMonitor.bottom);
+                            } else {
+                                work.top = work.top.min(b.rect.top).max(mi.rcMonitor.top);
+                            }
+                            let _ = SystemParametersInfoW(SPI_SETWORKAREA, 0, Some(&mut work as *mut RECT as _), SPIF_SENDCHANGE);
+                        }
+                    }
+                }
             }
         }
         self.refresh_work_areas();
+    }
+
+    /// Safety net (clock timer): re-check that every bar's strip is still reserved.
+    pub fn bars_ensure_work_areas(&mut self) {
+        for i in 0..self.bars.len() {
+            let Some(mon) = self.monitors.get(self.bars[i].mon).map(|m| m.rect) else { continue };
+            let was = self.bars[i].forced_work;
+            self.bars[i].ensure_work_area(mon);
+            if self.bars[i].forced_work && !was {
+                self.refresh_work_areas();
+            }
+        }
     }
 
     /// Our app bars shrink each monitor's work area: keep our copy current.
@@ -793,7 +876,9 @@ impl App {
             b.vol = RECT { left: b.battery.left - icon_w, top: s(3.0), right: b.battery.left, bottom: h - s(3.0) };
             b.net = RECT { left: b.vol.left - icon_w, top: s(3.0), right: b.vol.left, bottom: h - s(3.0) };
             let n_priv = (!self.status.mic.is_empty()) as i32 + (!self.status.cam.is_empty()) as i32;
-            b.privacy = RECT { left: b.net.left - icon_w * n_priv, top: s(3.0), right: b.net.left, bottom: h - s(3.0) };
+            let ts_w = if crate::tailscale::installed() { icon_w } else { 0 };
+            b.ts = RECT { left: b.net.left - ts_w, top: s(3.0), right: b.net.left, bottom: h - s(3.0) };
+            b.privacy = RECT { left: b.ts.left - icon_w * n_priv, top: s(3.0), right: b.ts.left, bottom: h - s(3.0) };
             let mut ix = b.privacy.left - s(4.0);
             let mut tray_icons: Vec<(u32, u32, RECT)> = icons
                 .iter()
@@ -1080,6 +1165,37 @@ impl App {
                     }
                 }
             }
+            // Tailscale: a 3×3 grid of dots with a bright "T" when connected (dim when not,
+            // accent colour when using an exit node, orange when it needs a login).
+            if b.ts.right > b.ts.left {
+                if b.hover == Hit::Tailscale {
+                    ui::fill_round(mem, b.ts, s(6.0), hover_bg);
+                }
+                use crate::tailscale::State;
+                let st = crate::tailscale::status().unwrap_or_default();
+                let lit = match st.state {
+                    State::Running if st.exit_node().is_some() => Some(ui::ACCENT),
+                    State::Running => Some(ui::TEXT),
+                    State::NeedsLogin => Some(ATTENTION),
+                    State::Starting => Some(ui::MUTED),
+                    State::Stopped | State::Unavailable => None,
+                };
+                let d = s(3.0).max(2);
+                let step = s(5.0);
+                let cx = (b.ts.left + b.ts.right) / 2;
+                let cy = (b.ts.top + b.ts.bottom) / 2;
+                for row in -1..=1 {
+                    for col in -1..=1 {
+                        let in_t = row == 0 || (row == 1 && col == 0);
+                        let color = match lit {
+                            Some(c) if in_t => c,
+                            _ => dim,
+                        };
+                        let (x0, y0) = (cx + col * step - d / 2, cy + row * step - d / 2);
+                        ui::fill_round(mem, RECT { left: x0, top: y0, right: x0 + d, bottom: y0 + d }, d / 2, color);
+                    }
+                }
+            }
             if b.hover == Hit::Network {
                 ui::fill_round(mem, b.net, s(6.0), hover_bg);
             }
@@ -1147,6 +1263,11 @@ impl App {
         }
     }
 
+    /// What's under (x, y) on this bar.
+    pub fn bar_hit_at(&self, hwnd: HWND, x: i32, y: i32) -> Option<Hit> {
+        Some(self.bars[self.bar_index(hwnd)?].hit(x, y))
+    }
+
     /// The launcher button under (x, y): index into config.launchers.
     pub fn bar_launcher_at(&self, hwnd: HWND, x: i32, y: i32) -> Option<usize> {
         match self.bars[self.bar_index(hwnd)?].hit(x, y) {
@@ -1199,6 +1320,47 @@ impl App {
                 Net::Wifi(q) => format!("Wi-Fi: {} ({}%)", self.status.ssid, q),
                 Net::Offline => "Not connected".into(),
             }),
+            Hit::Tailscale => {
+                use crate::tailscale::State;
+                let st = crate::tailscale::status().unwrap_or_default();
+                Some(match st.state {
+                    State::Running => {
+                        let mut parts = vec!["Tailscale: connected".to_string()];
+                        if !st.tailnet.is_empty() {
+                            parts.push(st.tailnet.clone());
+                        }
+                        if !st.ip.is_empty() {
+                            parts.push(st.ip.clone());
+                        }
+                        if let Some(e) = st.exit_node() {
+                            parts.push(format!("exit node {}", e.name));
+                        }
+                        parts.join("  ·  ")
+                    }
+                    State::Starting => "Tailscale: connecting…".into(),
+                    State::NeedsLogin => "Tailscale: needs login (click)".into(),
+                    State::Stopped => "Tailscale: disconnected".into(),
+                    State::Unavailable => "Tailscale: service not running".into(),
+                })
+            }
+            Hit::Battery => {
+                let mut ps = SYSTEM_POWER_STATUS::default();
+                let mut parts = Vec::new();
+                if unsafe { GetSystemPowerStatus(&mut ps) }.is_ok() && ps.BatteryLifePercent <= 100 {
+                    let state = if ps.ACLineStatus != 1 {
+                        "on battery"
+                    } else if ps.BatteryFlag & 8 != 0 {
+                        "charging"
+                    } else {
+                        "plugged in"
+                    };
+                    parts.push(format!("Battery {}% ({state})", ps.BatteryLifePercent));
+                }
+                if let Some(rpm) = crate::asus::fan_rpm() {
+                    parts.push(if rpm == 0 { "fan off".into() } else { format!("fan {rpm} rpm") });
+                }
+                (!parts.is_empty()).then(|| parts.join("  ·  "))
+            }
             _ => None,
         }
     }
@@ -1209,6 +1371,8 @@ impl App {
             Hit::Volume => b.vol,
             Hit::Network => b.net,
             Hit::Privacy => b.privacy,
+            Hit::Tailscale => b.ts,
+            Hit::Battery => b.battery,
             _ => return,
         };
         if let Some(text) = self.status_tip(hit) {
@@ -1224,7 +1388,7 @@ impl App {
             unsafe {
                 let _ = InvalidateRect(self.bars[i].hwnd, None, false);
             }
-            if matches!(self.bars[i].hover, Hit::Volume | Hit::Network | Hit::Privacy) && TIP.with(|t| unsafe { IsWindowVisible(t.borrow().0).as_bool() }) {
+            if matches!(self.bars[i].hover, Hit::Volume | Hit::Network | Hit::Privacy | Hit::Tailscale | Hit::Battery) && TIP.with(|t| unsafe { IsWindowVisible(t.borrow().0).as_bool() }) {
                 self.show_status_tip(i, self.bars[i].hover);
             }
         }
@@ -1247,7 +1411,7 @@ impl App {
 
     pub fn bar_show_tip(&mut self, hwnd: HWND) {
         let Some(i) = self.bar_index(hwnd) else { return };
-        if matches!(self.bars[i].hover, Hit::Volume | Hit::Network | Hit::Privacy) {
+        if matches!(self.bars[i].hover, Hit::Volume | Hit::Network | Hit::Privacy | Hit::Tailscale | Hit::Battery) {
             self.show_status_tip(i, self.bars[i].hover);
             return;
         }
@@ -1403,7 +1567,7 @@ impl App {
                 unsafe {
                     SetTimer(hwnd, TIP_TIMER, 450, None);
                 }
-            } else if matches!(hit, Hit::Volume | Hit::Network | Hit::Privacy | Hit::Launcher(_)) {
+            } else if matches!(hit, Hit::Volume | Hit::Network | Hit::Privacy | Hit::Tailscale | Hit::Battery | Hit::Launcher(_)) {
                 unsafe {
                     SetTimer(hwnd, TIP_TIMER, 450, None);
                 }
@@ -1579,6 +1743,11 @@ pub unsafe extern "system" fn bar_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPA
             if msg == WM_LBUTTONUP && with_app(|app| app.bar_drag_end(hwnd)) == Some(true) {
                 return LRESULT(0);
             }
+            if msg == WM_LBUTTONUP && with_app(|app| app.bar_hit_at(hwnd, x, y)).flatten() == Some(Hit::Tailscale) {
+                hide_tip();
+                tailscale_menu();
+                return LRESULT(0);
+            }
             let keys = with_app(|app| app.bar_click(hwnd, x, y, msg == WM_MBUTTONUP)).flatten();
             if let Some(k) = keys {
                 press(&k);
@@ -1592,6 +1761,13 @@ pub unsafe extern "system" fn bar_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPA
             }
             crate::preview::hide();
             hide_tip();
+            match with_app(|app| app.bar_hit_at(hwnd, x, y)).flatten() {
+                Some(Hit::Tailscale) => {
+                    tailscale_menu();
+                    return LRESULT(0);
+                }
+                _ => {}
+            }
             if let Some(li) = with_app(|app| app.bar_launcher_at(hwnd, x, y)).flatten() {
                 launcher_menu(li);
                 return LRESULT(0);
@@ -1721,6 +1897,100 @@ fn window_menu(k: isize, m: usize) {
                     app.bars_refresh();
                 });
             }
+            _ => {}
+        }
+    }
+}
+
+/// Show a popup menu at the cursor and return the chosen command (0 = none).
+unsafe fn run_menu(menu: HMENU) -> usize {
+    let Some(main) = with_app(|app| app.main) else { return 0 };
+    let pt = cursor();
+    let _ = SetForegroundWindow(main);
+    let cmd = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON, pt.x, pt.y, 0, main, None).0 as usize;
+    let _ = PostMessageW(main, WM_NULL, WPARAM(0), LPARAM(0));
+    let _ = DestroyMenu(menu);
+    cmd
+}
+
+fn wide_z(s: &str) -> Vec<u16> {
+    s.encode_utf16().chain(std::iter::once(0)).collect()
+}
+
+/// Tailscale's menu (left or right click on its icon): connect/disconnect, exit node, IP.
+fn tailscale_menu() {
+    use crate::tailscale::State;
+    const CMD_TOGGLE: usize = 1;
+    const CMD_COPY_IP: usize = 2;
+    const CMD_APP: usize = 3;
+    const CMD_ADMIN: usize = 4;
+    const CMD_EXIT_NONE: usize = 10;
+    const CMD_EXIT: usize = 100; // 100 + index into exit_nodes
+    let st = crate::tailscale::status().unwrap_or_default();
+    unsafe {
+        let Ok(menu) = CreatePopupMenu() else { return };
+        let add = |m: HMENU, flags: MENU_ITEM_FLAGS, id: usize, text: &str| {
+            let t = wide_z(&text.replace('&', "&&"));
+            let _ = AppendMenuW(m, flags, id, windows::core::PCWSTR(t.as_ptr()));
+        };
+        let head = match st.state {
+            State::Running if !st.tailnet.is_empty() => format!("Connected to {}", st.tailnet),
+            State::Running => "Connected".into(),
+            State::Starting => "Connecting…".into(),
+            State::NeedsLogin => "Needs login".into(),
+            State::Stopped => "Disconnected".into(),
+            State::Unavailable => "Tailscale service isn't running".into(),
+        };
+        add(menu, MF_STRING | MF_GRAYED, 0, &head);
+        let _ = AppendMenuW(menu, MF_SEPARATOR, 0, windows::core::PCWSTR::null());
+        match st.state {
+            State::Running | State::Starting => add(menu, MF_STRING, CMD_TOGGLE, "Disconnect"),
+            State::Stopped => add(menu, MF_STRING, CMD_TOGGLE, "Connect"),
+            State::NeedsLogin => add(menu, MF_STRING, CMD_APP, "Log in…"),
+            State::Unavailable => {}
+        }
+        if st.state == State::Running {
+            if !st.ip.is_empty() {
+                add(menu, MF_STRING, CMD_COPY_IP, &format!("Copy this device's IP ({})", st.ip));
+            }
+            if !st.exit_nodes.is_empty() {
+                if let Ok(sub) = CreatePopupMenu() {
+                    let none = st.exit_node().is_none();
+                    add(sub, MF_STRING | if none { MF_CHECKED } else { MF_UNCHECKED }, CMD_EXIT_NONE, "None");
+                    let _ = AppendMenuW(sub, MF_SEPARATOR, 0, windows::core::PCWSTR::null());
+                    for (n, e) in st.exit_nodes.iter().enumerate() {
+                        let mut flags = MF_STRING;
+                        if e.active {
+                            flags |= MF_CHECKED;
+                        }
+                        if !e.online && !e.active {
+                            flags |= MF_GRAYED;
+                        }
+                        let label = if e.online { e.name.clone() } else { format!("{} (offline)", e.name) };
+                        add(sub, flags, CMD_EXIT + n, &label);
+                    }
+                    let t = wide_z("Exit node");
+                    let _ = AppendMenuW(menu, MF_POPUP, sub.0 as usize, windows::core::PCWSTR(t.as_ptr()));
+                }
+            }
+        }
+        let _ = AppendMenuW(menu, MF_SEPARATOR, 0, windows::core::PCWSTR::null());
+        add(menu, MF_STRING, CMD_APP, "Open Tailscale app");
+        add(menu, MF_STRING, CMD_ADMIN, "Admin console");
+        match run_menu(menu) {
+            CMD_TOGGLE => crate::tailscale::set_running(st.state == State::Stopped),
+            CMD_COPY_IP => crate::win::set_clipboard_text(&st.ip),
+            CMD_APP => {
+                if let Some(p) = crate::tailscale::app_path() {
+                    let t = wide_z(&p);
+                    ShellExecuteW(None, w!("open"), windows::core::PCWSTR(t.as_ptr()), None, None, SW_SHOWNORMAL);
+                }
+            }
+            CMD_ADMIN => {
+                ShellExecuteW(None, w!("open"), w!("https://login.tailscale.com/admin/machines"), None, None, SW_SHOWNORMAL);
+            }
+            CMD_EXIT_NONE => crate::tailscale::set_exit_node(None),
+            c if c >= CMD_EXIT && c < CMD_EXIT + st.exit_nodes.len() => crate::tailscale::set_exit_node(Some(&st.exit_nodes[c - CMD_EXIT].id)),
             _ => {}
         }
     }
