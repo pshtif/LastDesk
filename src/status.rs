@@ -3,6 +3,7 @@
 //! Volume changes arrive through a Core Audio callback and network changes through
 //! NotifyIpInterfaceChange; both only post WM_STATUS to the main window, so nothing polls.
 //! The default output device and the Wi-Fi signal are re-read on the bar's clock tick.
+//! Microphone / camera use: see the end of the file.
 
 use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU32, Ordering};
 
@@ -76,6 +77,9 @@ pub struct Status {
     pub net: Net,
     pub ssid: String,
     wlan: HANDLE,
+    pub mic: Vec<String>,
+    pub cam: Vec<String>,
+    privacy: Privacy,
     _ip_notify: HANDLE,
 }
 
@@ -95,10 +99,15 @@ impl Status {
             net: Net::Offline,
             ssid: String::new(),
             wlan: HANDLE::default(),
+            mic: Vec::new(),
+            cam: Vec::new(),
+            privacy: Privacy::default(),
             _ip_notify: ip_notify,
         };
         s.refresh_audio();
         s.refresh_net();
+        s.privacy.start_camera();
+        s.refresh_privacy();
         s
     }
 
@@ -247,4 +256,222 @@ impl Status {
         }
     }
 }
+
+// ---- Microphone / camera in use -------------------------------------------------------------
+//
+// Microphone: active capture sessions on every recording device (Core Audio); new sessions and
+// session state changes arrive as callbacks.
+// Camera: Media Foundation's sensor activity monitor reports which processes stream a camera.
+// (The ConsentStore registry values are no longer written on current Windows builds.)
+// Callbacks only post STATUS_PRIVACY; the camera one stores the process ids first.
+
+use std::sync::Mutex;
+
+use windows::core::{Interface, GUID, PCWSTR};
+use windows::Win32::Foundation::{CloseHandle, BOOL};
+use windows::Win32::Media::Audio::{
+    eCapture, AudioSessionDisconnectReason, AudioSessionState, AudioSessionStateActive, IAudioSessionControl, IAudioSessionControl2,
+    IAudioSessionEvents, IAudioSessionEvents_Impl, IAudioSessionManager2, IAudioSessionNotification, IAudioSessionNotification_Impl,
+    DEVICE_STATE_ACTIVE,
+};
+use windows::Win32::Media::MediaFoundation::{
+    IMFSensorActivitiesReport, IMFSensorActivitiesReportCallback, IMFSensorActivitiesReportCallback_Impl, IMFSensorActivityMonitor,
+    MFCreateSensorActivityMonitor,
+};
+use windows::Win32::System::Threading::{OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION};
+
+pub const STATUS_PRIVACY: usize = 2;
+
+static CAMERA_PIDS: Mutex<Vec<u32>> = Mutex::new(Vec::new());
+
+#[implement(IAudioSessionNotification)]
+struct NewSession;
+
+impl IAudioSessionNotification_Impl for NewSession_Impl {
+    fn OnSessionCreated(&self, _: Option<&IAudioSessionControl>) -> Result<()> {
+        post(STATUS_PRIVACY);
+        Ok(())
+    }
+}
+
+#[implement(IAudioSessionEvents)]
+struct SessionEvents;
+
+impl IAudioSessionEvents_Impl for SessionEvents_Impl {
+    fn OnDisplayNameChanged(&self, _: &PCWSTR, _: *const GUID) -> Result<()> {
+        Ok(())
+    }
+    fn OnIconPathChanged(&self, _: &PCWSTR, _: *const GUID) -> Result<()> {
+        Ok(())
+    }
+    fn OnSimpleVolumeChanged(&self, _: f32, _: BOOL, _: *const GUID) -> Result<()> {
+        Ok(())
+    }
+    fn OnChannelVolumeChanged(&self, _: u32, _: *const f32, _: u32, _: *const GUID) -> Result<()> {
+        Ok(())
+    }
+    fn OnGroupingParamChanged(&self, _: *const GUID, _: *const GUID) -> Result<()> {
+        Ok(())
+    }
+    fn OnStateChanged(&self, _: AudioSessionState) -> Result<()> {
+        post(STATUS_PRIVACY);
+        Ok(())
+    }
+    fn OnSessionDisconnected(&self, _: AudioSessionDisconnectReason) -> Result<()> {
+        post(STATUS_PRIVACY);
+        Ok(())
+    }
+}
+
+#[implement(IMFSensorActivitiesReportCallback)]
+struct CameraActivity;
+
+impl IMFSensorActivitiesReportCallback_Impl for CameraActivity_Impl {
+    fn OnActivitiesReport(&self, report: Option<&IMFSensorActivitiesReport>) -> Result<()> {
+        let mut pids = Vec::new();
+        if let Some(r) = report {
+            unsafe {
+                for i in 0..r.GetCount().unwrap_or(0) {
+                    let Ok(a) = r.GetActivityReport(i) else { continue };
+                    for j in 0..a.GetProcessCount().unwrap_or(0) {
+                        let Ok(p) = a.GetProcessActivity(j) else { continue };
+                        if p.GetStreamingState().map(|s| s.as_bool()).unwrap_or(false) {
+                            if let Ok(pid) = p.GetProcessId() {
+                                pids.push(pid);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        pids.sort();
+        pids.dedup();
+        let mut cur = CAMERA_PIDS.lock().unwrap_or_else(|e| e.into_inner());
+        if *cur != pids {
+            *cur = pids;
+            post(STATUS_PRIVACY);
+        }
+        Ok(())
+    }
+}
+
+/// "C:\...\Teams.exe" -> "Teams"
+fn process_name(pid: u32) -> String {
+    unsafe {
+        let Ok(h) = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) else { return format!("process {pid}") };
+        let mut buf = [0u16; 512];
+        let mut len = buf.len() as u32;
+        let ok = QueryFullProcessImageNameW(h, PROCESS_NAME_WIN32, windows::core::PWSTR(buf.as_mut_ptr()), &mut len).is_ok();
+        let _ = CloseHandle(h);
+        if !ok {
+            return format!("process {pid}");
+        }
+        let path = String::from_utf16_lossy(&buf[..len as usize]);
+        let file = path.rsplit('\\').next().unwrap_or(&path);
+        file.strip_suffix(".exe").or_else(|| file.strip_suffix(".EXE")).unwrap_or(file).to_string()
+    }
+}
+
+/// Recording devices with their new-session notification, per-session listeners, camera monitor.
+#[derive(Default)]
+struct Privacy {
+    managers: Vec<(String, IAudioSessionManager2, IAudioSessionNotification)>,
+    sessions: Vec<(IAudioSessionControl, IAudioSessionEvents)>,
+    camera: Option<IMFSensorActivityMonitor>,
+}
+
+impl Privacy {
+    fn start_camera(&mut self) {
+        unsafe {
+            let cb: IMFSensorActivitiesReportCallback = CameraActivity.into();
+            if let Ok(m) = MFCreateSensorActivityMonitor(&cb) {
+                if m.Start().is_ok() {
+                    self.camera = Some(m);
+                }
+            }
+        }
+    }
+
+    /// Follow recording devices being added or removed.
+    fn sync_devices(&mut self, devices: &IMMDeviceEnumerator) {
+        unsafe {
+            let Ok(coll) = devices.EnumAudioEndpoints(eCapture, DEVICE_STATE_ACTIVE) else { return };
+            let mut ids = Vec::new();
+            for i in 0..coll.GetCount().unwrap_or(0) {
+                let Ok(d) = coll.Item(i) else { continue };
+                let Ok(p) = d.GetId() else { continue };
+                let id = p.to_string().unwrap_or_default();
+                CoTaskMemFree(Some(p.0 as *const _));
+                if !self.managers.iter().any(|(m, _, _)| *m == id) {
+                    if let Ok(mgr) = d.Activate::<IAudioSessionManager2>(CLSCTX_ALL, None) {
+                        let n: IAudioSessionNotification = NewSession.into();
+                        // Notifications only start once the session list has been asked for.
+                        let _ = mgr.GetSessionEnumerator();
+                        let _ = mgr.RegisterSessionNotification(&n);
+                        self.managers.push((id.clone(), mgr, n));
+                    }
+                }
+                ids.push(id);
+            }
+            self.managers.retain(|(id, mgr, n)| {
+                let keep = ids.contains(id);
+                if !keep {
+                    let _ = mgr.UnregisterSessionNotification(n);
+                }
+                keep
+            });
+        }
+    }
+
+    /// Apps with an active recording session; (re)subscribes to every session's state changes.
+    fn microphone_apps(&mut self) -> Vec<String> {
+        for (s, e) in self.sessions.drain(..) {
+            unsafe {
+                let _ = s.UnregisterAudioSessionNotification(&e);
+            }
+        }
+        let me = std::process::id();
+        let mut out = Vec::new();
+        unsafe {
+            for (_, mgr, _) in &self.managers {
+                let Ok(list) = mgr.GetSessionEnumerator() else { continue };
+                for i in 0..list.GetCount().unwrap_or(0) {
+                    let Ok(s) = list.GetSession(i) else { continue };
+                    let e: IAudioSessionEvents = SessionEvents.into();
+                    let _ = s.RegisterAudioSessionNotification(&e);
+                    if s.GetState().ok() == Some(AudioSessionStateActive) {
+                        if let Ok(pid) = s.cast::<IAudioSessionControl2>().and_then(|c| c.GetProcessId()) {
+                            if pid != 0 && pid != me {
+                                out.push(process_name(pid));
+                            }
+                        }
+                    }
+                    self.sessions.push((s, e));
+                }
+            }
+        }
+        out.sort();
+        out.dedup();
+        out
+    }
+}
+
+impl Status {
+    /// Re-read which apps use the microphone / camera. Returns whether anything changed.
+    pub fn refresh_privacy(&mut self) -> bool {
+        if let Some(d) = self.devices.clone() {
+            self.privacy.sync_devices(&d);
+        }
+        let mic = self.privacy.microphone_apps();
+        let pids = CAMERA_PIDS.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let mut cam: Vec<String> = pids.into_iter().map(process_name).collect();
+        cam.sort();
+        cam.dedup();
+        let changed = mic != self.mic || cam != self.cam;
+        self.mic = mic;
+        self.cam = cam;
+        changed
+    }
+}
+
 

@@ -28,6 +28,8 @@ const BASE_HEIGHT: f32 = 34.0;
 const WM_MOUSELEAVE: u32 = 0x02A3;
 const TIP_TIMER: usize = 1;
 pub const TIP_CLASS: windows::core::PCWSTR = w!("LastDeskTip");
+/// Button colour for a window asking for attention (FlashWindow), as on the Windows taskbar.
+const ATTENTION: COLORREF = ui::rgb(0xC8, 0x5A, 0x14);
 
 fn cursor() -> POINT {
     let mut p = POINT::default();
@@ -129,6 +131,7 @@ pub enum Hit {
     Window(isize),
     TrayIcon(usize),
     Tray,
+    Privacy,
     Network,
     Volume,
     Battery,
@@ -155,6 +158,8 @@ pub struct Bar {
     /// Tray icons shown in this bar: (owner hwnd, uid, rect).
     pub tray_icons: Vec<(u32, u32, RECT)>,
     pub tray: RECT,
+    /// Microphone / camera in-use icons (zero width when nothing is in use).
+    pub privacy: RECT,
     pub net: RECT,
     pub vol: RECT,
     pub battery: RECT,
@@ -362,6 +367,9 @@ impl Bar {
         if contains(&self.tray, x, y) {
             return Hit::Tray;
         }
+        if contains(&self.privacy, x, y) {
+            return Hit::Privacy;
+        }
         if contains(&self.net, x, y) {
             return Hit::Network;
         }
@@ -474,6 +482,7 @@ impl App {
                 buttons: Vec::new(),
                 tray_icons: Vec::new(),
                 tray: RECT::default(),
+                privacy: RECT::default(),
                 net: RECT::default(),
                 vol: RECT::default(),
                 battery: RECT::default(),
@@ -632,7 +641,9 @@ impl App {
             let icon_w = s(30.0);
             b.vol = RECT { left: b.battery.left - icon_w, top: s(3.0), right: b.battery.left, bottom: h - s(3.0) };
             b.net = RECT { left: b.vol.left - icon_w, top: s(3.0), right: b.vol.left, bottom: h - s(3.0) };
-            let mut ix = b.net.left - s(4.0);
+            let n_priv = (!self.status.mic.is_empty()) as i32 + (!self.status.cam.is_empty()) as i32;
+            b.privacy = RECT { left: b.net.left - icon_w * n_priv, top: s(3.0), right: b.net.left, bottom: h - s(3.0) };
+            let mut ix = b.privacy.left - s(4.0);
             let mut tray_icons: Vec<(u32, u32, RECT)> = icons
                 .iter()
                 .rev()
@@ -728,6 +739,10 @@ impl App {
                 let occupied = if active { !b.order.is_empty() } else { !ms.hidden[i].is_empty() };
                 let bg = if active { ui::ACCENT } else if b.hover == Hit::Workspace(i) { hover_bg } else { ui::rgb(0x22, 0x23, 0x27) };
                 ui::fill_round(mem, *r, s(6.0), bg);
+                // A window on another workspace wants attention: orange frame.
+                if !active && ms.hidden[i].iter().any(|k| self.flashing.contains(k)) {
+                    ui::frame_round(mem, *r, s(6.0), s(2.0).max(2), ATTENTION);
+                }
                 let color = if active || occupied { ui::TEXT } else { ui::rgb(0x60, 0x63, 0x6A) };
                 let mut tr = *r;
                 ui::draw_text(mem, &(i + 1).to_string(), &mut tr, color, f_num);
@@ -742,6 +757,8 @@ impl App {
                     ui::rgb(0x34, 0x36, 0x3D)
                 } else if is_fg {
                     ui::rgb(0x2C, 0x3D, 0x5E)
+                } else if self.flashing.contains(&btn.hwnd) {
+                    ATTENTION
                 } else if b.hover == Hit::Window(btn.hwnd) {
                     hover_bg
                 } else {
@@ -808,6 +825,21 @@ impl App {
             let f_icon = ui::icon_font(s(16.0));
             let dim = ui::rgb(0x5A, 0x5D, 0x64);
             let glyph = |c: u32| char::from_u32(c).map(String::from).unwrap_or_default();
+            // Microphone / camera in use (only shown while something uses them).
+            if b.hover == Hit::Privacy {
+                ui::fill_round(mem, b.privacy, s(6.0), hover_bg);
+            }
+            {
+                let mut x = b.privacy.left;
+                let iw = if b.privacy.right > b.privacy.left { s(30.0) } else { 0 };
+                for (on, g) in [(!self.status.mic.is_empty(), 0xE720), (!self.status.cam.is_empty(), 0xE714)] {
+                    if on {
+                        let mut r = RECT { left: x, right: x + iw, ..b.privacy };
+                        ui::draw_text(mem, &glyph(g), &mut r, ui::TEXT, f_icon);
+                        x += iw;
+                    }
+                }
+            }
             if b.hover == Hit::Network {
                 ui::fill_round(mem, b.net, s(6.0), hover_bg);
             }
@@ -903,6 +935,16 @@ impl App {
                 None => "No audio output".into(),
                 Some((v, m)) => format!("Volume {}%{}", (v * 100.0).round() as i32, if m { " (muted)" } else { "" }),
             }),
+            Hit::Privacy => {
+                let mut parts = Vec::new();
+                if !self.status.mic.is_empty() {
+                    parts.push(format!("Microphone: {}", self.status.mic.join(", ")));
+                }
+                if !self.status.cam.is_empty() {
+                    parts.push(format!("Camera: {}", self.status.cam.join(", ")));
+                }
+                Some(parts.join("  ·  "))
+            }
             Hit::Network => Some(match self.status.net {
                 Net::Ethernet => "Ethernet".into(),
                 Net::Wifi(_) if self.status.ssid.is_empty() => "Wi-Fi".into(),
@@ -918,6 +960,7 @@ impl App {
         let r = match hit {
             Hit::Volume => b.vol,
             Hit::Network => b.net,
+            Hit::Privacy => b.privacy,
             _ => return,
         };
         if let Some(text) = self.status_tip(hit) {
@@ -933,7 +976,7 @@ impl App {
             unsafe {
                 let _ = InvalidateRect(self.bars[i].hwnd, None, false);
             }
-            if matches!(self.bars[i].hover, Hit::Volume | Hit::Network) && TIP.with(|t| unsafe { IsWindowVisible(t.borrow().0).as_bool() }) {
+            if matches!(self.bars[i].hover, Hit::Volume | Hit::Network | Hit::Privacy) && TIP.with(|t| unsafe { IsWindowVisible(t.borrow().0).as_bool() }) {
                 self.show_status_tip(i, self.bars[i].hover);
             }
         }
@@ -956,7 +999,7 @@ impl App {
 
     pub fn bar_show_tip(&mut self, hwnd: HWND) {
         let Some(i) = self.bar_index(hwnd) else { return };
-        if matches!(self.bars[i].hover, Hit::Volume | Hit::Network) {
+        if matches!(self.bars[i].hover, Hit::Volume | Hit::Network | Hit::Privacy) {
             self.show_status_tip(i, self.bars[i].hover);
             return;
         }
@@ -1081,7 +1124,7 @@ impl App {
                 unsafe {
                     SetTimer(hwnd, TIP_TIMER, 450, None);
                 }
-            } else if matches!(hit, Hit::Volume | Hit::Network) {
+            } else if matches!(hit, Hit::Volume | Hit::Network | Hit::Privacy) {
                 unsafe {
                     SetTimer(hwnd, TIP_TIMER, 450, None);
                 }
@@ -1135,6 +1178,11 @@ impl App {
                 crate::taskbar::peek();
                 return Some(vec![VK_LWIN, VIRTUAL_KEY('B' as u16)]);
             }
+            Hit::Privacy if !middle => unsafe {
+                hide_tip();
+                let page = if self.status.mic.is_empty() { w!("ms-settings:privacy-webcam") } else { w!("ms-settings:privacy-microphone") };
+                ShellExecuteW(None, w!("open"), page, None, None, SW_SHOWNORMAL);
+            },
             Hit::Volume if middle => {
                 self.status.toggle_mute();
                 self.bars_status_changed();

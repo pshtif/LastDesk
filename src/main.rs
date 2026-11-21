@@ -114,6 +114,9 @@ struct App {
     launched: Vec<(isize, usize, std::time::Instant)>,
     /// Preferred order of apps on the bar (exe names), from dragging buttons.
     bar_rank: Vec<String>,
+    /// Windows asking for attention (FlashWindow), until they are activated.
+    flashing: HashSet<isize>,
+    shell_hook: u32,
     status: status::Status,
     bars: Vec<bar::Bar>,
     /// LastDesk is keeping the Windows taskbar hidden (its bar sits in the taskbar's strip).
@@ -255,6 +258,7 @@ impl App {
         }
         self.methods.retain(|k, _| unsafe { IsWindow(key_hwnd(*k)).as_bool() });
         self.seen.retain(|k| unsafe { IsWindow(key_hwnd(*k)).as_bool() });
+        self.flashing.retain(|k| unsafe { IsWindow(key_hwnd(*k)).as_bool() });
         self.exe_cache.borrow_mut().retain(|k, _| unsafe { IsWindow(key_hwnd(*k)).as_bool() });
     }
 
@@ -720,6 +724,9 @@ impl App {
 
     /// Activation of a hidden window (taskbar click, app raising itself): go to its workspace.
     fn on_foreground(&mut self, h: HWND) {
+        if self.flashing.remove(&hwnd_key(h)) {
+            self.schedule_bar_refresh();
+        }
         self.taskbar_enforce();
         self.focus_mouse_mon = win::monitor_name_at_cursor();
         let k = hwnd_key(h);
@@ -1206,6 +1213,14 @@ unsafe extern "system" fn main_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
                 if wp.0 == status::STATUS_NET && !app.status.refresh_net() {
                     return;
                 }
+                if wp.0 == status::STATUS_PRIVACY {
+                    if app.status.refresh_privacy() {
+                        trace(&format!("privacy mic={:?} cam={:?}", app.status.mic, app.status.cam));
+                        app.bars_refresh(); // icons appear/disappear: re-layout
+                        app.bars_status_changed();
+                    }
+                    return;
+                }
                 app.bars_status_changed();
             });
             LRESULT(0)
@@ -1239,6 +1254,20 @@ unsafe extern "system" fn main_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
             LRESULT(0)
         }
         _ => {
+            let sh = with_app(|a| a.shell_hook).unwrap_or(0);
+            if sh != 0 && msg == sh {
+                // HSHELL_FLASH: a window asks for attention (chat message, finished task…).
+                const HSHELL_FLASH: usize = 0x8006;
+                if wp.0 == HSHELL_FLASH && lp.0 != 0 && GetForegroundWindow().0 as isize != lp.0 {
+                    trace(&format!("flash {:#x}", lp.0));
+                    with_app(|app| {
+                        if app.flashing.insert(lp.0) {
+                            app.schedule_bar_refresh();
+                        }
+                    });
+                }
+                return LRESULT(0);
+            }
             let tc = with_app(|a| a.taskbar_created).unwrap_or(0);
             if tc != 0 && msg == tc {
                 with_app(|app| {
@@ -1478,6 +1507,8 @@ fn main() {
             launch: None,
             launched: Vec::new(),
             bar_rank: bar::load_rank(),
+            flashing: HashSet::new(),
+            shell_hook: RegisterWindowMessageW(w!("SHELLHOOK")),
             status: status::Status::new(main),
             bars: Vec::new(),
             taskbar_hidden: false,
@@ -1498,6 +1529,7 @@ fn main() {
             problems.push(format!("These shortcuts are used by another app and won't work:\n{}", failed.join(", ")));
         }
         APP.with(|a| *a.borrow_mut() = Some(app));
+        let _ = RegisterShellHookWindow(main);
         if !problems.is_empty() {
             message(&problems.join("\n"), true);
         }
