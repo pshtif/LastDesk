@@ -1,3 +1,4 @@
+// Created by Peter @sHTiF Stefcek
 //! Hiding windows without minimizing them.
 //!
 //! Uses the shell's (undocumented but long-stable) IApplicationView::SetCloak, the same

@@ -1,3 +1,4 @@
+// Created by Peter @sHTiF Stefcek
 //! Hiding the Windows taskbar while the LastDesk bar is on.
 //!
 //! The Explorer taskbar windows are hidden (ShowWindow) but keep their reserved strip of the

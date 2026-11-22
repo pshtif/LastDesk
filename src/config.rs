@@ -1,3 +1,4 @@
+// Created by Peter @sHTiF Stefcek
 //! `%APPDATA%\LastDesk\config.ini`: workspace count, shortcuts, bar options, pinned apps and
 //! app rules. A commented file is written on first start; the Settings window rewrites it
 //! with `render`. Tray > "Reload config" applies hand edits.
@@ -345,6 +346,9 @@ pub fn render(c: &Config) -> String {
     s.push_str(&format!("move = {}\n", c.move_text));
     s.push_str(&format!("pin = {}\n", c.pin.text));
     s.push_str(&format!("overview = {}\n", c.overview.text));
+    s.push_str("# Next / previous workspace on the monitor you're on.\n");
+    s.push_str(&format!("next = {}\n", c.next.text));
+    s.push_str(&format!("prev = {}\n", c.prev.text));
     s.push_str("# Tip: Windows' own Win+Shift+Left/Right moves a window to the other monitor and works with LastDesk.\n\n");
     s.push_str("[bar]\n");
     s.push_str("# LastDesk's own taskbar on every monitor.\n");

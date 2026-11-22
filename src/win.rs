@@ -1,3 +1,4 @@
+// Created by Peter @sHTiF Stefcek
 //! Window and monitor queries.
 
 use windows::Win32::Foundation::{BOOL, HWND, LPARAM, POINT, RECT, TRUE};

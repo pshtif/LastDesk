@@ -1,3 +1,4 @@
+// Created by Peter @sHTiF Stefcek
 //! LastDesk: per-monitor workspaces for Windows.
 //!
 //! Alt+1..4        switch the workspace of the monitor you're on

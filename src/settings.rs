@@ -1,3 +1,4 @@
+// Created by Peter @sHTiF Stefcek
 //! Settings window: dark, applies every change immediately (like Windows Settings).
 //!
 //! Toggles, segmented pickers and buttons are drawn by LastDesk ("LastDeskCtl" class) so

@@ -1,3 +1,4 @@
+// Created by Peter @sHTiF Stefcek
 //! Remembering which window is on which workspace across LastDesk restarts and reboots.
 //!
 //! `layout.txt` (tab-separated, one record per line):

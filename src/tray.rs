@@ -1,3 +1,4 @@
+// Created by Peter @sHTiF Stefcek
 //! System tray host: apps' notification-area icons shown in the LastDesk bar.
 //!
 //! Shell_NotifyIcon finds the tray with FindWindow("Shell_TrayWnd") and sends it WM_COPYDATA.

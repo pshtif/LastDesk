@@ -1,3 +1,4 @@
+// Created by Peter @sHTiF Stefcek
 //! Overview: a full-screen panel on every monitor showing its workspaces as columns with
 //! live window thumbnails. Click a window to jump to it, click a workspace header to switch,
 //! drag a window onto another column (any monitor) to move it, type to filter, Esc to close.

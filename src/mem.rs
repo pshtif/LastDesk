@@ -1,3 +1,4 @@
+// Created by Peter @sHTiF Stefcek
 //! Memory meter for the bar (optional, Settings > Bar): how much RAM is in use, and on hover
 //! which apps use the most.
 

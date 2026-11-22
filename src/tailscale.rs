@@ -1,3 +1,4 @@
+// Created by Peter @sHTiF Stefcek
 //! Tailscale on the bar, replacing its tray app. Talks to the Tailscale service (tailscaled)
 //! over its local API pipe, like the tray app does: one long-lived "watch" connection that
 //! tells us when something changes (and, like the tray app's, keeps the service connected

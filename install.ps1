@@ -1,3 +1,4 @@
+# Created by Peter @sHTiF Stefcek
 # Build LastDesk and install it to %USERPROFILE%\tools\LastDesk, replacing a running copy.
 # The running copy is closed gracefully: it saves the workspace layout and shows all windows,
 # and the new copy puts every window back on its workspace when it starts.

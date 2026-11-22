@@ -1,3 +1,4 @@
+// Created by Peter @sHTiF Stefcek
 //! Network drives that follow you: each drive letter has a path for home and one for
 //! everywhere else, e.g. a NAS by its local address at home and through Tailscale or a VPN
 //! when away. LastDesk switches the mapping when you change networks.

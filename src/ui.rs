@@ -1,3 +1,4 @@
+// Created by Peter @sHTiF Stefcek
 //! Drawing: the tray icon (current workspace numbers) and the on-screen indicator.
 
 use windows::core::PCWSTR;

@@ -1,3 +1,4 @@
+// Created by Peter @sHTiF Stefcek
 //! ASUS laptops: fan speed, read through the ASUS ACPI device (\\.\ATKACPI, the interface
 //! MyASUS uses; needs no admin rights). On other laptops the device doesn't exist and
 //! nothing shows up.

@@ -1,3 +1,4 @@
+// Created by Peter @sHTiF Stefcek
 //! Pinned app buttons ("launchers"): what to store when a window is pinned, matching running
 //! windows to a launcher, the launcher's icon, and starting it.
 //!

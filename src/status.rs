@@ -1,3 +1,4 @@
+// Created by Peter @sHTiF Stefcek
 //! Volume and network state for the bar's status area (next to the battery).
 //!
 //! Volume changes arrive through a Core Audio callback and network changes through

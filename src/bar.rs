@@ -1,3 +1,4 @@
+// Created by Peter @sHTiF Stefcek
 //! LastDesk bar: a thin taskbar on top of every monitor.
 //!
 //!   [Start] [1][2][3][4] | window buttons of THIS monitor + workspace ...   net vol battery  clock

@@ -1,3 +1,4 @@
+// Created by Peter @sHTiF Stefcek
 //! Workspace switch slide. A temporary panel covers the monitor's work area, shows the
 //! wallpaper, and slides DWM live thumbnails of the old workspace's windows out and the new
 //! ones in. The real swap happens underneath; the panel is removed when the slide ends.

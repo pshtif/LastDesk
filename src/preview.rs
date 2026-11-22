@@ -1,3 +1,4 @@
+// Created by Peter @sHTiF Stefcek
 //! Hover previews for bar window buttons: a small popup with the window's title and a live
 //! DWM thumbnail. It never takes focus or mouse input; the bar drives showing and hiding.
 
