@@ -148,6 +148,8 @@ V: = \\192.168.1.10\Media | \\my-nas\Media | NAS Media
 - **Crash safety:** hidden windows are recorded in `%LOCALAPPDATA%\LastDesk\hidden.txt` and
   restored on exit, on panic, on display changes and on the next start. A crash never leaves
   windows invisible, and a hidden Windows taskbar is shown again.
+- **Watchdog:** a tiny guard process restarts LastDesk if it ever disappears without you
+  choosing Exit. It stops after 3 restarts within 2 minutes, so a crash can't loop.
 - **Remembered layout:** each window's workspace is kept in `%LOCALAPPDATA%\LastDesk\layout.txt`
   and restored after restarts and reboots. Tray > "Show all windows (reset)" clears it.
 - **Window previews:** live DWM thumbnails. Nothing is captured or stored.

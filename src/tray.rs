@@ -244,6 +244,12 @@ unsafe extern "system" fn tray_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
             }
             forward(msg, wp, lp)
         }
+        // Someone else asking our tray window to close (Explorer may, when it starts up and
+        // finds a Shell_TrayWnd): refuse. LastDesk removes it itself with DestroyWindow.
+        WM_CLOSE => {
+            crate::trace("tray window: refused a WM_CLOSE from outside");
+            LRESULT(0)
+        }
         // Commands and private shell messages meant for the taskbar go to Explorer.
         WM_COMMAND => forward(msg, wp, lp),
         m if (WM_USER..0xC000).contains(&m) => forward(msg, wp, lp),

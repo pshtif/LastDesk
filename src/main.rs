@@ -19,6 +19,7 @@ mod asus;
 mod bar;
 mod cloak;
 mod config;
+mod guard;
 mod launcher;
 mod layout;
 mod mem;
@@ -1345,7 +1346,15 @@ unsafe extern "system" fn main_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
             LRESULT(0)
         }
         WM_QUERYENDSESSION => LRESULT(1),
+        WM_CLOSE => {
+            trace("main window: WM_CLOSE");
+            DefWindowProcW(hwnd, msg, wp, lp)
+        }
         WM_ENDSESSION => {
+            trace(&format!("main window: WM_ENDSESSION wp={} lp={:#x}", wp.0, lp.0));
+            if wp.0 != 0 {
+                guard::mark_clean_exit(); // signing out / shutting down: don't restart
+            }
             // Logging off / shutting down: keep the layout for next time.
             with_app(|app| {
                 app.taskbar_restore();
@@ -1355,6 +1364,8 @@ unsafe extern "system" fn main_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
             LRESULT(0)
         }
         WM_DESTROY => {
+            trace("main window: WM_DESTROY");
+            guard::mark_clean_exit();
             tray::destroy();
             with_app(|app| {
                 app.taskbar_restore();
@@ -1471,7 +1482,12 @@ unsafe extern "system" fn location_event(_: HWINEVENTHOOK, _: u32, hwnd: HWND, i
 
 static MAIN_HWND: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(0);
 
-fn trace(s: &str) {
+#[allow(non_snake_case)]
+fn MAIN_HWND_get() -> HWND {
+    HWND(MAIN_HWND.load(std::sync::atomic::Ordering::Relaxed) as *mut _)
+}
+
+pub(crate) fn trace(s: &str) {
     if std::env::var_os("LASTDESK_TRACE").is_some() {
         use std::io::Write;
         if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(std::env::temp_dir().join("lastdesk-trace.txt")) {
@@ -1499,6 +1515,14 @@ fn enable_dark_menus() {
 }
 
 fn main() {
+    // Watchdog mode (started by LastDesk itself): wait for that process, restart it if needed.
+    let args: Vec<String> = std::env::args().collect();
+    if let Some(i) = args.iter().position(|a| a == "--guard") {
+        if let Some(pid) = args.get(i + 1).and_then(|p| p.parse().ok()) {
+            guard::run(pid);
+        }
+        return;
+    }
     enable_dark_menus();
     unsafe {
         let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
@@ -1650,6 +1674,7 @@ fn main() {
         let _ = RegisterShellHookWindow(main);
         netdrives::schedule_check();
         with_app(|app| app.integrations_apply());
+        guard::spawn(); // restarts LastDesk if it ever disappears unexpectedly
         if !problems.is_empty() {
             message(&problems.join("\n"), true);
         }
@@ -1665,13 +1690,24 @@ fn main() {
         let _hook_loc = SetWinEventHook(EVENT_OBJECT_LOCATIONCHANGE, EVENT_OBJECT_LOCATIONCHANGE, None, Some(location_event), 0, 0, WINEVENT_OUTOFCONTEXT);
 
         trace("loop"); let mut msg = MSG::default();
-        while GetMessageW(&mut msg, None, 0, 0).as_bool() {
-            if settings::is_dialog_message(&msg) {
+        loop {
+            while GetMessageW(&mut msg, None, 0, 0).as_bool() {
+                if settings::is_dialog_message(&msg) {
+                    continue;
+                }
+                let _ = TranslateMessage(&msg);
+                DispatchMessageW(&msg);
+            }
+            // We quit only through WM_DESTROY (Exit, installer). A WM_QUIT posted by something
+            // else (e.g. the shell around an Explorer restart) while the main window is still
+            // there must not end LastDesk.
+            if IsWindow(MAIN_HWND_get()).as_bool() {
+                trace(&format!("ignored a WM_QUIT from outside (wp={})", msg.wParam.0));
                 continue;
             }
-            let _ = TranslateMessage(&msg);
-            DispatchMessageW(&msg);
+            break;
         }
+        trace("message loop ended");
         // Windows were restored and the state file removed in WM_DESTROY. Skip the normal
         // runtime teardown: releasing the shell COM object during process exit can hang.
         let _ = windows::Win32::System::Threading::TerminateProcess(windows::Win32::System::Threading::GetCurrentProcess(), 0);
