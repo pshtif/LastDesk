@@ -30,6 +30,7 @@ mod settings;
 mod status;
 mod taskbar;
 mod tray;
+mod tweaks;
 mod ui;
 mod tailscale;
 mod win;
@@ -1517,6 +1518,11 @@ fn enable_dark_menus() {
 fn main() {
     // Watchdog mode (started by LastDesk itself): wait for that process, restart it if needed.
     let args: Vec<String> = std::env::args().collect();
+    // Elevated helper for Settings > Windows tweaks: apply one change and exit.
+    if let Some(i) = args.iter().position(|a| a == "--tweak") {
+        tweaks::run_elevated(&args[i + 1..]);
+        return;
+    }
     if let Some(i) = args.iter().position(|a| a == "--guard") {
         if let Some(pid) = args.get(i + 1).and_then(|p| p.parse().ok()) {
             guard::run(pid);

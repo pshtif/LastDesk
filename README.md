@@ -48,6 +48,12 @@ own workspaces, and replaces the Windows taskbar with its own bar on every monit
 - Network drives that switch between a home path and an away path, e.g. a NAS by local
   address at home and through Tailscale or a VPN elsewhere. See below.
 
+**Windows tweaks** (Settings; each shows and changes Windows' own setting; most ask for admin)
+- Turn off Start search (~100 MB; typing in Start finds nothing).
+- Turn off Start search's web view (~130 MB, after a restart).
+- No Bing web results in Start search.
+- Don't preload File Explorer in the background.
+
 ## Keys
 
 | Keys | Action |

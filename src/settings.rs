@@ -48,6 +48,8 @@ const ID_ANIM: i32 = 117;
 const ID_TAILSCALE: i32 = 118;
 const ID_WINKEY: i32 = 119;
 const ID_MEMORY: i32 = 120;
+/// Windows tweaks: ID_TWEAK + index into tweaks::ALL.
+const ID_TWEAK: i32 = 130;
 
 const EN_KILLFOCUS: u32 = 0x0200;
 const WM_MOUSELEAVE: u32 = 0x02A3;
@@ -92,6 +94,24 @@ struct State {
 thread_local! {
     static SETTINGS: RefCell<Option<State>> = const { RefCell::new(None) };
     static CTLS: RefCell<HashMap<isize, Ctl>> = RefCell::new(HashMap::new());
+    /// (content height, current scroll position) when the window is taller than the screen.
+    static SCROLL: std::cell::Cell<(i32, i32)> = const { std::cell::Cell::new((0, 0)) };
+}
+
+/// Scroll the settings window's contents to `pos` (clamped), moving the controls.
+unsafe fn scroll_to(hwnd: HWND, pos: i32) {
+    let (content, cur) = SCROLL.with(|s| s.get());
+    let mut cr = RECT::default();
+    let _ = GetClientRect(hwnd, &mut cr);
+    let page = cr.bottom - cr.top;
+    let new = pos.clamp(0, (content - page).max(0));
+    if new == cur {
+        return;
+    }
+    SCROLL.with(|s| s.set((content, new)));
+    let _ = ScrollWindowEx(hwnd, 0, cur - new, None, None, None, None, SW_SCROLLCHILDREN | SW_INVALIDATE | SW_ERASE);
+    let si = SCROLLINFO { cbSize: std::mem::size_of::<SCROLLINFO>() as u32, fMask: SIF_POS, nPos: new, ..Default::default() };
+    windows::Win32::UI::Controls::SetScrollInfo(hwnd, SB_VERT, &si, true);
 }
 
 fn wide(s: &str) -> Vec<u16> {
@@ -127,6 +147,20 @@ fn text_of(id: i32) -> String {
 fn toggle_on(id: i32) -> bool {
     let k = item(id).0 as isize;
     CTLS.with(|c| matches!(c.borrow().get(&k), Some(Ctl { kind: Kind::Toggle { on: true, .. }, .. })))
+}
+
+/// Set a toggle's state from code (and repaint it).
+fn set_toggle(id: i32, value: bool) {
+    let h = item(id);
+    let k = h.0 as isize;
+    CTLS.with(|c| {
+        if let Some(Ctl { kind: Kind::Toggle { on, .. }, .. }) = c.borrow_mut().get_mut(&k) {
+            *on = value;
+        }
+    });
+    unsafe {
+        let _ = InvalidateRect(h, None, false);
+    }
 }
 
 fn seg_value(id: i32) -> String {
@@ -548,6 +582,17 @@ pub fn open() {
         }
         y += 12;
 
+        // Windows tweaks: show and change the system's own settings (not stored in config).
+        header("Windows tweaks", y);
+        y += 26;
+        native(w!("STATIC"), "Applied to Windows right away. Most ask for admin permission.", 0, 28, y, 504, 20, -1, font);
+        y += 26;
+        for (i, t) in crate::tweaks::ALL.iter().enumerate() {
+            toggle(ID_TWEAK + i as i32, t.label(), t.is_on(), y);
+            y += 36;
+        }
+        y += 12;
+
         header("Pinned apps", y);
         y += 26;
         native(w!("STATIC"), "Shown on every workspace. One exe name per line, e.g. spotify", 0, 28, y, 504, 20, -1, font);
@@ -568,14 +613,28 @@ pub fn open() {
         custom(Kind::Button { label: "Close".into(), accent: true }, 432, y, 100, 34, ID_CLOSE);
         y += 34 + 20;
 
-        // Fit the window to the content, centred on the monitor.
-        let mut r = RECT { left: 0, top: 0, right: s(560), bottom: s(y) };
+        // Fit the window to the content, centred on the monitor. Taller than the screen: the
+        // window gets a scroll bar (and the mouse wheel scrolls it).
+        let content = s(y);
+        let mut r = RECT { left: 0, top: 0, right: s(560), bottom: content };
         let _ = AdjustWindowRectEx(&mut r, style, false, WS_EX_CONTROLPARENT);
-        let (ww, wh) = (r.right - r.left, r.bottom - r.top);
+        let (mut ww, wh) = (r.right - r.left, r.bottom - r.top);
         let wa = mi.rcWork;
+        let fits = wh <= wa.bottom - wa.top;
+        if !fits {
+            let _ = SetWindowLongPtrW(hwnd, GWL_STYLE, (style | WS_VSCROLL).0 as isize);
+            ww += windows::Win32::UI::HiDpi::GetSystemMetricsForDpi(SM_CXVSCROLL, (96.0 * sc) as u32);
+        }
         let x = wa.left + ((wa.right - wa.left) - ww) / 2;
         let yy = (wa.top + ((wa.bottom - wa.top) - wh) / 2).max(wa.top);
-        let _ = SetWindowPos(hwnd, None, x, yy, ww, wh.min(wa.bottom - wa.top), SWP_NOZORDER);
+        let _ = SetWindowPos(hwnd, None, x, yy, ww, wh.min(wa.bottom - wa.top), SWP_NOZORDER | SWP_FRAMECHANGED);
+        SCROLL.with(|sc| sc.set((content, 0)));
+        if !fits {
+            let mut cr = RECT::default();
+            let _ = GetClientRect(hwnd, &mut cr);
+            let si = SCROLLINFO { cbSize: std::mem::size_of::<SCROLLINFO>() as u32, fMask: SIF_RANGE | SIF_PAGE | SIF_POS, nMin: 0, nMax: content - 1, nPage: (cr.bottom - cr.top) as u32, nPos: 0, nTrackPos: 0 };
+            windows::Win32::UI::Controls::SetScrollInfo(hwnd, SB_VERT, &si, true);
+        }
         let _ = ShowWindow(hwnd, SW_SHOW);
         let _ = SetForegroundWindow(hwnd);
     }
@@ -602,7 +661,53 @@ pub unsafe extern "system" fn settings_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp
                 }
                 ID_WORKSPACES | ID_ANIM | ID_SWITCH | ID_MOVE | ID_BAR | ID_EDGE | ID_BUTTONS | ID_ALIGN | ID_HIDE_TASKBAR | ID_TRAY | ID_MEMORY | ID_TAILSCALE | ID_WINKEY => apply(),
                 ID_PIN | ID_OVERVIEW | ID_NEXT | ID_PREV | ID_PINNED | ID_RULES if code == EN_KILLFOCUS => apply(),
+                i if (ID_TWEAK..ID_TWEAK + crate::tweaks::ALL.len() as i32).contains(&i) => {
+                    let t = crate::tweaks::ALL[(i - ID_TWEAK) as usize];
+                    let want = toggle_on(i);
+                    if !crate::tweaks::set(t, want, hwnd) {
+                        // Prompt cancelled or not allowed: show the real state again.
+                        set_toggle(i, t.is_on());
+                    } else if !t.needs_admin() {
+                        set_toggle(i, t.is_on());
+                    }
+                }
                 _ => {}
+            }
+            LRESULT(0)
+        }
+        WM_MOUSEWHEEL => {
+            let delta = ((wp.0 >> 16) & 0xFFFF) as i16 as i32;
+            let (_, cur) = SCROLL.with(|s| s.get());
+            scroll_to(hwnd, cur - delta * 60 / 120 * windows::Win32::UI::HiDpi::GetDpiForWindow(hwnd) as i32 / 96);
+            LRESULT(0)
+        }
+        WM_VSCROLL => {
+            let (_, cur) = SCROLL.with(|s| s.get());
+            let mut cr = RECT::default();
+            let _ = GetClientRect(hwnd, &mut cr);
+            let page = cr.bottom - cr.top;
+            let line = 40 * windows::Win32::UI::HiDpi::GetDpiForWindow(hwnd) as i32 / 96;
+            let target = match (wp.0 & 0xFFFF) as i32 {
+                x if x == SB_LINEUP.0 => cur - line,
+                x if x == SB_LINEDOWN.0 => cur + line,
+                x if x == SB_PAGEUP.0 => cur - page,
+                x if x == SB_PAGEDOWN.0 => cur + page,
+                x if x == SB_THUMBTRACK.0 || x == SB_THUMBPOSITION.0 => {
+                    let mut si = SCROLLINFO { cbSize: std::mem::size_of::<SCROLLINFO>() as u32, fMask: SIF_TRACKPOS, ..Default::default() };
+                    let _ = GetScrollInfo(hwnd, SB_VERT, &mut si);
+                    si.nTrackPos
+                }
+                x if x == SB_TOP.0 => 0,
+                x if x == SB_BOTTOM.0 => i32::MAX,
+                _ => cur,
+            };
+            scroll_to(hwnd, target);
+            LRESULT(0)
+        }
+        // An elevated tweak finished: re-read every tweak's real state.
+        crate::tweaks::WM_TWEAK_DONE => {
+            for (i, t) in crate::tweaks::ALL.iter().enumerate() {
+                set_toggle(ID_TWEAK + i as i32, t.is_on());
             }
             LRESULT(0)
         }
