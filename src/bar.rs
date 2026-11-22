@@ -1174,7 +1174,8 @@ impl App {
                 use crate::tailscale::State;
                 let st = crate::tailscale::status().unwrap_or_default();
                 let lit = match st.state {
-                    State::Running if st.exit_node().is_some() => Some(ui::ACCENT),
+                    State::Running if !st.warnings().is_empty() => Some(ATTENTION),
+                    State::Running if st.exit.is_some() => Some(ui::ACCENT),
                     State::Running => Some(ui::TEXT),
                     State::NeedsLogin => Some(ATTENTION),
                     State::Starting => Some(ui::MUTED),
@@ -1332,10 +1333,16 @@ impl App {
                         if !st.ip.is_empty() {
                             parts.push(st.ip.clone());
                         }
-                        if let Some(e) = st.exit_node() {
-                            parts.push(format!("exit node {}", e.name));
+                        if let Some(e) = st.exit_label() {
+                            parts.push(format!("via {e}"));
                         }
-                        parts.join("  ·  ")
+                        let mut text = parts.join("  ·  ");
+                        // Problems on their own lines.
+                        for w in st.warnings() {
+                            text.push_str("\n⚠ ");
+                            text.push_str(&w);
+                        }
+                        text
                     }
                     State::Starting => "Tailscale: connecting…".into(),
                     State::NeedsLogin => "Tailscale: needs login (click)".into(),
@@ -1917,6 +1924,15 @@ fn wide_z(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
 }
 
+/// What an exit node menu item does.
+enum ExitPick {
+    None,
+    Suggested,
+    Node(String),
+    Best(String, Option<String>),
+    LanAccess(bool),
+}
+
 /// Tailscale's menu (left or right click on its icon): connect/disconnect, exit node, IP.
 fn tailscale_menu() {
     use crate::tailscale::State;
@@ -1924,15 +1940,26 @@ fn tailscale_menu() {
     const CMD_COPY_IP: usize = 2;
     const CMD_APP: usize = 3;
     const CMD_ADMIN: usize = 4;
-    const CMD_EXIT_NONE: usize = 10;
-    const CMD_EXIT: usize = 100; // 100 + index into exit_nodes
+    const CMD_UNATTENDED: usize = 5;
+    const CMD_PICK: usize = 1000; // 1000 + index into picks
     let st = crate::tailscale::status().unwrap_or_default();
+    // Refresh the exit node list in the background for next time (online states change).
+    std::thread::spawn(crate::tailscale::load_exit_nodes);
+    let nodes = crate::tailscale::exit_nodes();
+    let active = st.exit.as_ref().map(|(id, _)| id.clone());
+    let active_node = active.as_ref().and_then(|id| nodes.iter().find(|n| &n.id == id).cloned());
+    let mut picks: Vec<ExitPick> = Vec::new();
     unsafe {
         let Ok(menu) = CreatePopupMenu() else { return };
         let add = |m: HMENU, flags: MENU_ITEM_FLAGS, id: usize, text: &str| {
             let t = wide_z(&text.replace('&', "&&"));
             let _ = AppendMenuW(m, flags, id, windows::core::PCWSTR(t.as_ptr()));
         };
+        let add_sub = |m: HMENU, sub: HMENU, flags: MENU_ITEM_FLAGS, text: &str| {
+            let t = wide_z(&text.replace('&', "&&"));
+            let _ = AppendMenuW(m, MF_POPUP | flags, sub.0 as usize, windows::core::PCWSTR(t.as_ptr()));
+        };
+        let check = |on: bool| if on { MF_CHECKED } else { MF_UNCHECKED };
         let head = match st.state {
             State::Running if !st.tailnet.is_empty() => format!("Connected to {}", st.tailnet),
             State::Running => "Connected".into(),
@@ -1942,6 +1969,13 @@ fn tailscale_menu() {
             State::Unavailable => "Tailscale service isn't running".into(),
         };
         add(menu, MF_STRING | MF_GRAYED, 0, &head);
+        if let Some(l) = st.exit_label() {
+            add(menu, MF_STRING | MF_GRAYED, 0, &format!("Exit node: {l}"));
+        }
+        for w in st.warnings() {
+            let w: String = if w.chars().count() > 90 { w.chars().take(87).collect::<String>() + "…" } else { w };
+            add(menu, MF_STRING | MF_GRAYED, 0, &format!("⚠ {w}"));
+        }
         let _ = AppendMenuW(menu, MF_SEPARATOR, 0, windows::core::PCWSTR::null());
         match st.state {
             State::Running | State::Starting => add(menu, MF_STRING, CMD_TOGGLE, "Disconnect"),
@@ -1953,26 +1987,61 @@ fn tailscale_menu() {
             if !st.ip.is_empty() {
                 add(menu, MF_STRING, CMD_COPY_IP, &format!("Copy this device's IP ({})", st.ip));
             }
-            if !st.exit_nodes.is_empty() {
+            if !nodes.is_empty() || active.is_some() {
                 if let Ok(sub) = CreatePopupMenu() {
-                    let none = st.exit_node().is_none();
-                    add(sub, MF_STRING | if none { MF_CHECKED } else { MF_UNCHECKED }, CMD_EXIT_NONE, "None");
-                    let _ = AppendMenuW(sub, MF_SEPARATOR, 0, windows::core::PCWSTR::null());
-                    for (n, e) in st.exit_nodes.iter().enumerate() {
-                        let mut flags = MF_STRING;
-                        if e.active {
-                            flags |= MF_CHECKED;
+                    let mut pick = |p: ExitPick| {
+                        picks.push(p);
+                        CMD_PICK + picks.len() - 1
+                    };
+                    add(sub, MF_STRING | check(active.is_none()), pick(ExitPick::None), "None");
+                    add(sub, MF_STRING, pick(ExitPick::Suggested), "Fastest (Tailscale's suggestion)");
+                    // Your own exit nodes, by name.
+                    let own: Vec<&crate::tailscale::ExitNode> = nodes.iter().filter(|n| !n.is_located()).collect();
+                    if !own.is_empty() {
+                        let _ = AppendMenuW(sub, MF_SEPARATOR, 0, windows::core::PCWSTR::null());
+                        for n in own {
+                            let on = active.as_deref() == Some(n.id.as_str());
+                            let label = if n.online { n.name.clone() } else { format!("{} (offline)", n.name) };
+                            let flags = MF_STRING | check(on) | if n.online || on { MF_ENABLED } else { MF_GRAYED };
+                            add(sub, flags, pick(ExitPick::Node(n.id.clone())), &label);
                         }
-                        if !e.online && !e.active {
-                            flags |= MF_GRAYED;
-                        }
-                        let label = if e.online { e.name.clone() } else { format!("{} (offline)", e.name) };
-                        add(sub, flags, CMD_EXIT + n, &label);
                     }
-                    let t = wide_z("Exit node");
-                    let _ = AppendMenuW(menu, MF_POPUP, sub.0 as usize, windows::core::PCWSTR(t.as_ptr()));
+                    // Located ones (Mullvad): Country → City; picking one uses its best server.
+                    let mut countries: Vec<&str> = nodes.iter().filter(|n| n.is_located()).map(|n| n.country.as_str()).collect();
+                    countries.dedup();
+                    if !countries.is_empty() {
+                        let _ = AppendMenuW(sub, MF_SEPARATOR, 0, windows::core::PCWSTR::null());
+                    }
+                    for country in countries {
+                        let in_country: Vec<&crate::tailscale::ExitNode> = nodes.iter().filter(|n| n.country == country).collect();
+                        let any_online = in_country.iter().any(|n| n.online);
+                        let here = active_node.as_ref().is_some_and(|a| a.country == country);
+                        let mut cities: Vec<&str> = in_country.iter().map(|n| n.city.as_str()).collect();
+                        cities.dedup();
+                        let dim = if any_online { MF_ENABLED } else { MF_GRAYED };
+                        if cities.len() <= 1 {
+                            add(sub, MF_STRING | check(here) | dim, pick(ExitPick::Best(country.to_string(), None)), country);
+                            continue;
+                        }
+                        let Ok(csub) = CreatePopupMenu() else { continue };
+                        add(csub, MF_STRING | dim, pick(ExitPick::Best(country.to_string(), None)), &format!("Any city in {country}"));
+                        let _ = AppendMenuW(csub, MF_SEPARATOR, 0, windows::core::PCWSTR::null());
+                        for city in cities {
+                            let online = in_country.iter().any(|n| n.city == city && n.online);
+                            let on = here && active_node.as_ref().is_some_and(|a| a.city == city);
+                            let flags = MF_STRING | check(on) | if online { MF_ENABLED } else { MF_GRAYED };
+                            add(csub, flags, pick(ExitPick::Best(country.to_string(), Some(city.to_string()))), city);
+                        }
+                        add_sub(sub, csub, check(here) | dim, country);
+                    }
+                    let _ = AppendMenuW(sub, MF_SEPARATOR, 0, windows::core::PCWSTR::null());
+                    add(sub, MF_STRING | check(st.lan_access), pick(ExitPick::LanAccess(!st.lan_access)), "Allow local network access");
+                    add_sub(menu, sub, check(active.is_some()), "Exit node");
                 }
             }
+        }
+        if st.state != State::Unavailable {
+            add(menu, MF_STRING | check(st.unattended), CMD_UNATTENDED, "Stay connected without LastDesk (unattended)");
         }
         let _ = AppendMenuW(menu, MF_SEPARATOR, 0, windows::core::PCWSTR::null());
         add(menu, MF_STRING, CMD_APP, "Open Tailscale app");
@@ -1980,6 +2049,7 @@ fn tailscale_menu() {
         match run_menu(menu) {
             CMD_TOGGLE => crate::tailscale::set_running(st.state == State::Stopped),
             CMD_COPY_IP => crate::win::set_clipboard_text(&st.ip),
+            CMD_UNATTENDED => crate::tailscale::set_unattended(!st.unattended),
             CMD_APP => {
                 if let Some(p) = crate::tailscale::app_path() {
                     let t = wide_z(&p);
@@ -1989,8 +2059,16 @@ fn tailscale_menu() {
             CMD_ADMIN => {
                 ShellExecuteW(None, w!("open"), w!("https://login.tailscale.com/admin/machines"), None, None, SW_SHOWNORMAL);
             }
-            CMD_EXIT_NONE => crate::tailscale::set_exit_node(None),
-            c if c >= CMD_EXIT && c < CMD_EXIT + st.exit_nodes.len() => crate::tailscale::set_exit_node(Some(&st.exit_nodes[c - CMD_EXIT].id)),
+            c if c >= CMD_PICK && c < CMD_PICK + picks.len() => match &picks[c - CMD_PICK] {
+                ExitPick::None => crate::tailscale::set_exit_node(None),
+                ExitPick::Suggested => crate::tailscale::use_suggested(),
+                ExitPick::Node(id) => crate::tailscale::set_exit_node(Some(id)),
+                ExitPick::Best(country, city) => match crate::tailscale::best_node(country, city.as_deref()) {
+                    Some(id) => crate::tailscale::set_exit_node(Some(&id)),
+                    None => crate::message("No server there is online right now.", true),
+                },
+                ExitPick::LanAccess(on) => crate::tailscale::set_lan_access(*on),
+            },
             _ => {}
         }
     }

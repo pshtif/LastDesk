@@ -3,6 +3,10 @@
 //! tells us when something changes (and, like the tray app's, keeps the service connected
 //! for this user), plus short requests for status and for changing settings.
 //! Nothing shows up if Tailscale isn't installed.
+//!
+//! Exit nodes: with the Mullvad add-on there are hundreds, so the full list (which needs the
+//! big peer listing) is only loaded at start and when the menu opens; routine updates use
+//! the small status (state, health, which exit node is in use and whether it's online).
 
 use std::sync::Mutex;
 use std::time::Duration;
@@ -24,33 +28,90 @@ pub enum State {
     Running,
 }
 
-#[derive(Clone, Default, Debug)]
+/// An exit node. Mullvad ones have a country and city; your own don't.
+#[derive(Clone, Default, Debug, PartialEq)]
 pub struct ExitNode {
     pub id: String,
     pub name: String,
+    pub country: String,
+    pub city: String,
+    pub priority: i64,
     pub online: bool,
-    pub active: bool,
 }
 
-#[derive(Clone, Default, Debug)]
+impl ExitNode {
+    pub fn is_located(&self) -> bool {
+        !self.country.is_empty()
+    }
+
+    /// "Los Angeles, CA, USA" for Mullvad, the device name otherwise.
+    pub fn label(&self) -> String {
+        if self.is_located() {
+            if self.city.is_empty() { self.country.clone() } else { format!("{}, {}", self.city, self.country) }
+        } else {
+            self.name.clone()
+        }
+    }
+}
+
+#[derive(Clone, Default, Debug, PartialEq)]
 pub struct Status {
     pub state: State,
     pub tailnet: String,
     pub ip: String,
-    pub exit_nodes: Vec<ExitNode>,
+    /// Tailscale's own health warnings.
+    pub health: Vec<String>,
+    /// Exit node in use: (id, online).
+    pub exit: Option<(String, bool)>,
+    pub lan_access: bool,
+    /// "Run unattended": stays connected without any app (tray app or LastDesk) attached.
+    pub unattended: bool,
 }
 
 impl Status {
-    pub fn exit_node(&self) -> Option<&ExitNode> {
-        self.exit_nodes.iter().find(|e| e.active)
+    /// The exit node in use, if it's in the loaded list.
+    pub fn exit_node(&self) -> Option<ExitNode> {
+        let (id, _) = self.exit.as_ref()?;
+        exit_nodes().into_iter().find(|n| &n.id == id)
+    }
+
+    /// Display name of the exit node in use.
+    pub fn exit_label(&self) -> Option<String> {
+        self.exit.as_ref()?;
+        Some(self.exit_node().map(|n| n.label()).unwrap_or_else(|| "exit node".into()))
+    }
+
+    /// Problems worth showing: Tailscale's health warnings, and an offline exit node (which
+    /// blocks all internet traffic until it's back or another is picked).
+    pub fn warnings(&self) -> Vec<String> {
+        let mut w = Vec::new();
+        if self.state == State::Running {
+            if let Some((_, false)) = self.exit {
+                w.push(format!("Exit node {} is offline: internet is blocked", self.exit_label().unwrap_or_default()));
+            }
+            w.extend(self.health.iter().cloned());
+        }
+        w
     }
 }
 
 static STATUS: Mutex<Option<Status>> = Mutex::new(None);
+static NODES: Mutex<Vec<ExitNode>> = Mutex::new(Vec::new());
+static ALERT: Mutex<Option<String>> = Mutex::new(None);
 
 /// Latest known status (None until the first read).
 pub fn status() -> Option<Status> {
     STATUS.lock().ok()?.clone()
+}
+
+/// Exit nodes as last loaded (sorted: own first, then by country, city).
+pub fn exit_nodes() -> Vec<ExitNode> {
+    NODES.lock().map(|n| n.clone()).unwrap_or_default()
+}
+
+/// A one-off notice to show (exit node went offline), taken once.
+pub fn take_alert() -> Option<String> {
+    ALERT.lock().ok()?.take()
 }
 
 /// Is Tailscale installed? (Its service is registered; checked once.)
@@ -187,8 +248,13 @@ fn dechunk(mut s: &str) -> String {
     out
 }
 
-fn parse(body: &str) -> Option<Status> {
-    let v: serde_json::Value = serde_json::from_str(body).ok()?;
+fn get_json(path: &str) -> Option<serde_json::Value> {
+    serde_json::from_str(&request("GET", path, None)?).ok()
+}
+
+/// Small status (no peer list) + prefs.
+fn read_status() -> Status {
+    let Some(v) = get_json("/localapi/v0/status?peers=false") else { return Status::default() };
     let state = match v["BackendState"].as_str().unwrap_or("") {
         "Running" => State::Running,
         "Starting" => State::Starting,
@@ -198,7 +264,18 @@ fn parse(body: &str) -> Option<Status> {
     };
     let tailnet = v["CurrentTailnet"]["Name"].as_str().unwrap_or("").to_string();
     let ip = v["Self"]["TailscaleIPs"].as_array().and_then(|a| a.iter().filter_map(|x| x.as_str()).find(|x| x.contains('.'))).unwrap_or("").to_string();
-    let mut exit_nodes: Vec<ExitNode> = v["Peer"]
+    let health = v["Health"].as_array().map(|a| a.iter().filter_map(|x| x.as_str()).map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect()).unwrap_or_default();
+    let exit = v["ExitNodeStatus"]["ID"].as_str().filter(|s| !s.is_empty()).map(|id| (id.to_string(), v["ExitNodeStatus"]["Online"].as_bool().unwrap_or(false)));
+    let prefs = get_json("/localapi/v0/prefs");
+    let pref = |k: &str| prefs.as_ref().and_then(|p| p[k].as_bool()).unwrap_or(false);
+    let (lan_access, unattended) = (pref("ExitNodeAllowLANAccess"), pref("ForceDaemon"));
+    Status { state, tailnet, ip, health, exit, lan_access, unattended }
+}
+
+/// Load the full exit node list (big: includes every peer).
+pub fn load_exit_nodes() {
+    let Some(v) = get_json("/localapi/v0/status") else { return };
+    let mut nodes: Vec<ExitNode> = v["Peer"]
         .as_object()
         .map(|peers| {
             peers
@@ -206,48 +283,118 @@ fn parse(body: &str) -> Option<Status> {
                 .filter(|p| p["ExitNodeOption"].as_bool() == Some(true))
                 .map(|p| {
                     let dns = p["DNSName"].as_str().unwrap_or("").split('.').next().unwrap_or("").to_string();
+                    let loc = &p["Location"];
                     ExitNode {
                         id: p["ID"].as_str().unwrap_or("").to_string(),
                         name: if dns.is_empty() { p["HostName"].as_str().unwrap_or("?").to_string() } else { dns },
+                        country: loc["Country"].as_str().unwrap_or("").to_string(),
+                        city: loc["City"].as_str().unwrap_or("").to_string(),
+                        priority: loc["Priority"].as_i64().unwrap_or(0),
                         online: p["Online"].as_bool().unwrap_or(false),
-                        active: p["ExitNode"].as_bool().unwrap_or(false),
                     }
                 })
                 .collect()
         })
         .unwrap_or_default();
-    exit_nodes.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
-    Some(Status { state, tailnet, ip, exit_nodes })
+    nodes.sort_by(|a, b| {
+        (a.is_located(), a.country.to_lowercase(), a.city.to_lowercase(), a.name.to_lowercase()).cmp(&(b.is_located(), b.country.to_lowercase(), b.city.to_lowercase(), b.name.to_lowercase()))
+    });
+    if let Ok(mut n) = NODES.lock() {
+        *n = nodes;
+    }
+}
+
+/// Best online node in a country (and city): highest priority, a random one among equals
+/// (spreads load like Tailscale's own app does).
+pub fn best_node(country: &str, city: Option<&str>) -> Option<String> {
+    let nodes = exit_nodes();
+    let pick: Vec<&ExitNode> = nodes.iter().filter(|n| n.online && n.country == country && city.map_or(true, |c| n.city == c)).collect();
+    let top = pick.iter().map(|n| n.priority).max()?;
+    let best: Vec<&&ExitNode> = pick.iter().filter(|n| n.priority == top).collect();
+    let r = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.subsec_nanos() as usize).unwrap_or(0);
+    best.get(r % best.len()).map(|n| n.id.clone())
 }
 
 fn refresh(notify: &dyn Fn()) {
-    let st = request("GET", "/localapi/v0/status", None).and_then(|b| parse(&b)).unwrap_or_default();
-    let changed = {
+    let st = read_status();
+    let (changed, need_nodes) = {
         let mut cur = STATUS.lock().unwrap();
-        let changed = cur.as_ref().map(|c| format!("{c:?}")) != Some(format!("{st:?}"));
+        let prev = cur.clone();
+        // Exit node went from online to offline: worth a notice.
+        if let (Some(Some((pid, true))), Some((id, false))) = (prev.as_ref().map(|p| p.exit.clone()), st.exit.as_ref()) {
+            if pid == *id {
+                let name = st.exit_label().unwrap_or_else(|| "exit node".into());
+                *ALERT.lock().unwrap() = Some(format!("Tailscale exit node {name} went offline. Internet traffic is blocked until it's back or you pick another one."));
+            }
+        }
+        // Load the list if the exit node in use isn't in it, or if it's empty while connected
+        // (e.g. it was loaded while Tailscale was still starting); at most once a minute.
+        let unknown = st.exit.as_ref().is_some_and(|(id, _)| !exit_nodes().iter().any(|n| &n.id == id));
+        let empty = st.state == State::Running && exit_nodes().is_empty();
+        let need_nodes = (unknown || empty) && {
+            static LAST: Mutex<Option<std::time::Instant>> = Mutex::new(None);
+            let mut last = LAST.lock().unwrap();
+            let due = last.map_or(true, |t| t.elapsed() > Duration::from_secs(60));
+            if due {
+                *last = Some(std::time::Instant::now());
+            }
+            due
+        };
+        let changed = prev.as_ref() != Some(&st);
         *cur = Some(st);
-        changed
+        (changed, need_nodes)
     };
+    if need_nodes {
+        load_exit_nodes(); // switched to a node we don't know yet: get its name
+    }
     if changed {
         notify();
     }
 }
 
-/// Start watching in the background; `notify` is called (on that thread) when the status changes.
-pub fn start(notify: impl Fn() + Send + 'static) {
+/// Start watching in the background; `notify` is called (on a background thread) when the
+/// status changes.
+pub fn start(notify: impl Fn() + Send + Sync + 'static) {
+    let notify = std::sync::Arc::new(notify);
+    // Exit node list, once at start.
+    std::thread::spawn(load_exit_nodes);
+    // Safety net: re-read every 30 s (an exit node's online state can change without a
+    // message on the watch connection).
+    let n2 = notify.clone();
+    std::thread::spawn(move || loop {
+        std::thread::sleep(Duration::from_secs(30));
+        refresh(&*n2);
+    });
+    // This connection is what keeps Tailscale connected without its tray app, so if the
+    // service ever refuses the options, fall back to the plainest watch request.
+    let mut basic = false;
     std::thread::spawn(move || loop {
         let Some(p) = Pipe::open() else {
-            refresh(&notify); // shows "unavailable"
+            refresh(&*notify); // shows "unavailable"
             std::thread::sleep(Duration::from_secs(10));
             continue;
         };
-        // mask 2 = send the current state at once; later messages arrive on every change.
-        let req = "GET /localapi/v0/watch-ipn-bus?mask=2 HTTP/1.1\r\nHost: local-tailscaled.sock\r\nSec-Tailscale: localapi\r\n\r\n";
+        // 2 = send the current state at once, 128 = include health changes.
+        // Later messages arrive on every change.
+        let mask = if basic { 2 } else { 130 };
+        let req = format!("GET /localapi/v0/watch-ipn-bus?mask={mask} HTTP/1.1\r\nHost: local-tailscaled.sock\r\nSec-Tailscale: localapi\r\n\r\n");
         if !p.write(req.as_bytes()) {
             std::thread::sleep(Duration::from_secs(10));
             continue;
         }
         let mut buf = vec![0u8; 64 * 1024];
+        let n = p.read(&mut buf);
+        if n == 0 {
+            std::thread::sleep(Duration::from_secs(3));
+            continue;
+        }
+        if !buf[..n].starts_with(b"HTTP/1.1 200") {
+            crate::trace(&format!("tailscale watch refused: {}", String::from_utf8_lossy(&buf[..n.min(200)]).lines().last().unwrap_or("")));
+            basic = !basic; // try the other form
+            std::thread::sleep(Duration::from_secs(1));
+            continue;
+        }
+        refresh(&*notify);
         loop {
             if p.read(&mut buf) == 0 {
                 break; // service restarted or stopped
@@ -259,9 +406,9 @@ pub fn start(notify: impl Fn() + Send + 'static) {
                     break;
                 }
             }
-            refresh(&notify);
+            refresh(&*notify);
         }
-        refresh(&notify);
+        refresh(&*notify);
         std::thread::sleep(Duration::from_secs(3));
     });
 }
@@ -280,4 +427,21 @@ pub fn set_running(on: bool) {
 pub fn set_exit_node(id: Option<&str>) {
     let id = serde_json::Value::String(id.unwrap_or("").to_string());
     patch_prefs(format!(r#"{{"ExitNodeID":{id},"ExitNodeIDSet":true,"ExitNodeIP":"","ExitNodeIPSet":true}}"#));
+}
+
+/// Use the exit node Tailscale suggests (closest / fastest).
+pub fn use_suggested() {
+    std::thread::spawn(|| {
+        if let Some(id) = get_json("/localapi/v0/suggest-exit-node").and_then(|v| v["ID"].as_str().map(String::from)).filter(|s| !s.is_empty()) {
+            request("PATCH", "/localapi/v0/prefs", Some(&format!(r#"{{"ExitNodeID":{},"ExitNodeIDSet":true,"ExitNodeIP":"","ExitNodeIPSet":true}}"#, serde_json::Value::String(id))));
+        }
+    });
+}
+
+pub fn set_unattended(on: bool) {
+    patch_prefs(format!(r#"{{"ForceDaemon":{on},"ForceDaemonSet":true}}"#));
+}
+
+pub fn set_lan_access(on: bool) {
+    patch_prefs(format!(r#"{{"ExitNodeAllowLANAccess":{on},"ExitNodeAllowLANAccessSet":true}}"#));
 }

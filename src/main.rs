@@ -945,6 +945,18 @@ impl App {
     }
 }
 
+/// A Windows notification from LastDesk's tray icon.
+fn notify_balloon(hwnd: HWND, title: &str, text: &str) {
+    let mut nid = tray_data(hwnd);
+    nid.uFlags = NIF_INFO;
+    nid.dwInfoFlags = NIIF_WARNING;
+    copy_wide(&mut nid.szInfoTitle, title);
+    copy_wide(&mut nid.szInfo, text);
+    unsafe {
+        let _ = Shell_NotifyIconW(NIM_MODIFY, &nid);
+    }
+}
+
 fn tray_data(hwnd: HWND) -> NOTIFYICONDATAW {
     NOTIFYICONDATAW { cbSize: std::mem::size_of::<NOTIFYICONDATAW>() as u32, hWnd: hwnd, uID: 1, ..Default::default() }
 }
@@ -1230,7 +1242,16 @@ unsafe extern "system" fn main_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
                 }
                 if wp.0 == status::STATUS_TAILSCALE {
                     let st = tailscale::status().unwrap_or_default();
-                    trace(&format!("tailscale {:?} exit_nodes={} using_exit={}", st.state, st.exit_nodes.len(), st.exit_node().is_some()));
+                    trace(&format!(
+                        "tailscale {:?} nodes={} exit={:?} warnings={}",
+                        st.state,
+                        tailscale::exit_nodes().len(),
+                        st.exit.as_ref().map(|(_, online)| if *online { "online" } else { "offline" }),
+                        st.warnings().len()
+                    ));
+                    if let Some(text) = tailscale::take_alert() {
+                        notify_balloon(app.main, "Tailscale", &text);
+                    }
                 }
                 if wp.0 == status::STATUS_PRIVACY {
                     if app.status.refresh_privacy() {
