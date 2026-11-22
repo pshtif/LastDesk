@@ -63,14 +63,15 @@ mod tests {
         let top = super::top(5);
         assert!(!top.is_empty(), "should see at least our own process");
         assert!(top.windows(2).all(|w| w[0].1 >= w[1].1), "largest first");
-        assert!(super::summary().starts_with("Memory: "));
+        assert!(super::summary().starts_with("Memory\t"));
     }
 }
 
 /// Tooltip text.
 pub fn summary() -> String {
     let Some((used, total)) = usage() else { return "Memory".into() };
-    let mut s = format!("Memory: {} of {} in use ({}%)", gb(used), gb(total), used * 100 / total.max(1));
+    let g = |b: u64| b as f64 / (1u64 << 30) as f64;
+    let mut s = format!("Memory\t{:.1}/{:.1} GB", g(used), g(total));
     // "name<TAB>amount": the tooltip draws these as a table (name left, amount right).
     for (name, b) in top(5) {
         s.push_str(&format!("\n{name}\t{}", gb(b)));
