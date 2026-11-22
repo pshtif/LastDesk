@@ -3,6 +3,8 @@ name = "lastdesk"
 version = "0.1.0"
 edition = "2021"
 description = "Per-monitor workspaces for Windows, tiny and crash-safe"
+license = "MIT"
+authors = ["Peter @sHTiF Stefcek"]
 
 [dependencies]
 windows-core = "=0.58.0"

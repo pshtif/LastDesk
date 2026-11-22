@@ -155,3 +155,7 @@ V: = \\192.168.1.10\Media | \\my-nas\Media | NAS Media
   talks to the local Tailscale service.
 - **Keyboard hook:** the optional Win-key feature uses one that only checks whether a key is
   the Win key.
+
+## License
+
+[MIT](LICENSE) © 2026 Peter @sHTiF Stefcek
