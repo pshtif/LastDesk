@@ -31,6 +31,8 @@ const PREVIEW_TIMER: usize = 2;
 pub const TIP_CLASS: windows::core::PCWSTR = w!("LastDeskTip");
 /// Button colour for a window asking for attention (FlashWindow), as on the Windows taskbar.
 const ATTENTION: COLORREF = ui::rgb(0xC8, 0x5A, 0x14);
+/// Top-edge line on pinned apps: quiet grey, so the blue focus line stays the strongest mark.
+const PIN_EDGE: COLORREF = ui::rgb(0x8A, 0x90, 0x9C);
 
 fn cursor() -> POINT {
     let mut p = POINT::default();
@@ -1036,10 +1038,17 @@ impl App {
             // Pinned apps that aren't running here: icon only. A dragged one leaves an empty
             // slot and floats under the cursor.
             let pin_drag = b.drag.as_ref().filter(|d| d.active && d.pin);
+            // Pinned apps (icon or running) get a thin line along the top edge, mirroring the
+            // focused window's accent line at the bottom.
+            let pin_edge = |r: RECT| {
+                let line = RECT { left: r.left + s(8.0), top: r.top + s(1.0), right: r.right - s(8.0), bottom: r.top + s(1.0) + s(2.0).max(2) };
+                ui::fill_round(mem, line, s(1.0), PIN_EDGE);
+            };
             let draw_pin = |li: usize, r: RECT, bg: Option<COLORREF>| {
                 if let Some(bg) = bg {
                     ui::fill_round(mem, r, s(6.0), bg);
                 }
+                pin_edge(r);
                 if let Some((_, icon)) = self.launcher_icons.get(li) {
                     if !icon.is_invalid() {
                         let sz = s(18.0);
@@ -1067,7 +1076,6 @@ impl App {
             // Window buttons. While dragging, the dragged one leaves an empty slot and is drawn
             // last, floating under the cursor.
             let dragging = b.drag.as_ref().filter(|d| d.active && !d.pin);
-            let f_pin = ui::icon_font(s(10.0));
             let draw_button = |btn: &Button, rect: RECT, lifted: bool| {
                 let is_fg = hwnd_key(fg) == btn.hwnd;
                 let bg = if lifted {
@@ -1095,13 +1103,10 @@ impl App {
                 if !btn.icon.is_invalid() {
                     let _ = DrawIconEx(mem, ix, (h - icon) / 2, btn.icon, icon, icon, 0, None, DI_NORMAL);
                 }
-                // Pinned app: a small pin in the top-right corner.
-                let pin_w = if btn.pin.is_some() { s(13.0) } else { 0 };
                 if btn.pin.is_some() {
-                    let mut pr = RECT { left: rect.right - s(15.0), top: rect.top + s(2.0), right: rect.right - s(2.0), bottom: rect.top + s(15.0) };
-                    ui::draw_text(mem, "\u{E840}", &mut pr, ui::MUTED, f_pin);
+                    pin_edge(rect);
                 }
-                let mut tr = RECT { left: ix + icon + s(7.0), top: rect.top, right: rect.right - s(6.0) - pin_w, bottom: rect.bottom };
+                let mut tr = RECT { left: ix + icon + s(7.0), top: rect.top, right: rect.right - s(6.0), bottom: rect.bottom };
                 if !icons_only && tr.right - tr.left > s(12.0) {
                     ui::draw_text_left(mem, &btn.title, &mut tr, if btn.minimized { ui::MUTED } else { ui::TEXT }, f_text);
                 }
@@ -1121,7 +1126,6 @@ impl App {
                 }
             }
             draw_lifted_pin();
-            let _ = DeleteObject(f_pin);
 
             // Tray icons (drawn from the live list: icons can change between refreshes).
             if !b.tray_icons.is_empty() {
