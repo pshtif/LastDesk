@@ -885,7 +885,7 @@ impl App {
             return;
         }
         self.sync_launcher_icons();
-        let all = win::visible_windows();
+        let all = win::bar_windows();
         let n = workspaces();
         let icons_only = self.config.icons_only;
         let align = self.config.align;

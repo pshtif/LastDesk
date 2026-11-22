@@ -118,6 +118,20 @@ const IGNORED_CLASSES: &[&str] = &[
 /// A normal application window that belongs on a workspace.
 /// `allow_cloaked` is used when checking windows we hid ourselves.
 pub fn is_manageable(h: HWND, allow_cloaked: bool) -> bool {
+    manageable(h, allow_cloaked, false)
+}
+
+/// Always-on-top windows are left out of workspaces (picture-in-picture, overlays), but a
+/// normal app window that's set always-on-top (title bar) or minimized still needs a bar
+/// button: otherwise a minimized one could never be brought back.
+fn bar_worthy(h: HWND) -> bool {
+    unsafe {
+        let style = GetWindowLongPtrW(h, GWL_STYLE) as u32;
+        manageable(h, false, true) && (IsIconic(h).as_bool() || style & WS_CAPTION.0 == WS_CAPTION.0)
+    }
+}
+
+fn manageable(h: HWND, allow_cloaked: bool, allow_topmost: bool) -> bool {
     unsafe {
         if !IsWindow(h).as_bool() || !IsWindowVisible(h).as_bool() {
             return false;
@@ -142,7 +156,7 @@ pub fn is_manageable(h: HWND, allow_cloaked: bool) -> bool {
             return false;
         }
         // Always-on-top windows (picture-in-picture, overlays) stay on every workspace.
-        if ex & WS_EX_TOPMOST.0 != 0 {
+        if ex & WS_EX_TOPMOST.0 != 0 && !allow_topmost {
             return false;
         }
         if GetWindowTextLengthW(h) == 0 {
@@ -181,6 +195,23 @@ pub fn visible_windows() -> Vec<HWND> {
     unsafe extern "system" fn cb(h: HWND, data: LPARAM) -> BOOL {
         let v = &mut *(data.0 as *mut Vec<HWND>);
         if is_manageable(h, false) {
+            v.push(h);
+        }
+        TRUE
+    }
+    let mut v: Vec<HWND> = Vec::new();
+    unsafe {
+        let _ = EnumWindows(Some(cb), LPARAM(&mut v as *mut _ as isize));
+    }
+    v
+}
+
+/// Windows that get a bar button: the manageable ones plus always-on-top app windows
+/// (see bar_worthy), in z-order.
+pub fn bar_windows() -> Vec<HWND> {
+    unsafe extern "system" fn cb(h: HWND, data: LPARAM) -> BOOL {
+        let v = &mut *(data.0 as *mut Vec<HWND>);
+        if is_manageable(h, false) || bar_worthy(h) {
             v.push(h);
         }
         TRUE
