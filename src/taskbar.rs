@@ -83,6 +83,19 @@ pub fn show_all() {
     }
 }
 
+/// Hide the taskbars on secondary monitors. LastDesk never shows those on purpose, so unlike
+/// the main one (peeked at for tray icons) they're hidden whatever has focus. Explorer shows
+/// them again on some settings changes (e.g. a policy refresh).
+pub fn hide_secondary() {
+    for h in tray_windows() {
+        unsafe {
+            if crate::win::class_name(h) == "Shell_SecondaryTrayWnd" && IsWindowVisible(h).as_bool() {
+                let _ = ShowWindow(h, SW_HIDE);
+            }
+        }
+    }
+}
+
 /// Show just the primary taskbar (to reach tray icons); it's hidden again when focus leaves.
 pub fn peek() {
     if let Some(t) = primary_tray() {

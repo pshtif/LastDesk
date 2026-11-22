@@ -77,6 +77,7 @@ const BAR_TIMER: usize = 4;
 const PLACE_TIMER: usize = 5;
 const TRAY_TIMER: usize = 6;
 const FS_TIMER: usize = 7;
+const TASKBAR_TIMER: usize = 8;
 const OSD_MS: u32 = 900;
 const RUN_KEY: PCWSTR = w!("Software\\Microsoft\\Windows\\CurrentVersion\\Run");
 const APP_NAME: PCWSTR = w!("LastDesk");
@@ -462,6 +463,7 @@ impl App {
     /// Explorer shows its taskbar again now and then: hide it unless the shell UI is in use.
     fn taskbar_enforce(&self) {
         if self.taskbar_hidden {
+            taskbar::hide_secondary(); // never wanted, whatever has focus
             let fg = unsafe { GetForegroundWindow() };
             if !taskbar::is_shell_ui(fg) {
                 taskbar::hide_all();
@@ -1226,6 +1228,17 @@ unsafe extern "system" fn main_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
             if ev == WM_RBUTTONUP || ev == WM_LBUTTONUP {
                 show_menu(hwnd);
             }
+            LRESULT(0)
+        }
+        WM_SETTINGCHANGE => {
+            // Explorer may show its taskbars again after a settings / policy change: check
+            // once it has settled (the clock timer would catch it too, but later).
+            SetTimer(hwnd, TASKBAR_TIMER, 1500, None);
+            DefWindowProcW(hwnd, msg, wp, lp)
+        }
+        WM_TIMER if wp.0 == TASKBAR_TIMER => {
+            let _ = KillTimer(hwnd, TASKBAR_TIMER);
+            with_app(|app| app.taskbar_enforce());
             LRESULT(0)
         }
         WM_DISPLAYCHANGE => {
