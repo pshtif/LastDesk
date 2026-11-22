@@ -27,6 +27,8 @@ pub struct Drive {
     pub letter: String,
     pub home: String,
     pub away: String,
+    /// Friendly name shown for the drive (Explorer, file managers); empty = leave as is.
+    pub name: String,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -65,12 +67,13 @@ pub fn load() -> Option<Drives> {
         if k.eq_ignore_ascii_case("home") {
             d.homes.extend(v.split(',').map(norm_mac).filter(|m| !m.is_empty()));
         } else if k.len() == 2 && k.ends_with(':') && k.as_bytes()[0].is_ascii_alphabetic() {
-            let (home, away) = match v.split_once('|') {
-                Some((h, a)) => (h.trim().to_string(), a.trim().to_string()),
-                None => (v.to_string(), v.to_string()),
-            };
+            // home | away | name   (away and name optional)
+            let mut parts = v.split('|').map(|p| p.trim().to_string());
+            let home = parts.next().unwrap_or_default();
+            let away = parts.next().filter(|a| !a.is_empty()).unwrap_or_else(|| home.clone());
+            let name = parts.next().unwrap_or_default();
             if !home.is_empty() {
-                d.drives.push(Drive { letter: k.to_uppercase(), away: if away.is_empty() { home.clone() } else { away }, home });
+                d.drives.push(Drive { letter: k.to_uppercase(), home, away, name });
             }
         }
     }
@@ -81,13 +84,18 @@ fn save(d: &Drives) -> std::io::Result<()> {
     let mut s = String::new();
     s.push_str("# LastDesk network drives: each drive letter has a path for home and one for everywhere else.\n");
     s.push_str("# LastDesk switches between them when you change networks.\n#\n");
-    s.push_str("#   X: = <path at home> | <path elsewhere>\n");
-    s.push_str("#   e.g. V: = \\\\192.168.1.10\\Media | \\\\my-nas\\Media   (local address at home, Tailscale/VPN name away)\n#\n");
+    s.push_str("#   X: = <path at home> | <path elsewhere> | <name to show (optional)>\n");
+    s.push_str("#   e.g. V: = \\\\192.168.1.10\\Media | \\\\my-nas\\Media | NAS Media\n");
+    s.push_str("#   (local address at home, Tailscale/VPN name away)\n#\n");
     s.push_str("# home = your router's hardware address(es), comma separated. Easiest: right-click LastDesk >\n");
     s.push_str("# Network drives > \"This network is home\" while connected at home.\n\n");
     s.push_str(&format!("home = {}\n\n", d.homes.join(", ")));
     for dr in &d.drives {
-        s.push_str(&format!("{} = {} | {}\n", dr.letter, dr.home, dr.away));
+        if dr.name.is_empty() {
+            s.push_str(&format!("{} = {} | {}\n", dr.letter, dr.home, dr.away));
+        } else {
+            s.push_str(&format!("{} = {} | {} | {}\n", dr.letter, dr.home, dr.away, dr.name));
+        }
     }
     std::fs::write(path(), s)
 }
@@ -214,6 +222,32 @@ fn reachable(unc: &str) -> bool {
     addrs.take(3).any(|a| TcpStream::connect_timeout(&a, std::time::Duration::from_millis(1500)).is_ok())
 }
 
+/// Give the network path `unc` a display name, the way Explorer's "Rename" on a mapped drive
+/// does (stored per path, so it's set for both the home and the away path). Returns whether
+/// it changed.
+fn set_label(unc: &str, name: &str) -> bool {
+    use windows::Win32::System::Registry::{RegGetValueW, RegSetKeyValueW, HKEY_CURRENT_USER, REG_SZ, RRF_RT_REG_SZ};
+    if name.is_empty() || !unc.starts_with("\\\\") {
+        return false;
+    }
+    let key = wide(&format!(r"Software\Microsoft\Windows\CurrentVersion\Explorer\MountPoints2\{}", unc.trim_end_matches('\\').replace('\\', "#")));
+    let value = wide("_LabelFromReg");
+    unsafe {
+        let mut buf = [0u16; 260];
+        let mut n = (buf.len() * 2) as u32;
+        let cur = if RegGetValueW(HKEY_CURRENT_USER, PCWSTR(key.as_ptr()), PCWSTR(value.as_ptr()), RRF_RT_REG_SZ, None, Some(buf.as_mut_ptr() as _), Some(&mut n)) == ERROR_SUCCESS {
+            String::from_utf16_lossy(&buf[..(n as usize / 2).saturating_sub(1)])
+        } else {
+            String::new()
+        };
+        if cur == name {
+            return false;
+        }
+        let data = wide(name);
+        RegSetKeyValueW(HKEY_CURRENT_USER, PCWSTR(key.as_ptr()), PCWSTR(value.as_ptr()), REG_SZ.0, Some(data.as_ptr() as _), (data.len() * 2) as u32) == ERROR_SUCCESS
+    }
+}
+
 /// Map each drive for where we are now. Returns what was done (for the log) and whether
 /// some drive still needs switching (its server didn't answer yet: try again later).
 pub fn apply() -> (Vec<String>, bool) {
@@ -225,6 +259,12 @@ pub fn apply() -> (Vec<String>, bool) {
     let mut done = Vec::new();
     let mut pending = false;
     for dr in &d.drives {
+        // Names first (also when nothing needs re-mapping), so renames show up right away.
+        let renamed = set_label(&dr.home, &dr.name) | set_label(&dr.away, &dr.name);
+        if renamed {
+            announce(&dr.letter, true);
+            done.push(format!("{} named", dr.letter));
+        }
         let want = if p == Place::Home { &dr.home } else { &dr.away };
         let cur = current(&dr.letter);
         if cur.as_ref().is_some_and(|c| c.eq_ignore_ascii_case(want)) {
@@ -298,7 +338,7 @@ pub fn create_from_current() -> std::io::Result<()> {
     for c in b'D'..=b'Z' {
         let letter = format!("{}:", c as char);
         if let Some(r) = current(&letter) {
-            d.drives.push(Drive { letter, home: r.clone(), away: r });
+            d.drives.push(Drive { letter, home: r.clone(), away: r, name: String::new() });
         }
     }
     save(&d)

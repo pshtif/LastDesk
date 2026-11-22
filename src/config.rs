@@ -64,6 +64,10 @@ pub struct Config {
     pub align: Align,
     pub hide_taskbar: bool,
     pub tray: bool,
+    /// Tailscale status and menu in the bar (if Tailscale is installed).
+    pub tailscale: bool,
+    /// The Win key opens Start on the monitor you're on (needs a keyboard hook).
+    pub win_key_start: bool,
     pub errors: Vec<String>,
 }
 
@@ -197,6 +201,8 @@ pub fn parse(text: &str) -> Config {
         align: Align::Left,
         hide_taskbar: false,
         tray: true,
+        tailscale: false,
+        win_key_start: false,
         errors: Vec::new(),
     };
     let mut section = String::new();
@@ -278,6 +284,14 @@ pub fn parse(text: &str) -> Config {
                 Some(b) => c.tray = b,
                 None => bad(),
             },
+            ("bar", "tailscale") => match bool_of(val) {
+                Some(b) => c.tailscale = b,
+                None => bad(),
+            },
+            ("bar", "win_key_start") => match bool_of(val) {
+                Some(b) => c.win_key_start = b,
+                None => bad(),
+            },
             ("pinned_apps", app) => c.pinned_apps.push(app.trim_end_matches(".exe").to_string()),
             ("launchers", name) if !val.is_empty() => c.launchers.push(Launcher { name: name.to_string(), target: val.to_string() }),
             ("rules", app) => {
@@ -337,7 +351,11 @@ pub fn render(c: &Config) -> String {
     s.push_str("# Hide the Windows taskbar while the LastDesk bar is on.\n");
     s.push_str(&format!("hide_taskbar = {}\n", c.hide_taskbar));
     s.push_str("# Show apps' tray icons in the LastDesk bar.\n");
-    s.push_str(&format!("tray = {}\n\n", c.tray));
+    s.push_str(&format!("tray = {}\n", c.tray));
+    s.push_str("# Tailscale status and menu in the bar, if Tailscale is installed (replaces its tray app).\n");
+    s.push_str(&format!("tailscale = {}\n", c.tailscale));
+    s.push_str("# The Win key opens Start on the monitor you're on (uses a keyboard hook that only looks at the Win key).\n");
+    s.push_str(&format!("win_key_start = {}\n\n", c.win_key_start));
     s.push_str("[pinned_apps]\n");
     s.push_str("# Apps shown on every workspace. One exe name per line (without .exe), e.g. spotify\n");
     for a in &c.pinned_apps {
@@ -397,6 +415,12 @@ mod tests {
         assert_eq!(back.switch, MOD_CONTROL | MOD_ALT);
         assert_eq!((back.bar_edge, back.icons_only, back.align), (Edge::Bottom, true, Align::Right));
         assert!(back.hide_taskbar && !back.tray);
+        // Integrations: off unless turned on, and kept when saved.
+        assert!(!back.tailscale && !back.win_key_start);
+        let mut on = parse("[bar]\ntailscale = true\nwin_key_start = true\n");
+        on.errors.clear();
+        let on_back = parse(&render(&on));
+        assert!(on_back.tailscale && on_back.win_key_start && on_back.errors.is_empty());
         assert_eq!(back.pinned_apps, vec!["spotify".to_string()]);
         assert_eq!((back.rules[0].monitor, back.rules[0].workspace), (1, 2));
     }

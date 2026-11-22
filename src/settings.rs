@@ -44,6 +44,8 @@ const ID_STATUS: i32 = 114;
 const ID_NEXT: i32 = 115;
 const ID_PREV: i32 = 116;
 const ID_ANIM: i32 = 117;
+const ID_TAILSCALE: i32 = 118;
+const ID_WINKEY: i32 = 119;
 
 const EN_KILLFOCUS: u32 = 0x0200;
 const WM_MOUSELEAVE: u32 = 0x02A3;
@@ -137,7 +139,7 @@ fn seg_value(id: i32) -> String {
 fn gather() -> Config {
     let lines = |id: i32| text_of(id).lines().map(|l| l.trim().to_string()).filter(|l| !l.is_empty()).collect::<Vec<_>>().join("\n");
     let text = format!(
-        "workspaces = {}\nanimation = {}\nlaunch_ignore = {}\n[keys]\nswitch = {}\nmove = {}\npin = {}\noverview = {}\nnext = {}\nprev = {}\n[bar]\nenabled = {}\nposition = {}\nbuttons = {}\nalign = {}\nhide_taskbar = {}\ntray = {}\n[pinned_apps]\n{}\n[launchers]\n{}\n[rules]\n{}\n",
+        "workspaces = {}\nanimation = {}\nlaunch_ignore = {}\n[keys]\nswitch = {}\nmove = {}\npin = {}\noverview = {}\nnext = {}\nprev = {}\n[bar]\nenabled = {}\nposition = {}\nbuttons = {}\nalign = {}\nhide_taskbar = {}\ntray = {}\ntailscale = {}\nwin_key_start = {}\n[pinned_apps]\n{}\n[launchers]\n{}\n[rules]\n{}\n",
         seg_value(ID_WORKSPACES),
         seg_value(ID_ANIM),
         SETTINGS.with(|s| s.borrow().as_ref().map(|s| s.launch_ignore.join(", ")).unwrap_or_default()),
@@ -153,6 +155,8 @@ fn gather() -> Config {
         seg_value(ID_ALIGN),
         toggle_on(ID_HIDE_TASKBAR),
         toggle_on(ID_TRAY),
+        toggle_on(ID_TAILSCALE),
+        toggle_on(ID_WINKEY),
         lines(ID_PINNED),
         // Not edited here (pin/unpin from the bar): keep the app's current list.
         with_app(|a| a.config.launchers.clone())
@@ -528,6 +532,17 @@ pub fn open() {
         toggle(ID_TRAY, "Show tray icons in the bar", cfg.tray, y);
         y += 48;
 
+        header("Integrations", y);
+        y += 34;
+        toggle(ID_WINKEY, "Win key opens Start on the monitor you're on", cfg.win_key_start, y);
+        y += 36;
+        // Only offered where Tailscale is installed.
+        if crate::tailscale::installed() {
+            toggle(ID_TAILSCALE, "Tailscale in the bar (status, connect, exit nodes)", cfg.tailscale, y);
+            y += 36;
+        }
+        y += 12;
+
         header("Pinned apps", y);
         y += 26;
         native(w!("STATIC"), "Shown on every workspace. One exe name per line, e.g. spotify", 0, 28, y, 504, 20, -1, font);
@@ -580,7 +595,7 @@ pub unsafe extern "system" fn settings_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp
                     let p = wide(&config::path().display().to_string());
                     ShellExecuteW(None, w!("open"), w!("notepad.exe"), PCWSTR(p.as_ptr()), None, SW_SHOWNORMAL);
                 }
-                ID_WORKSPACES | ID_ANIM | ID_SWITCH | ID_MOVE | ID_BAR | ID_EDGE | ID_BUTTONS | ID_ALIGN | ID_HIDE_TASKBAR | ID_TRAY => apply(),
+                ID_WORKSPACES | ID_ANIM | ID_SWITCH | ID_MOVE | ID_BAR | ID_EDGE | ID_BUTTONS | ID_ALIGN | ID_HIDE_TASKBAR | ID_TRAY | ID_TAILSCALE | ID_WINKEY => apply(),
                 ID_PIN | ID_OVERVIEW | ID_NEXT | ID_PREV | ID_PINNED | ID_RULES if code == EN_KILLFOCUS => apply(),
                 _ => {}
             }

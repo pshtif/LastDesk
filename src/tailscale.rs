@@ -352,9 +352,51 @@ fn refresh(notify: &dyn Fn()) {
     }
 }
 
+static ENABLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static STARTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// Handle of the open watch connection (0 = none), so turning off can interrupt its read.
+static WATCH: Mutex<isize> = Mutex::new(0);
+
+/// Shown and connected? (Installed and turned on in Settings.)
+pub fn active() -> bool {
+    installed() && ENABLED.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+/// Turn the integration on or off (Settings > Integrations). Off closes the connection to
+/// the Tailscale service; Tailscale itself is left as it is.
+pub fn set_enabled(on: bool, notify: impl Fn() + Send + Sync + 'static) {
+    use std::sync::atomic::Ordering::SeqCst;
+    let on = on && installed();
+    if ENABLED.swap(on, SeqCst) == on {
+        return;
+    }
+    if on {
+        if !STARTED.swap(true, SeqCst) {
+            start(notify);
+        } else {
+            std::thread::spawn(load_exit_nodes);
+        }
+    } else {
+        if let Ok(w) = WATCH.lock() {
+            if *w != 0 {
+                unsafe {
+                    let _ = windows::Win32::System::IO::CancelIoEx(HANDLE(*w as *mut _), None);
+                }
+            }
+        }
+        if let Ok(mut s) = STATUS.lock() {
+            *s = None;
+        }
+    }
+}
+
+fn enabled() -> bool {
+    ENABLED.load(std::sync::atomic::Ordering::SeqCst)
+}
+
 /// Start watching in the background; `notify` is called (on a background thread) when the
-/// status changes.
-pub fn start(notify: impl Fn() + Send + Sync + 'static) {
+/// status changes. The threads idle while the integration is off.
+fn start(notify: impl Fn() + Send + Sync + 'static) {
     let notify = std::sync::Arc::new(notify);
     // Exit node list, once at start.
     std::thread::spawn(load_exit_nodes);
@@ -363,12 +405,18 @@ pub fn start(notify: impl Fn() + Send + Sync + 'static) {
     let n2 = notify.clone();
     std::thread::spawn(move || loop {
         std::thread::sleep(Duration::from_secs(30));
-        refresh(&*n2);
+        if enabled() {
+            refresh(&*n2);
+        }
     });
     // This connection is what keeps Tailscale connected without its tray app, so if the
     // service ever refuses the options, fall back to the plainest watch request.
     let mut basic = false;
     std::thread::spawn(move || loop {
+        if !enabled() {
+            std::thread::sleep(Duration::from_secs(1));
+            continue;
+        }
         let Some(p) = Pipe::open() else {
             refresh(&*notify); // shows "unavailable"
             std::thread::sleep(Duration::from_secs(10));
@@ -394,10 +442,11 @@ pub fn start(notify: impl Fn() + Send + Sync + 'static) {
             std::thread::sleep(Duration::from_secs(1));
             continue;
         }
+        *WATCH.lock().unwrap() = p.0 .0 as isize;
         refresh(&*notify);
         loop {
-            if p.read(&mut buf) == 0 {
-                break; // service restarted or stopped
+            if p.read(&mut buf) == 0 || !enabled() {
+                break; // service restarted or stopped, or turned off here
             }
             // Changes come in bursts: let it settle, skip what's queued, then read the status once.
             std::thread::sleep(Duration::from_millis(300));
@@ -408,8 +457,18 @@ pub fn start(notify: impl Fn() + Send + Sync + 'static) {
             }
             refresh(&*notify);
         }
-        refresh(&*notify);
-        std::thread::sleep(Duration::from_secs(3));
+        {
+            // Close it while holding the lock, so turning off never cancels a reused handle.
+            let mut w = WATCH.lock().unwrap();
+            *w = 0;
+            drop(p);
+        }
+        if enabled() {
+            refresh(&*notify);
+            std::thread::sleep(Duration::from_secs(3));
+        } else {
+            notify(); // repaint without the icon
+        }
     });
 }
 

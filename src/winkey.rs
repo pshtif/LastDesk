@@ -3,16 +3,18 @@
 //! goes down, ask the main thread to move the (still closed) Start window to the current
 //! monitor; Start opens on key-up, by which time it's there.
 //!
-//! The hook runs on its own thread so typing never waits on LastDesk, and it only looks at
-//! whether the key is a Win key: nothing else is read, kept or passed on.
+//! Optional (Settings > Integrations), off by default. The hook runs on its own thread so
+//! typing never waits on LastDesk, and it only looks at whether the key is a Win key:
+//! nothing else is read, kept or passed on. Turning the option off removes the hook.
 
-use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU32, Ordering};
 
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
+use windows::Win32::System::Threading::GetCurrentThreadId;
 use windows::Win32::UI::Input::KeyboardAndMouse::{VK_LWIN, VK_RWIN};
 use windows::Win32::UI::WindowsAndMessaging::{
-    CallNextHookEx, GetMessageW, PostMessageW, SetWindowsHookExW, KBDLLHOOKSTRUCT, MSG, WH_KEYBOARD_LL, WM_APP, WM_KEYDOWN, WM_KEYUP, WM_SYSKEYDOWN,
-    WM_SYSKEYUP,
+    CallNextHookEx, GetMessageW, PostMessageW, PostThreadMessageW, SetWindowsHookExW, UnhookWindowsHookEx, KBDLLHOOKSTRUCT, MSG, WH_KEYBOARD_LL, WM_APP,
+    WM_KEYDOWN, WM_KEYUP, WM_QUIT, WM_SYSKEYDOWN, WM_SYSKEYUP,
 };
 
 /// Posted to the main window when a Win key goes down.
@@ -20,6 +22,8 @@ pub const WM_WINKEY: u32 = WM_APP + 8;
 
 static MAIN: AtomicIsize = AtomicIsize::new(0);
 static DOWN: AtomicBool = AtomicBool::new(false);
+/// Thread running the hook (0 = off).
+static THREAD: AtomicU32 = AtomicU32::new(0);
 
 unsafe extern "system" fn hook(code: i32, wp: WPARAM, lp: LPARAM) -> LRESULT {
     if code >= 0 {
@@ -38,13 +42,23 @@ unsafe extern "system" fn hook(code: i32, wp: WPARAM, lp: LPARAM) -> LRESULT {
     CallNextHookEx(None, code, wp, lp)
 }
 
-pub fn start(main: HWND) {
+/// Install or remove the hook.
+pub fn set_enabled(on: bool, main: HWND) {
     MAIN.store(main.0 as isize, Ordering::Relaxed);
-    std::thread::spawn(|| unsafe {
-        if SetWindowsHookExW(WH_KEYBOARD_LL, Some(hook), None, 0).is_err() {
-            return;
+    let running = THREAD.load(Ordering::SeqCst);
+    if on && running == 0 {
+        std::thread::spawn(|| unsafe {
+            let Ok(h) = SetWindowsHookExW(WH_KEYBOARD_LL, Some(hook), None, 0) else { return };
+            THREAD.store(GetCurrentThreadId(), Ordering::SeqCst);
+            let mut msg = MSG::default();
+            // Until WM_QUIT (set_enabled(false)).
+            while GetMessageW(&mut msg, None, 0, 0).as_bool() {}
+            let _ = UnhookWindowsHookEx(h);
+            THREAD.store(0, Ordering::SeqCst);
+        });
+    } else if !on && running != 0 {
+        unsafe {
+            let _ = PostThreadMessageW(running, WM_QUIT, WPARAM(0), LPARAM(0));
         }
-        let mut msg = MSG::default();
-        while GetMessageW(&mut msg, None, 0, 0).as_bool() {}
-    });
+    }
 }

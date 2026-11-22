@@ -527,6 +527,19 @@ impl App {
     }
 
     /// Apply a config (from file or the Settings window). Returns problems to report.
+    /// Optional integrations (Settings > Integrations): start or stop each to match the config.
+    fn integrations_apply(&mut self) {
+        winkey::set_enabled(self.config.win_key_start, self.main);
+        let was = tailscale::active();
+        let m = self.main.0 as isize;
+        tailscale::set_enabled(self.config.bar && self.config.tailscale, move || unsafe {
+            let _ = PostMessageW(HWND(m as *mut _), status::WM_STATUS, WPARAM(status::STATUS_TAILSCALE), LPARAM(0));
+        });
+        if tailscale::active() != was {
+            self.bars_refresh(); // the icon's slot appears / goes
+        }
+    }
+
     fn apply_config(&mut self, new: config::Config) -> Vec<String> {
         let old_edge = self.config.bar_edge;
         let mut problems: Vec<String> = new.errors.iter().map(|e| format!("Not understood, ignored: {e}")).collect();
@@ -557,6 +570,7 @@ impl App {
         }
         self.taskbar_apply();
         self.tray_apply();
+        self.integrations_apply();
         let failed = self.register_hotkeys();
         if !failed.is_empty() {
             problems.push(format!("These shortcuts are used by another app and won't work: {}", failed.join(", ")));
@@ -1617,14 +1631,8 @@ fn main() {
         }
         APP.with(|a| *a.borrow_mut() = Some(app));
         let _ = RegisterShellHookWindow(main);
-        winkey::start(main);
         netdrives::schedule_check();
-        if tailscale::installed() {
-            let m = main.0 as isize;
-            tailscale::start(move || {
-                let _ = PostMessageW(HWND(m as *mut _), status::WM_STATUS, WPARAM(status::STATUS_TAILSCALE), LPARAM(0));
-            });
-        }
+        with_app(|app| app.integrations_apply());
         if !problems.is_empty() {
             message(&problems.join("\n"), true);
         }

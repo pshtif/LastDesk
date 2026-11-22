@@ -876,7 +876,7 @@ impl App {
             b.vol = RECT { left: b.battery.left - icon_w, top: s(3.0), right: b.battery.left, bottom: h - s(3.0) };
             b.net = RECT { left: b.vol.left - icon_w, top: s(3.0), right: b.vol.left, bottom: h - s(3.0) };
             let n_priv = (!self.status.mic.is_empty()) as i32 + (!self.status.cam.is_empty()) as i32;
-            let ts_w = if crate::tailscale::installed() { icon_w } else { 0 };
+            let ts_w = if crate::tailscale::active() { icon_w } else { 0 };
             b.ts = RECT { left: b.net.left - ts_w, top: s(3.0), right: b.net.left, bottom: h - s(3.0) };
             b.privacy = RECT { left: b.ts.left - icon_w * n_priv, top: s(3.0), right: b.ts.left, bottom: h - s(3.0) };
             let mut ix = b.privacy.left - s(4.0);
