@@ -158,6 +158,36 @@ pub fn current(letter: &str) -> Option<String> {
     Some(String::from_utf16_lossy(&buf[..end]))
 }
 
+/// Tell running programs (file managers like Double Commander, Explorer) that a network drive
+/// came or went, as Explorer does when you map one; mapping through the API doesn't.
+fn announce(letter: &str, arrived: bool) {
+    use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
+    use windows::Win32::UI::WindowsAndMessaging::{SendMessageTimeoutW, DEV_BROADCAST_HDR, DEV_BROADCAST_VOLUME, DBT_DEVTYP_VOLUME, SMTO_ABORTIFHUNG, WM_DEVICECHANGE};
+    const DBT_DEVICEARRIVAL: usize = 0x8000;
+    const DBT_DEVICEREMOVECOMPLETE: usize = 0x8004;
+    const DBTF_NET: u16 = 2;
+    let Some(c) = letter.chars().next().filter(|c| c.is_ascii_alphabetic()) else { return };
+    let v = DEV_BROADCAST_VOLUME {
+        dbcv_size: std::mem::size_of::<DEV_BROADCAST_VOLUME>() as u32,
+        dbcv_devicetype: DBT_DEVTYP_VOLUME.0,
+        dbcv_reserved: 0,
+        dbcv_unitmask: 1 << (c.to_ascii_uppercase() as u8 - b'A'),
+        dbcv_flags: windows::Win32::UI::WindowsAndMessaging::DEV_BROADCAST_VOLUME_FLAGS(DBTF_NET),
+    };
+    let _ = std::mem::size_of::<DEV_BROADCAST_HDR>();
+    unsafe {
+        let _ = SendMessageTimeoutW(
+            HWND(0xffff as *mut _), // HWND_BROADCAST
+            WM_DEVICECHANGE,
+            WPARAM(if arrived { DBT_DEVICEARRIVAL } else { DBT_DEVICEREMOVECOMPLETE }),
+            LPARAM(&v as *const _ as isize),
+            SMTO_ABORTIFHUNG,
+            2000,
+            None,
+        );
+    }
+}
+
 /// Point a drive letter at `remote` (saved, so it comes back after a restart). Uses the
 /// login saved in Windows for that server.
 fn map(letter: &str, remote: &str) -> Result<(), u32> {
@@ -167,6 +197,8 @@ fn map(letter: &str, remote: &str) -> Result<(), u32> {
         let _ = WNetCancelConnection2W(PCWSTR(l.as_ptr()), CONNECT_UPDATE_PROFILE, BOOL(1));
         let res = NETRESOURCEW { dwType: RESOURCETYPE_DISK, lpLocalName: PWSTR(l.as_mut_ptr()), lpRemoteName: PWSTR(r.as_mut_ptr()), ..Default::default() };
         let e = WNetAddConnection2W(&res, PCWSTR::null(), PCWSTR::null(), CONNECT_UPDATE_PROFILE);
+        // Either way the letter changed underneath open windows: let them refresh.
+        announce(letter, e == ERROR_SUCCESS);
         if e == ERROR_SUCCESS { Ok(()) } else { Err(e.0) }
     }
 }
