@@ -20,6 +20,7 @@ mod cloak;
 mod config;
 mod launcher;
 mod layout;
+mod netdrives;
 mod overview;
 mod preview;
 mod settings;
@@ -994,6 +995,9 @@ enum MenuAction {
     EditConfig,
     ReloadConfig,
     Autostart(bool),
+    DrivesHome,
+    DrivesEdit,
+    DrivesCreate,
     Exit,
 }
 
@@ -1035,6 +1039,27 @@ pub(crate) fn show_menu(hwnd: HWND) {
         e.push(("Show all windows (reset)".into(), Some(MenuAction::RevealAll), false));
         e.push(("Settings…".into(), Some(MenuAction::Settings), false));
         e.push(("Edit config file…".into(), Some(MenuAction::EditConfig), false));
+        // Network drives (home / away paths).
+        match netdrives::summary() {
+            Some((place, drives)) => {
+                let where_ = match place {
+                    netdrives::Place::Home => "at home",
+                    netdrives::Place::Away => "away from home",
+                    netdrives::Place::Offline => "offline",
+                };
+                e.push((String::new(), None, false));
+                e.push((format!("Network drives: {where_}"), None, false));
+                for (line, _) in drives {
+                    e.push((format!("    {}", line.replace('&', "&&")), None, false));
+                }
+                if place == netdrives::Place::Away {
+                    e.push(("    This network is home".into(), Some(MenuAction::DrivesHome), false));
+                }
+                e.push(("    Edit network drives…".into(), Some(MenuAction::DrivesEdit), false));
+                e.push((String::new(), None, false));
+            }
+            None => e.push(("Set up network drives (home / away)…".into(), Some(MenuAction::DrivesCreate), false)),
+        }
         e.push(("Reload config".into(), Some(MenuAction::ReloadConfig), false));
         let auto = autostart_enabled();
         e.push(("Start with Windows".into(), Some(MenuAction::Autostart(!auto)), auto));
@@ -1111,6 +1136,21 @@ pub(crate) fn show_menu(hwnd: HWND) {
                 }
             }
             Some(MenuAction::Autostart(on)) => set_autostart(*on),
+            Some(MenuAction::DrivesHome) => {
+                if let Err(e) = netdrives::mark_home() {
+                    message(&e, true);
+                }
+            }
+            Some(MenuAction::DrivesCreate) | Some(MenuAction::DrivesEdit) => {
+                if matches!(entries[idx - 1].1, Some(MenuAction::DrivesCreate)) {
+                    if let Err(e) = netdrives::create_from_current() {
+                        message(&format!("Couldn't create drives.ini: {e}"), true);
+                        return;
+                    }
+                }
+                let p = wide(&netdrives::path().display().to_string());
+                ShellExecuteW(None, w!("open"), w!("notepad.exe"), PCWSTR(p.as_ptr()), None, SW_SHOWNORMAL);
+            }
             Some(MenuAction::Exit) => {
                 let _ = DestroyWindow(hwnd);
             }
@@ -1237,6 +1277,9 @@ unsafe extern "system" fn main_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
         }
         status::WM_STATUS => {
             with_app(|app| {
+                if wp.0 == status::STATUS_NET {
+                    netdrives::schedule_check(); // joined another network? (debounced, off the UI thread)
+                }
                 if wp.0 == status::STATUS_NET && !app.status.refresh_net() {
                     return;
                 }
@@ -1575,6 +1618,7 @@ fn main() {
         APP.with(|a| *a.borrow_mut() = Some(app));
         let _ = RegisterShellHookWindow(main);
         winkey::start(main);
+        netdrives::schedule_check();
         if tailscale::installed() {
             let m = main.0 as isize;
             tailscale::start(move || {
