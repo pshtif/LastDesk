@@ -154,7 +154,7 @@ pub unsafe extern "system" fn tip_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPA
             SetBkMode(hdc, TRANSPARENT);
             if is_table(&text) {
                 let mut y = pad;
-                for line in text.lines() {
+                for (n, line) in text.lines().enumerate() {
                     let (_, lh) = measure(hdc, line.split('\t').next().unwrap_or(line));
                     let row = |s: &str, color: COLORREF, right: bool| {
                         let mut w: Vec<u16> = s.encode_utf16().collect();
@@ -167,7 +167,8 @@ pub unsafe extern "system" fn tip_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPA
                     };
                     match line.split_once('\t') {
                         Some((a, b)) => {
-                            row(a, ui::MUTED, false);
+                            // The first row is the total: its label stands out from the rest.
+                            row(a, if n == 0 { ui::TEXT } else { ui::MUTED }, false);
                             row(b, ui::ACCENT, true);
                         }
                         None => row(line, ui::TEXT, false),
