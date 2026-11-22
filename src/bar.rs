@@ -133,6 +133,7 @@ pub enum Hit {
     Workspace(usize),
     Launcher(usize),
     Tailscale,
+    Memory,
     Window(isize),
     TrayIcon(usize),
     Tray,
@@ -176,6 +177,8 @@ pub struct Bar {
     pub tray: RECT,
     /// Microphone / camera in-use icons (zero width when nothing is in use).
     pub privacy: RECT,
+    /// Memory meter (zero width when turned off).
+    pub mem: RECT,
     /// Tailscale icon (zero width when Tailscale isn't installed).
     pub ts: RECT,
     pub net: RECT,
@@ -439,6 +442,9 @@ impl Bar {
         if contains(&self.privacy, x, y) {
             return Hit::Privacy;
         }
+        if contains(&self.mem, x, y) {
+            return Hit::Memory;
+        }
         if contains(&self.ts, x, y) {
             return Hit::Tailscale;
         }
@@ -591,6 +597,7 @@ impl App {
                 tray: RECT::default(),
                 privacy: RECT::default(),
                 ts: RECT::default(),
+                mem: RECT::default(),
                 net: RECT::default(),
                 vol: RECT::default(),
                 battery: RECT::default(),
@@ -880,7 +887,9 @@ impl App {
             let n_priv = (!self.status.mic.is_empty()) as i32 + (!self.status.cam.is_empty()) as i32;
             let ts_w = if crate::tailscale::active() { icon_w } else { 0 };
             b.ts = RECT { left: b.net.left - ts_w, top: s(3.0), right: b.net.left, bottom: h - s(3.0) };
-            b.privacy = RECT { left: b.ts.left - icon_w * n_priv, top: s(3.0), right: b.ts.left, bottom: h - s(3.0) };
+            let mem_w = if self.config.memory { s(70.0) } else { 0 };
+            b.mem = RECT { left: b.ts.left - mem_w, top: s(3.0), right: b.ts.left, bottom: h - s(3.0) };
+            b.privacy = RECT { left: b.mem.left - icon_w * n_priv, top: s(3.0), right: b.mem.left, bottom: h - s(3.0) };
             let mut ix = b.privacy.left - s(4.0);
             let mut tray_icons: Vec<(u32, u32, RECT)> = icons
                 .iter()
@@ -1169,6 +1178,20 @@ impl App {
                     }
                 }
             }
+            // Memory meter: "RAM 62%", orange when memory is getting full, red when it's nearly gone.
+            if b.mem.right > b.mem.left {
+                if b.hover == Hit::Memory {
+                    ui::fill_round(mem, b.mem, s(6.0), hover_bg);
+                }
+                if let Some(p) = crate::mem::percent() {
+                    let color = if p >= 93 { ui::rgb(0xF0, 0x6A, 0x5A) } else if p >= 85 { ATTENTION } else { ui::TEXT };
+                    let mid = b.mem.left + (b.mem.right - b.mem.left) * 45 / 100;
+                    let mut lr = RECT { right: mid, ..b.mem };
+                    ui::draw_text(mem, "RAM", &mut lr, ui::MUTED, f_text);
+                    let mut vr = RECT { left: mid, ..b.mem };
+                    ui::draw_text(mem, &format!("{p}%"), &mut vr, color, f_text);
+                }
+            }
             // Tailscale: a 3×3 grid of dots with a bright "T" when connected (dim when not,
             // accent colour when using an exit node, orange when it needs a login).
             if b.ts.right > b.ts.left {
@@ -1354,6 +1377,7 @@ impl App {
                     State::Unavailable => "Tailscale: service not running".into(),
                 })
             }
+            Hit::Memory => Some(crate::mem::summary()),
             Hit::Battery => {
                 let mut ps = SYSTEM_POWER_STATUS::default();
                 let mut parts = Vec::new();
@@ -1383,6 +1407,7 @@ impl App {
             Hit::Network => b.net,
             Hit::Privacy => b.privacy,
             Hit::Tailscale => b.ts,
+            Hit::Memory => b.mem,
             Hit::Battery => b.battery,
             _ => return,
         };
@@ -1399,7 +1424,7 @@ impl App {
             unsafe {
                 let _ = InvalidateRect(self.bars[i].hwnd, None, false);
             }
-            if matches!(self.bars[i].hover, Hit::Volume | Hit::Network | Hit::Privacy | Hit::Tailscale | Hit::Battery) && TIP.with(|t| unsafe { IsWindowVisible(t.borrow().0).as_bool() }) {
+            if matches!(self.bars[i].hover, Hit::Volume | Hit::Network | Hit::Privacy | Hit::Tailscale | Hit::Memory | Hit::Battery) && TIP.with(|t| unsafe { IsWindowVisible(t.borrow().0).as_bool() }) {
                 self.show_status_tip(i, self.bars[i].hover);
             }
         }
@@ -1422,7 +1447,7 @@ impl App {
 
     pub fn bar_show_tip(&mut self, hwnd: HWND) {
         let Some(i) = self.bar_index(hwnd) else { return };
-        if matches!(self.bars[i].hover, Hit::Volume | Hit::Network | Hit::Privacy | Hit::Tailscale | Hit::Battery) {
+        if matches!(self.bars[i].hover, Hit::Volume | Hit::Network | Hit::Privacy | Hit::Tailscale | Hit::Memory | Hit::Battery) {
             self.show_status_tip(i, self.bars[i].hover);
             return;
         }
@@ -1578,7 +1603,7 @@ impl App {
                 unsafe {
                     SetTimer(hwnd, TIP_TIMER, 450, None);
                 }
-            } else if matches!(hit, Hit::Volume | Hit::Network | Hit::Privacy | Hit::Tailscale | Hit::Battery | Hit::Launcher(_)) {
+            } else if matches!(hit, Hit::Volume | Hit::Network | Hit::Privacy | Hit::Tailscale | Hit::Memory | Hit::Battery | Hit::Launcher(_)) {
                 unsafe {
                     SetTimer(hwnd, TIP_TIMER, 450, None);
                 }
@@ -1707,6 +1732,11 @@ impl App {
                     }
                 });
                 return Some(vec![VK_LWIN, VIRTUAL_KEY(b'A' as u16)]);
+            }
+            Hit::Memory if !middle => {
+                hide_tip();
+                // Ctrl+Shift+Esc: Task Manager (opens on the processes list).
+                return Some(vec![VK_CONTROL, VK_SHIFT, VK_ESCAPE]);
             }
             Hit::Clock if !middle => {
                 place_flyout(w!("Notification Centre"), self.monitors[m].work);

@@ -20,6 +20,7 @@ mod cloak;
 mod config;
 mod launcher;
 mod layout;
+mod mem;
 mod netdrives;
 mod overview;
 mod preview;
@@ -571,6 +572,8 @@ impl App {
         self.taskbar_apply();
         self.tray_apply();
         self.integrations_apply();
+        // Bar items may have been switched on or off (memory meter…): lay the bar out again.
+        self.bars_refresh();
         let failed = self.register_hotkeys();
         if !failed.is_empty() {
             problems.push(format!("These shortcuts are used by another app and won't work: {}", failed.join(", ")));

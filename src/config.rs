@@ -64,6 +64,8 @@ pub struct Config {
     pub align: Align,
     pub hide_taskbar: bool,
     pub tray: bool,
+    /// Memory meter in the bar.
+    pub memory: bool,
     /// Tailscale status and menu in the bar (if Tailscale is installed).
     pub tailscale: bool,
     /// The Win key opens Start on the monitor you're on (needs a keyboard hook).
@@ -201,6 +203,7 @@ pub fn parse(text: &str) -> Config {
         align: Align::Left,
         hide_taskbar: false,
         tray: true,
+        memory: false,
         tailscale: false,
         win_key_start: false,
         errors: Vec::new(),
@@ -284,6 +287,10 @@ pub fn parse(text: &str) -> Config {
                 Some(b) => c.tray = b,
                 None => bad(),
             },
+            ("bar", "memory") => match bool_of(val) {
+                Some(b) => c.memory = b,
+                None => bad(),
+            },
             ("bar", "tailscale") => match bool_of(val) {
                 Some(b) => c.tailscale = b,
                 None => bad(),
@@ -352,6 +359,8 @@ pub fn render(c: &Config) -> String {
     s.push_str(&format!("hide_taskbar = {}\n", c.hide_taskbar));
     s.push_str("# Show apps' tray icons in the LastDesk bar.\n");
     s.push_str(&format!("tray = {}\n", c.tray));
+    s.push_str("# Memory use in the bar (hover for the apps using the most).\n");
+    s.push_str(&format!("memory = {}\n", c.memory));
     s.push_str("# Tailscale status and menu in the bar, if Tailscale is installed (replaces its tray app).\n");
     s.push_str(&format!("tailscale = {}\n", c.tailscale));
     s.push_str("# The Win key opens Start on the monitor you're on (uses a keyboard hook that only looks at the Win key).\n");
@@ -416,11 +425,11 @@ mod tests {
         assert_eq!((back.bar_edge, back.icons_only, back.align), (Edge::Bottom, true, Align::Right));
         assert!(back.hide_taskbar && !back.tray);
         // Integrations: off unless turned on, and kept when saved.
-        assert!(!back.tailscale && !back.win_key_start);
-        let mut on = parse("[bar]\ntailscale = true\nwin_key_start = true\n");
+        assert!(!back.tailscale && !back.win_key_start && !back.memory);
+        let mut on = parse("[bar]\ntailscale = true\nwin_key_start = true\nmemory = true\n");
         on.errors.clear();
         let on_back = parse(&render(&on));
-        assert!(on_back.tailscale && on_back.win_key_start && on_back.errors.is_empty());
+        assert!(on_back.tailscale && on_back.win_key_start && on_back.memory && on_back.errors.is_empty());
         assert_eq!(back.pinned_apps, vec!["spotify".to_string()]);
         assert_eq!((back.rules[0].monitor, back.rules[0].workspace), (1, 2));
     }
