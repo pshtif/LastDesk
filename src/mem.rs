@@ -71,9 +71,9 @@ mod tests {
 pub fn summary() -> String {
     let Some((used, total)) = usage() else { return "Memory".into() };
     let mut s = format!("Memory: {} of {} in use ({}%)", gb(used), gb(total), used * 100 / total.max(1));
+    // "name<TAB>amount": the tooltip draws these as a table (name left, amount right).
     for (name, b) in top(5) {
-        s.push_str(&format!("\n{name}  {}", gb(b)));
+        s.push_str(&format!("\n{name}\t{}", gb(b)));
     }
-    s.push_str("\nClick for Task Manager");
     s
 }

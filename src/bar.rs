@@ -72,9 +72,28 @@ fn show_tip(text: &str, anchor: POINT, scale: f32, above: bool) {
         let dc = GetDC(hwnd);
         let f = tip_font(scale);
         let old = SelectObject(dc, f);
-        let mut w: Vec<u16> = text.encode_utf16().collect();
-        let mut r = RECT { left: 0, top: 0, right: (420.0 * scale) as i32, bottom: 0 };
-        DrawTextW(dc, &mut w, &mut r, DT_CALCRECT | DT_NOPREFIX | DT_WORDBREAK);
+        let r = if is_table(text) {
+            // Table: widest row (label + gap + value), one line per row.
+            let (mut wmax, mut lh) = (0, 0);
+            for line in text.lines() {
+                let (lw, h) = match line.split_once('\t') {
+                    Some((a, b)) => {
+                        let (aw, ah) = measure(dc, a);
+                        let (bw, _) = measure(dc, b);
+                        (aw + tip_col_gap(scale) + bw, ah)
+                    }
+                    None => measure(dc, line),
+                };
+                wmax = wmax.max(lw);
+                lh = lh.max(h);
+            }
+            RECT { left: 0, top: 0, right: wmax, bottom: lh * text.lines().count() as i32 }
+        } else {
+            let mut w: Vec<u16> = text.encode_utf16().collect();
+            let mut r = RECT { left: 0, top: 0, right: (420.0 * scale) as i32, bottom: 0 };
+            DrawTextW(dc, &mut w, &mut r, DT_CALCRECT | DT_NOPREFIX | DT_WORDBREAK);
+            r
+        };
         SelectObject(dc, old);
         let _ = DeleteObject(f);
         ReleaseDC(hwnd, dc);
@@ -85,6 +104,27 @@ fn show_tip(text: &str, anchor: POINT, scale: f32, above: bool) {
         let _ = SetWindowPos(hwnd, HWND_TOPMOST, x, y, tw, th, SWP_NOACTIVATE | SWP_SHOWWINDOW);
         let _ = InvalidateRect(hwnd, None, true);
     }
+}
+
+/// A tooltip with "label\tvalue" lines is drawn as a table: label left (muted), value right
+/// (accent blue). Lines without a tab are plain rows (headers, notes).
+fn is_table(text: &str) -> bool {
+    text.lines().any(|l| l.contains('\t'))
+}
+
+fn tip_col_gap(scale: f32) -> i32 {
+    (24.0 * scale) as i32
+}
+
+/// Width and height of one line of text in the selected font.
+unsafe fn measure(dc: HDC, s: &str) -> (i32, i32) {
+    let mut w: Vec<u16> = s.encode_utf16().collect();
+    let mut r = RECT::default();
+    if w.is_empty() {
+        w.push(' ' as u16);
+    }
+    DrawTextW(dc, &mut w, &mut r, DT_CALCRECT | DT_NOPREFIX | DT_SINGLELINE);
+    (r.right - r.left, r.bottom - r.top)
 }
 
 fn hide_tip() {
@@ -112,10 +152,34 @@ pub unsafe extern "system" fn tip_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPA
             let old = SelectObject(hdc, f);
             SetTextColor(hdc, ui::TEXT);
             SetBkMode(hdc, TRANSPARENT);
-            let mut w: Vec<u16> = text.encode_utf16().collect();
-            let mut tr = RECT { left: pad, top: pad, right: r.right - pad, bottom: r.bottom - pad };
-            if !w.is_empty() {
-                DrawTextW(hdc, &mut w, &mut tr, DT_NOPREFIX | DT_WORDBREAK);
+            if is_table(&text) {
+                let mut y = pad;
+                for line in text.lines() {
+                    let (_, lh) = measure(hdc, line.split('\t').next().unwrap_or(line));
+                    let row = |s: &str, color: COLORREF, right: bool| {
+                        let mut w: Vec<u16> = s.encode_utf16().collect();
+                        if w.is_empty() {
+                            return;
+                        }
+                        SetTextColor(hdc, color);
+                        let mut rr = RECT { left: pad, top: y, right: r.right - pad, bottom: y + lh };
+                        DrawTextW(hdc, &mut w, &mut rr, DT_NOPREFIX | DT_SINGLELINE | DT_VCENTER | if right { DT_RIGHT } else { DT_LEFT });
+                    };
+                    match line.split_once('\t') {
+                        Some((a, b)) => {
+                            row(a, ui::MUTED, false);
+                            row(b, ui::ACCENT, true);
+                        }
+                        None => row(line, ui::TEXT, false),
+                    }
+                    y += lh;
+                }
+            } else {
+                let mut w: Vec<u16> = text.encode_utf16().collect();
+                let mut tr = RECT { left: pad, top: pad, right: r.right - pad, bottom: r.bottom - pad };
+                if !w.is_empty() {
+                    DrawTextW(hdc, &mut w, &mut tr, DT_NOPREFIX | DT_WORDBREAK);
+                }
             }
             SelectObject(hdc, old);
             let _ = DeleteObject(f);
