@@ -78,6 +78,8 @@ struct Ctl {
     scale: f32,
     hover: Option<usize>,
     tracking: bool,
+    /// The left button went down on this control (a click needs press and release here).
+    pressed: bool,
 }
 
 struct State {
@@ -369,15 +371,30 @@ pub unsafe extern "system" fn ctl_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPA
                 if let Some(ctl) = c.borrow_mut().get_mut(&key) {
                     ctl.hover = None;
                     ctl.tracking = false;
+                    ctl.pressed = false; // dragged off: releasing elsewhere isn't a click
                 }
             });
             let _ = InvalidateRect(hwnd, None, false);
+            LRESULT(0)
+        }
+        WM_LBUTTONDOWN => {
+            // A click counts only if it also started here (like a normal button): when a
+            // section opens under the mouse, the button-up lands on a control that just
+            // appeared there and must not flip it.
+            CTLS.with(|c| {
+                if let Some(ctl) = c.borrow_mut().get_mut(&key) {
+                    ctl.pressed = true;
+                }
+            });
             LRESULT(0)
         }
         WM_LBUTTONUP => {
             let changed = CTLS.with(|c| {
                 let mut c = c.borrow_mut();
                 let Some(ctl) = c.get_mut(&key) else { return false };
+                if !std::mem::replace(&mut ctl.pressed, false) {
+                    return false; // the press began somewhere else
+                }
                 let scale = ctl.scale;
                 match &mut ctl.kind {
                     Kind::Toggle { on, .. } => {
@@ -481,7 +498,7 @@ pub fn open() {
                 None,
             )
             .unwrap_or_default();
-            CTLS.with(|m| m.borrow_mut().insert(c.0 as isize, Ctl { kind, scale: sc, hover: None, tracking: false }));
+            CTLS.with(|m| m.borrow_mut().insert(c.0 as isize, Ctl { kind, scale: sc, hover: None, tracking: false, pressed: false }));
             let _ = InvalidateRect(c, None, false);
         };
         let label = |text: &str, y: i32| {
