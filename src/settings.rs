@@ -492,7 +492,8 @@ pub fn open() {
         let header = |text: &str, y: i32| {
             let i = heads.borrow().len();
             let open = OPEN.with(|o| o.borrow().get(i).copied().unwrap_or(false));
-            let h = native(w!("STATIC"), &section_title(text, open), 0x0100, 20, y, 500, 26, ID_SECTION + i as i32, bold);
+            // SS_NOTIFY (clickable) | SS_CENTERIMAGE (text centred vertically in the band).
+            let h = native(w!("STATIC"), &section_title(text, open), 0x0100 | 0x0200, 12, y, 536, 30, ID_SECTION + i as i32, bold);
             heads.borrow_mut().push((h, s(y), text.to_string()));
         };
         let seg = |id: i32, choices: &[(&str, &str)], current: &str, y: i32| {
@@ -665,9 +666,13 @@ pub fn open() {
     }
 }
 
-/// "▾ Bar" (open) / "▸ Bar" (closed).
+/// "▾ Bar" (open) / "▸ Bar" (closed), indented inside the header band.
 fn section_title(title: &str, open: bool) -> String {
-    format!("{}  {title}", if open { "\u{25BE}" } else { "\u{25B8}" })
+    format!("   {}   {title}", if open { "\u{25BE}" } else { "\u{25B8}" })
+}
+
+fn section_is_open(i: usize) -> bool {
+    OPEN.with(|o| o.borrow().get(i).copied().unwrap_or(false))
 }
 
 struct Section {
@@ -760,19 +765,21 @@ unsafe fn relayout(hwnd: HWND, center: Option<RECT>) {
     let _ = InvalidateRect(hwnd, None, true);
 }
 
-/// A section header was clicked: fold it open / closed.
+/// A section header was clicked. Accordion: opening a section closes the one that was open;
+/// clicking the open one closes it.
 unsafe fn toggle_section(hwnd: HWND, i: usize) {
-    let open = OPEN.with(|o| {
+    let headers: Vec<(HWND, String)> = LAYOUT.with(|l| l.borrow().as_ref().map(|l| l.sections.iter().map(|s| (s.header, s.title.clone())).collect()).unwrap_or_default());
+    let opening = !section_is_open(i);
+    OPEN.with(|o| {
         let mut o = o.borrow_mut();
-        if o.len() <= i {
-            o.resize(i + 1, false);
-        }
-        o[i] = !o[i];
-        o[i]
+        o.clear();
+        o.resize(headers.len().max(i + 1), false);
+        o[i] = opening;
     });
-    if let Some((h, title)) = LAYOUT.with(|l| l.borrow().as_ref().and_then(|l| l.sections.get(i).map(|s| (s.header, s.title.clone())))) {
-        let t = wide(&section_title(&title, open));
-        let _ = SetWindowTextW(h, PCWSTR(t.as_ptr()));
+    for (n, (h, title)) in headers.iter().enumerate() {
+        let t = wide(&section_title(title, section_is_open(n)));
+        let _ = SetWindowTextW(*h, PCWSTR(t.as_ptr()));
+        let _ = InvalidateRect(*h, None, true); // colour depends on open / closed
     }
     relayout(hwnd, None);
 }
@@ -849,6 +856,21 @@ pub unsafe extern "system" fn settings_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp
                 set_toggle(ID_TWEAK + i as i32, t.is_on());
             }
             LRESULT(0)
+        }
+        WM_CTLCOLORSTATIC if (ID_SECTION..ID_SECTION + 20).contains(&GetDlgCtrlID(HWND(lp.0 as *mut _))) => {
+            // Section header: a lighter band; the open section's title in the accent colour.
+            let hdc = HDC(wp.0 as *mut _);
+            let i = (GetDlgCtrlID(HWND(lp.0 as *mut _)) - ID_SECTION) as usize;
+            SetTextColor(hdc, if section_is_open(i) { ui::ACCENT } else { ui::TEXT });
+            SetBkMode(hdc, OPAQUE);
+            SetBkColor(hdc, FIELD);
+            LRESULT(SETTINGS.with(|s| s.borrow().as_ref().map(|s| s.field).unwrap_or_default()).0 as isize)
+        }
+        WM_SETCURSOR if (ID_SECTION..ID_SECTION + 20).contains(&GetDlgCtrlID(HWND(wp.0 as *mut _))) => {
+            if let Ok(c) = LoadCursorW(None, IDC_HAND) {
+                SetCursor(c);
+            }
+            LRESULT(1)
         }
         WM_CTLCOLORSTATIC => {
             let hdc = HDC(wp.0 as *mut _);
