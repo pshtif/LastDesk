@@ -50,6 +50,8 @@ const ID_WINKEY: i32 = 119;
 const ID_MEMORY: i32 = 120;
 /// Windows tweaks: ID_TWEAK + index into tweaks::ALL.
 const ID_TWEAK: i32 = 130;
+/// Section headers: ID_SECTION + section index.
+const ID_SECTION: i32 = 150;
 
 const EN_KILLFOCUS: u32 = 0x0200;
 const WM_MOUSELEAVE: u32 = 0x02A3;
@@ -96,6 +98,10 @@ thread_local! {
     static CTLS: RefCell<HashMap<isize, Ctl>> = RefCell::new(HashMap::new());
     /// (content height, current scroll position) when the window is taller than the screen.
     static SCROLL: std::cell::Cell<(i32, i32)> = const { std::cell::Cell::new((0, 0)) };
+    /// Which sections are open (by index). Kept while LastDesk runs, so reopening Settings
+    /// shows the same sections open.
+    static OPEN: RefCell<Vec<bool>> = const { RefCell::new(Vec::new()) };
+    static LAYOUT: RefCell<Option<Layout>> = const { RefCell::new(None) };
 }
 
 /// Scroll the settings window's contents to `pos` (clamped), moving the controls.
@@ -481,8 +487,13 @@ pub fn open() {
         let label = |text: &str, y: i32| {
             native(w!("STATIC"), text, 0, 28, y + 7, 200, 20, -1, font);
         };
+        // Section headers are clickable (SS_NOTIFY) and fold their section open / closed.
+        let heads: RefCell<Vec<(HWND, i32, String)>> = RefCell::new(Vec::new());
         let header = |text: &str, y: i32| {
-            native(w!("STATIC"), text, 0, 20, y, 500, 24, -1, bold);
+            let i = heads.borrow().len();
+            let open = OPEN.with(|o| o.borrow().get(i).copied().unwrap_or(false));
+            let h = native(w!("STATIC"), &section_title(text, open), 0x0100, 20, y, 500, 26, ID_SECTION + i as i32, bold);
+            heads.borrow_mut().push((h, s(y), text.to_string()));
         };
         let seg = |id: i32, choices: &[(&str, &str)], current: &str, y: i32| {
             let mut options: Vec<String> = choices.iter().map(|c| c.0.to_string()).collect();
@@ -607,37 +618,163 @@ pub fn open() {
         edit(ID_RULES, &rules.join("\r\n"), 28, y, 504, 64, true);
         y += 80;
 
+        let footer_y = y;
         native(w!("STATIC"), "Changes are saved and applied as you make them.", 0, 28, y, 504, 20, ID_STATUS, font);
         y += 30;
         custom(Kind::Button { label: "Open config file".into(), accent: false }, 28, y, 150, 34, ID_OPEN);
         custom(Kind::Button { label: "Close".into(), accent: true }, 432, y, 100, 34, ID_CLOSE);
         y += 34 + 20;
 
-        // Fit the window to the content, centred on the monitor. Taller than the screen: the
-        // window gets a scroll bar (and the mouse wheel scrolls it).
-        let content = s(y);
-        let mut r = RECT { left: 0, top: 0, right: s(560), bottom: content };
-        let _ = AdjustWindowRectEx(&mut r, style, false, WS_EX_CONTROLPARENT);
-        let (mut ww, wh) = (r.right - r.left, r.bottom - r.top);
-        let wa = mi.rcWork;
-        let fits = wh <= wa.bottom - wa.top;
-        if !fits {
-            let _ = SetWindowLongPtrW(hwnd, GWL_STYLE, (style | WS_VSCROLL).0 as isize);
-            ww += windows::Win32::UI::HiDpi::GetSystemMetricsForDpi(SM_CXVSCROLL, (96.0 * sc) as u32);
+        // Which controls belong to which section (by where they were placed), so sections
+        // can fold: every child below a header and above the next one is that section's.
+        let heads = heads.into_inner();
+        let mut children: Vec<HWND> = Vec::new();
+        unsafe extern "system" fn collect(h: HWND, l: LPARAM) -> BOOL {
+            (*(l.0 as *mut Vec<HWND>)).push(h);
+            TRUE
         }
-        let x = wa.left + ((wa.right - wa.left) - ww) / 2;
-        let yy = (wa.top + ((wa.bottom - wa.top) - wh) / 2).max(wa.top);
-        let _ = SetWindowPos(hwnd, None, x, yy, ww, wh.min(wa.bottom - wa.top), SWP_NOZORDER | SWP_FRAMECHANGED);
-        SCROLL.with(|sc| sc.set((content, 0)));
-        if !fits {
-            let mut cr = RECT::default();
-            let _ = GetClientRect(hwnd, &mut cr);
-            let si = SCROLLINFO { cbSize: std::mem::size_of::<SCROLLINFO>() as u32, fMask: SIF_RANGE | SIF_PAGE | SIF_POS, nMin: 0, nMax: content - 1, nPage: (cr.bottom - cr.top) as u32, nPos: 0, nTrackPos: 0 };
-            windows::Win32::UI::Controls::SetScrollInfo(hwnd, SB_VERT, &si, true);
+        let _ = EnumChildWindows(hwnd, Some(collect), LPARAM(&mut children as *mut _ as isize));
+        let top_of = |c: HWND| {
+            let mut r = RECT::default();
+            let _ = GetWindowRect(c, &mut r);
+            let mut p = POINT { x: r.left, y: r.top };
+            let _ = ScreenToClient(hwnd, &mut p);
+            p.y
+        };
+        let fy = s(footer_y);
+        let mut layout = Layout { sections: Vec::new(), footer: Vec::new(), footer_h: s(y) - fy, top: heads.first().map(|h| h.1).unwrap_or(0), scale: sc, style };
+        for (i, (h, hy, title)) in heads.iter().enumerate() {
+            let next = heads.get(i + 1).map(|n| n.1).unwrap_or(fy);
+            layout.sections.push(Section { header: *h, title: title.clone(), items: Vec::new(), full: next - hy });
         }
+        for c in children {
+            if heads.iter().any(|h| h.0 == c) || GetParent(c).unwrap_or_default() != hwnd {
+                continue;
+            }
+            let cy = top_of(c);
+            if cy >= fy {
+                layout.footer.push((c, cy - fy));
+            } else if let Some(i) = heads.iter().rposition(|h| h.1 <= cy) {
+                layout.sections[i].items.push((c, cy - heads[i].1));
+            }
+        }
+        LAYOUT.with(|l| *l.borrow_mut() = Some(layout));
+        relayout(hwnd, Some(mi.rcWork));
         let _ = ShowWindow(hwnd, SW_SHOW);
         let _ = SetForegroundWindow(hwnd);
     }
+}
+
+/// "▾ Bar" (open) / "▸ Bar" (closed).
+fn section_title(title: &str, open: bool) -> String {
+    format!("{}  {title}", if open { "\u{25BE}" } else { "\u{25B8}" })
+}
+
+struct Section {
+    header: HWND,
+    title: String,
+    /// Controls and their offset below the header (pixels).
+    items: Vec<(HWND, i32)>,
+    /// Height of the section when open.
+    full: i32,
+}
+
+struct Layout {
+    sections: Vec<Section>,
+    footer: Vec<(HWND, i32)>,
+    footer_h: i32,
+    top: i32,
+    scale: f32,
+    style: WINDOW_STYLE,
+}
+
+/// Place the sections (open ones with their controls, closed ones as just the header), then
+/// size the window to the content: a scroll bar when it's taller than the screen. `center`:
+/// first placement, centred in this work area; otherwise the window keeps its position.
+unsafe fn relayout(hwnd: HWND, center: Option<RECT>) {
+    // Positions below are absolute: undo any scrolling first.
+    let (_, pos) = SCROLL.with(|s| s.get());
+    if pos != 0 {
+        let _ = ScrollWindowEx(hwnd, 0, pos, None, None, None, None, SW_SCROLLCHILDREN);
+    }
+    let Some((content, sc, style)) = LAYOUT.with(|l| {
+        let l = l.borrow();
+        let l = l.as_ref()?;
+        let collapsed = (36.0 * l.scale).round() as i32;
+        let mut y = l.top;
+        let place = |h: HWND, y: i32, show: bool| {
+            let mut r = RECT::default();
+            let _ = GetWindowRect(h, &mut r);
+            let mut p = POINT { x: r.left, y: r.top };
+            let _ = ScreenToClient(hwnd, &mut p);
+            let _ = SetWindowPos(h, None, p.x, y, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | if show { SWP_SHOWWINDOW } else { SWP_HIDEWINDOW });
+        };
+        for (i, s) in l.sections.iter().enumerate() {
+            let open = OPEN.with(|o| o.borrow().get(i).copied().unwrap_or(false));
+            place(s.header, y, true);
+            for (c, off) in &s.items {
+                place(*c, y + off, open);
+            }
+            y += if open { s.full } else { collapsed };
+        }
+        y += (8.0 * l.scale).round() as i32;
+        for (c, off) in &l.footer {
+            place(*c, y + off, true);
+        }
+        Some((y + l.footer_h, l.scale, l.style))
+    }) else { return };
+
+    // Size the window to the content.
+    let hm = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+    let mut mi = MONITORINFO { cbSize: std::mem::size_of::<MONITORINFO>() as u32, ..Default::default() };
+    let _ = GetMonitorInfoW(hm, &mut mi);
+    let wa = center.unwrap_or(mi.rcWork);
+    let mut r = RECT { left: 0, top: 0, right: (560.0 * sc).round() as i32, bottom: content };
+    let _ = AdjustWindowRectEx(&mut r, style, false, WS_EX_CONTROLPARENT);
+    let (mut ww, wh) = (r.right - r.left, r.bottom - r.top);
+    let avail = wa.bottom - wa.top;
+    let fits = wh <= avail;
+    // Only flip the scroll bar bit: the other bits (WS_VISIBLE…) must stay as they are.
+    let cur_style = GetWindowLongPtrW(hwnd, GWL_STYLE) as u32;
+    let new_style = if fits { cur_style & !WS_VSCROLL.0 } else { cur_style | WS_VSCROLL.0 };
+    let _ = SetWindowLongPtrW(hwnd, GWL_STYLE, new_style as isize);
+    if !fits {
+        ww += windows::Win32::UI::HiDpi::GetSystemMetricsForDpi(SM_CXVSCROLL, (96.0 * sc) as u32);
+    }
+    let h = wh.min(avail);
+    let (x, y) = match center {
+        Some(_) => (wa.left + ((wa.right - wa.left) - ww) / 2, (wa.top + (avail - h) / 2).max(wa.top)),
+        None => {
+            let mut cur = RECT::default();
+            let _ = GetWindowRect(hwnd, &mut cur);
+            // Keep the top where it is, unless the window would run off the bottom.
+            (cur.left, cur.top.min(wa.bottom - h).max(wa.top))
+        }
+    };
+    let _ = SetWindowPos(hwnd, None, x, y, ww, h, SWP_NOZORDER | SWP_FRAMECHANGED | SWP_NOACTIVATE);
+    SCROLL.with(|s| s.set((content, 0)));
+    let mut cr = RECT::default();
+    let _ = GetClientRect(hwnd, &mut cr);
+    let si = SCROLLINFO { cbSize: std::mem::size_of::<SCROLLINFO>() as u32, fMask: SIF_RANGE | SIF_PAGE | SIF_POS, nMin: 0, nMax: content - 1, nPage: (cr.bottom - cr.top) as u32, nPos: 0, nTrackPos: 0 };
+    windows::Win32::UI::Controls::SetScrollInfo(hwnd, SB_VERT, &si, true);
+    let _ = InvalidateRect(hwnd, None, true);
+}
+
+/// A section header was clicked: fold it open / closed.
+unsafe fn toggle_section(hwnd: HWND, i: usize) {
+    let open = OPEN.with(|o| {
+        let mut o = o.borrow_mut();
+        if o.len() <= i {
+            o.resize(i + 1, false);
+        }
+        o[i] = !o[i];
+        o[i]
+    });
+    if let Some((h, title)) = LAYOUT.with(|l| l.borrow().as_ref().and_then(|l| l.sections.get(i).map(|s| (s.header, s.title.clone())))) {
+        let t = wide(&section_title(&title, open));
+        let _ = SetWindowTextW(h, PCWSTR(t.as_ptr()));
+    }
+    relayout(hwnd, None);
 }
 
 fn close(hwnd: HWND) {
@@ -661,6 +798,8 @@ pub unsafe extern "system" fn settings_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp
                 }
                 ID_WORKSPACES | ID_ANIM | ID_SWITCH | ID_MOVE | ID_BAR | ID_EDGE | ID_BUTTONS | ID_ALIGN | ID_HIDE_TASKBAR | ID_TRAY | ID_MEMORY | ID_TAILSCALE | ID_WINKEY => apply(),
                 ID_PIN | ID_OVERVIEW | ID_NEXT | ID_PREV | ID_PINNED | ID_RULES if code == EN_KILLFOCUS => apply(),
+                // STN_CLICKED only (a double-click also sends STN_DBLCLK: don't fold twice).
+                i if (ID_SECTION..ID_SECTION + 20).contains(&i) && code == 0 => toggle_section(hwnd, (i - ID_SECTION) as usize),
                 i if (ID_TWEAK..ID_TWEAK + crate::tweaks::ALL.len() as i32).contains(&i) => {
                     let t = crate::tweaks::ALL[(i - ID_TWEAK) as usize];
                     let want = toggle_on(i);

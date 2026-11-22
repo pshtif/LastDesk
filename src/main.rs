@@ -161,12 +161,12 @@ fn copy_wide(dst: &mut [u16], s: &str) {
     dst[w.len()] = 0;
 }
 
-fn monitor_labels(n: usize) -> Vec<&'static str> {
+fn monitor_labels(n: usize) -> Vec<String> {
     match n {
-        1 => vec!["Monitor"],
-        2 => vec!["Left monitor", "Right monitor"],
-        3 => vec!["Left monitor", "Middle monitor", "Right monitor"],
-        _ => (0..n).map(|_| "Monitor").collect(),
+        1 => vec!["Monitor".into()],
+        2 => vec!["Left monitor".into(), "Right monitor".into()],
+        3 => vec!["Left monitor".into(), "Middle monitor".into(), "Right monitor".into()],
+        _ => (1..=n).map(|i| format!("Monitor {i}")).collect(),
     }
 }
 
@@ -1030,37 +1030,89 @@ pub(crate) fn message(text: &str, warn: bool) {
     }
 }
 
+/// One entry of the tray / bar menu: an item (greyed if it has no action), a separator, or a
+/// submenu.
+enum MenuNode {
+    Item(String, Option<MenuAction>, bool),
+    Sep,
+    Sub(String, Vec<MenuNode>, bool),
+}
+
+fn menu_item(label: impl Into<String>, action: MenuAction) -> MenuNode {
+    MenuNode::Item(label.into(), Some(action), false)
+}
+
+/// Create the Win32 menu for `nodes`; actions go into `actions`, command id = index + 1.
+unsafe fn build_menu(nodes: Vec<MenuNode>, actions: &mut Vec<MenuAction>) -> HMENU {
+    let menu = CreatePopupMenu().unwrap_or_default();
+    for n in nodes {
+        match n {
+            MenuNode::Sep => {
+                let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
+            }
+            MenuNode::Item(label, action, checked) => {
+                let mut flags = MF_STRING;
+                if checked {
+                    flags |= MF_CHECKED;
+                }
+                let id = match action {
+                    Some(a) => {
+                        actions.push(a);
+                        actions.len()
+                    }
+                    None => {
+                        flags |= MF_GRAYED;
+                        0
+                    }
+                };
+                let w = wide(&label);
+                let _ = AppendMenuW(menu, flags, id, PCWSTR(w.as_ptr()));
+            }
+            MenuNode::Sub(label, children, checked) => {
+                let sub = build_menu(children, actions);
+                let w = wide(&label);
+                let _ = AppendMenuW(menu, MF_POPUP | if checked { MF_CHECKED } else { MF_UNCHECKED }, sub.0 as usize, PCWSTR(w.as_ptr()));
+            }
+        }
+    }
+    menu
+}
+
 pub(crate) fn show_menu(hwnd: HWND) {
     // Build the model while borrowed, then run the (message-pumping) menu without a borrow.
-    let Some(entries) = with_app(|app| {
+    let Some(nodes) = with_app(|app| {
         app.prune();
         let labels = monitor_labels(app.mons.len());
-        let mut e: Vec<(String, Option<MenuAction>, bool)> = Vec::new(); // label, action, checked
+        let mut top: Vec<MenuNode> = Vec::new();
+        // One submenu per monitor; inside, its workspaces; a workspace with windows is a
+        // submenu of its own (switch to it, or jump straight to one of its windows).
         for m in 0..app.mons.len() {
-            e.push((labels[m].to_string(), None, false));
             let visible = app.visible_on(m);
+            let active = app.mons[m].active;
+            let mut ws_nodes = Vec::new();
             for w in 0..workspaces() {
-                let wins: Vec<isize> = if w == app.mons[m].active {
-                    visible.iter().map(|h| hwnd_key(*h)).collect()
-                } else {
-                    app.mons[m].hidden[w].clone()
-                };
-                let state = if w == app.mons[m].active { "  (shown)" } else if wins.is_empty() { "  (empty)" } else { "" };
-                e.push((format!("    Workspace {}{}", w + 1, state), Some(MenuAction::Go(m, w, None)), w == app.mons[m].active));
-                for k in wins {
-                    let mut t = win::title(key_hwnd(k));
+                let wins: Vec<isize> = if w == active { visible.iter().map(|h| hwnd_key(*h)).collect() } else { app.mons[m].hidden[w].clone() };
+                if wins.is_empty() {
+                    ws_nodes.push(MenuNode::Item(format!("Workspace {}  (empty)", w + 1), Some(MenuAction::Go(m, w, None)), w == active));
+                    continue;
+                }
+                let mut items = vec![menu_item(format!("Switch to workspace {}", w + 1), MenuAction::Go(m, w, None)), MenuNode::Sep];
+                for k in &wins {
+                    let mut t = win::title(key_hwnd(*k));
                     if t.chars().count() > 60 {
                         t = t.chars().take(57).collect::<String>() + "…";
                     }
-                    e.push((format!("            {}", t.replace('&', "&&")), Some(MenuAction::Go(m, w, Some(k))), false));
+                    items.push(menu_item(t.replace('&', "&&"), MenuAction::Go(m, w, Some(*k))));
                 }
+                let count = if wins.len() == 1 { "1 window".to_string() } else { format!("{} windows", wins.len()) };
+                ws_nodes.push(MenuNode::Sub(format!("Workspace {}  ({count})", w + 1), items, w == active));
             }
-            e.push((String::new(), None, false)); // separator
+            top.push(MenuNode::Sub(format!("{}  ·  workspace {}", labels[m], active + 1), ws_nodes, false));
         }
-        e.push(("Overview  (Alt+`)".into(), Some(MenuAction::Overview), false));
-        e.push(("Show all windows (reset)".into(), Some(MenuAction::RevealAll), false));
-        e.push(("Settings…".into(), Some(MenuAction::Settings), false));
-        e.push(("Edit config file…".into(), Some(MenuAction::EditConfig), false));
+        top.push(MenuNode::Sep);
+        top.push(menu_item("Overview  (Alt+`)", MenuAction::Overview));
+        top.push(menu_item("Show all windows (reset)", MenuAction::RevealAll));
+        top.push(MenuNode::Sep);
         // Network drives (home / away paths).
         match netdrives::summary() {
             Some((place, drives)) => {
@@ -1069,54 +1121,39 @@ pub(crate) fn show_menu(hwnd: HWND) {
                     netdrives::Place::Away => "away from home",
                     netdrives::Place::Offline => "offline",
                 };
-                e.push((String::new(), None, false));
-                e.push((format!("Network drives: {where_}"), None, false));
-                for (line, _) in drives {
-                    e.push((format!("    {}", line.replace('&', "&&")), None, false));
-                }
+                let mut items: Vec<MenuNode> = drives.into_iter().map(|(line, _)| MenuNode::Item(line.replace('&', "&&"), None, false)).collect();
+                items.push(MenuNode::Sep);
                 if place == netdrives::Place::Away {
-                    e.push(("    This network is home".into(), Some(MenuAction::DrivesHome), false));
+                    items.push(menu_item("This network is home", MenuAction::DrivesHome));
                 }
-                e.push(("    Edit network drives…".into(), Some(MenuAction::DrivesEdit), false));
-                e.push((String::new(), None, false));
+                items.push(menu_item("Edit network drives…", MenuAction::DrivesEdit));
+                top.push(MenuNode::Sub(format!("Network drives: {where_}"), items, false));
             }
-            None => e.push(("Set up network drives (home / away)…".into(), Some(MenuAction::DrivesCreate), false)),
+            None => top.push(MenuNode::Sub("Network drives".into(), vec![menu_item("Set up (home / away paths)…", MenuAction::DrivesCreate)], false)),
         }
-        e.push(("Reload config".into(), Some(MenuAction::ReloadConfig), false));
+        top.push(MenuNode::Sep);
+        top.push(menu_item("Settings…", MenuAction::Settings));
+        top.push(MenuNode::Sub("Advanced".into(), vec![menu_item("Edit config file…", MenuAction::EditConfig), menu_item("Reload config", MenuAction::ReloadConfig)], false));
         let auto = autostart_enabled();
-        e.push(("Start with Windows".into(), Some(MenuAction::Autostart(!auto)), auto));
-        e.push(("Exit (shows all windows)".into(), Some(MenuAction::Exit), false));
-        e
+        top.push(MenuNode::Item("Start with Windows".into(), Some(MenuAction::Autostart(!auto)), auto));
+        top.push(menu_item("Exit (shows all windows)", MenuAction::Exit));
+        top
     }) else { return };
 
     unsafe {
-        let menu = CreatePopupMenu().unwrap();
-        for (i, (label, action, checked)) in entries.iter().enumerate() {
-            if label.is_empty() {
-                let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
-                continue;
-            }
-            let mut flags = MF_STRING;
-            if action.is_none() {
-                flags |= MF_GRAYED;
-            }
-            if *checked {
-                flags |= MF_CHECKED;
-            }
-            let w = wide(label);
-            let _ = AppendMenuW(menu, flags, i + 1, PCWSTR(w.as_ptr()));
-        }
+        let mut actions: Vec<MenuAction> = Vec::new();
+        let menu = build_menu(nodes, &mut actions);
         let mut pt = POINT::default();
         let _ = GetCursorPos(&mut pt);
         let _ = SetForegroundWindow(hwnd);
         let cmd = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON | TPM_BOTTOMALIGN, pt.x, pt.y, 0, hwnd, None);
         let _ = PostMessageW(hwnd, WM_NULL, WPARAM(0), LPARAM(0));
-        let _ = DestroyMenu(menu);
+        let _ = DestroyMenu(menu); // also destroys the submenus
         let idx = cmd.0 as usize;
-        if idx == 0 || idx > entries.len() {
+        if idx == 0 || idx > actions.len() {
             return;
         }
-        match &entries[idx - 1].1 {
+        match Some(&actions[idx - 1]) {
             Some(MenuAction::Go(m, w, k)) => {
                 with_app(|app| {
                     let target = k.map(key_hwnd);
@@ -1164,7 +1201,7 @@ pub(crate) fn show_menu(hwnd: HWND) {
                 }
             }
             Some(MenuAction::DrivesCreate) | Some(MenuAction::DrivesEdit) => {
-                if matches!(entries[idx - 1].1, Some(MenuAction::DrivesCreate)) {
+                if matches!(actions[idx - 1], MenuAction::DrivesCreate) {
                     if let Err(e) = netdrives::create_from_current() {
                         message(&format!("Couldn't create drives.ini: {e}"), true);
                         return;

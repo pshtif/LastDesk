@@ -512,7 +512,7 @@ impl App {
 
             // Top row: monitor name left, filter / hint centered.
             let mut r = RECT { left: s(28.0), top: s(14.0), right: o.w / 3, bottom: s(46.0) };
-            ui::draw_text_left(mem, labels.get(o.mon).copied().unwrap_or("Monitor"), &mut r, ui::TEXT, f_label);
+            ui::draw_text_left(mem, labels.get(o.mon).map(|s| s.as_str()).unwrap_or("Monitor"), &mut r, ui::TEXT, f_label);
             let mut r = RECT { left: o.w / 4, top: s(14.0), right: o.w * 3 / 4, bottom: s(46.0) };
             if ov.filter.is_empty() {
                 ui::draw_text(mem, "Click to jump · drag to move · type to filter · Esc to close", &mut r, ui::MUTED, f_hint);
