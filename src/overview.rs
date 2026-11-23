@@ -141,8 +141,36 @@ pub(crate) fn window_icon(h: HWND) -> HICON {
         if c != 0 {
             return HICON(c as *mut _);
         }
-        HICON(GetClassLongPtrW(h, GCLP_HICON) as *mut _)
+        let c = GetClassLongPtrW(h, GCLP_HICON);
+        if c != 0 {
+            return HICON(c as *mut _);
+        }
+        store_app_icon(h)
     }
+}
+
+thread_local! {
+    /// Store app icons by AppUserModelID, kept for good (one per app; callers borrow them).
+    static STORE_ICONS: std::cell::RefCell<std::collections::HashMap<String, HICON>> = Default::default();
+}
+
+/// Store apps (Settings, Calculator…) live in a frame window that has no icon of its own;
+/// their icon comes from the app's package, found by the window's AppUserModelID, the way
+/// the taskbar does it.
+fn store_app_icon(h: HWND) -> HICON {
+    let aumid = crate::launcher::window_aumid(h);
+    if aumid.is_empty() {
+        return HICON::default();
+    }
+    STORE_ICONS.with(|cache| {
+        if let Some(i) = cache.borrow().get(&aumid) {
+            return *i;
+        }
+        let icon = crate::launcher::icon(&format!("shell:AppsFolder\\{aumid}"));
+        // Remember misses too, so a window without one isn't looked up on every redraw.
+        cache.borrow_mut().insert(aumid, icon);
+        icon
+    })
 }
 
 impl Overview {
