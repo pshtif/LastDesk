@@ -404,10 +404,14 @@ fn start(notify: impl Fn() + Send + Sync + 'static) {
     // Safety net: re-read every 30 s (an exit node's online state can change without a
     // message on the watch connection).
     let n2 = notify.clone();
-    std::thread::spawn(move || loop {
-        std::thread::sleep(Duration::from_secs(30));
-        if enabled() {
-            refresh(&*n2);
+    std::thread::spawn(move || {
+        let mut stuck_checks = 0;
+        loop {
+            std::thread::sleep(Duration::from_secs(30));
+            if enabled() {
+                recover_if_stuck(&mut stuck_checks);
+                refresh(&*n2);
+            }
         }
     });
     // This connection is what keeps Tailscale connected without its tray app, so if the
@@ -471,6 +475,22 @@ fn start(notify: impl Fn() + Send + Sync + 'static) {
             notify(); // repaint without the icon
         }
     });
+}
+
+/// The service can sit in "NoState" and never connect: after boot it waits for its tray app
+/// to start it (unless unattended), and a failed first contact with the coordination server
+/// isn't always retried. When it has been stuck there for two checks in a row while it is
+/// meant to be connected (wanted running, not logged out), start it the way the tray app
+/// does. A Tailscale turned off on purpose ("Stopped") or needing a login is left alone.
+fn recover_if_stuck(stuck_checks: &mut u32) {
+    let stuck = get_json("/localapi/v0/status?peers=false").is_some_and(|v| v["BackendState"].as_str() == Some("NoState"))
+        && get_json("/localapi/v0/prefs")
+            .is_some_and(|p| p["WantRunning"].as_bool() == Some(true) && p["LoggedOut"].as_bool() != Some(true));
+    *stuck_checks = if stuck { *stuck_checks + 1 } else { 0 };
+    if *stuck_checks >= 2 {
+        *stuck_checks = 0;
+        request("POST", "/localapi/v0/start", Some("{}"));
+    }
 }
 
 fn patch_prefs(json: String) {
