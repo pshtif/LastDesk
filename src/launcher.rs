@@ -101,7 +101,57 @@ pub fn for_window(h: HWND) -> Option<Launcher> {
     let name = display_name(&target).unwrap_or_else(|| stem(&path));
     // Keep the config line parseable.
     let name: String = name.chars().filter(|c| !matches!(c, '=' | '#' | '[' | ']')).collect::<String>().trim().to_lowercase();
-    Some(Launcher { name: if name.is_empty() { stem(&path) } else { name }, target })
+    Some(Launcher { name: if name.is_empty() { stem(&path) } else { name }, target, icon: String::new() })
+}
+
+/// Expand %VARIABLES% in a path.
+fn expand(s: &str) -> String {
+    use windows::Win32::System::Environment::ExpandEnvironmentStringsW;
+    let src = wide(s);
+    let mut buf = vec![0u16; 1024];
+    let n = unsafe { ExpandEnvironmentStringsW(PCWSTR(src.as_ptr()), Some(&mut buf)) } as usize;
+    if n == 0 || n > buf.len() {
+        return s.to_string();
+    }
+    String::from_utf16_lossy(&buf[..n.saturating_sub(1)])
+}
+
+/// The pin's icon: its own icon file if given, else the target's (caller owns it).
+pub fn icon_of(l: &Launcher) -> HICON {
+    use windows::Win32::UI::WindowsAndMessaging::{LoadImageW, IMAGE_ICON, LR_LOADFROMFILE};
+    if !l.icon.is_empty() {
+        let p = expand(&l.icon);
+        let w = wide(&p);
+        let h = if p.to_ascii_lowercase().ends_with(".ico") {
+            unsafe { LoadImageW(None, PCWSTR(w.as_ptr()), IMAGE_ICON, 32, 32, LR_LOADFROMFILE) }.map(|h| HICON(h.0)).unwrap_or_default()
+        } else {
+            icon(&p) // an exe / dll: its icon via the shell
+        };
+        if !h.is_invalid() {
+            return h;
+        }
+    }
+    icon(&l.target)
+}
+
+/// Does window `h` show this web pin? (A browser window shows the page title of its active
+/// tab, e.g. "LastTerminal — Mozilla Firefox".)
+pub fn web_window_matches(l: &Launcher, h: HWND) -> bool {
+    l.is_web() && !l.name.is_empty() && crate::win::title(h).to_lowercase().contains(&l.name.to_lowercase())
+}
+
+/// Open a pin. A web pin whose page is already open in a browser window switches to that
+/// window instead of opening another tab.
+pub fn open(l: &Launcher) {
+    if l.is_web() {
+        if let Some(h) = crate::win::visible_windows().into_iter().find(|h| web_window_matches(l, *h)) {
+            unsafe {
+                windows::Win32::UI::WindowsAndMessaging::SwitchToThisWindow(h, true);
+            }
+            return;
+        }
+    }
+    launch(&l.target);
 }
 
 /// The launcher's icon (32 px; drawn scaled). Caller owns it (DestroyIcon).

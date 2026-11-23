@@ -802,6 +802,10 @@ impl App {
     pub(crate) fn launcher_matches(&self, li: usize, k: isize) -> bool {
         let Some(l) = self.config.launchers.get(li) else { return false };
         let h = key_hwnd(k);
+        // Web app: the browser window showing its page.
+        if l.is_web() {
+            return crate::launcher::web_window_matches(l, h);
+        }
         match l.target.strip_prefix(crate::launcher::APPS_FOLDER) {
             Some(aumid) => self.aumid(h).eq_ignore_ascii_case(aumid),
             None => crate::launcher::stem(&l.target) == self.exe(h),
@@ -810,8 +814,8 @@ impl App {
 
     /// Keep launcher_icons in step with config.launchers.
     fn sync_launcher_icons(&mut self) {
-        let want: Vec<&String> = self.config.launchers.iter().map(|l| &l.target).collect();
-        if self.launcher_icons.len() == want.len() && self.launcher_icons.iter().zip(&want).all(|((t, _), w)| t == *w) {
+        let want: Vec<String> = self.config.launchers.iter().map(|l| l.value()).collect();
+        if self.launcher_icons.len() == want.len() && self.launcher_icons.iter().zip(&want).all(|((t, _), w)| t == w) {
             return;
         }
         for (_, i) in self.launcher_icons.drain(..) {
@@ -821,7 +825,7 @@ impl App {
                 }
             }
         }
-        self.launcher_icons = self.config.launchers.iter().map(|l| (l.target.clone(), crate::launcher::icon(&l.target))).collect();
+        self.launcher_icons = self.config.launchers.iter().map(|l| (l.value(), crate::launcher::icon_of(l))).collect();
     }
 
     /// Pin or unpin window `k`'s app; saves the config.
@@ -1743,7 +1747,7 @@ impl App {
                 if let Some(l) = self.config.launchers.get(li).cloned() {
                     // Open it on this bar's monitor, like Start does.
                     self.note_start_opened(m);
-                    crate::launcher::launch(&l.target);
+                    crate::launcher::open(&l);
                 }
             }
             Hit::Start if !middle => {
@@ -2197,7 +2201,7 @@ fn launcher_menu(li: usize) {
                     let m = crate::win::monitor_name_at_cursor().and_then(|n| app.mon_index(&n)).unwrap_or(0);
                     if let Some(l) = app.config.launchers.get(li).cloned() {
                         app.note_start_opened(m);
-                        crate::launcher::launch(&l.target);
+                        crate::launcher::open(&l);
                     }
                 });
             }

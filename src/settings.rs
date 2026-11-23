@@ -208,7 +208,7 @@ fn gather() -> Config {
             .or_else(|| SETTINGS.with(|s| s.borrow().as_ref().map(|s| s.launchers.clone())))
             .unwrap_or_default()
             .iter()
-            .map(|l| format!("{} = {}", l.name, l.target))
+            .map(|l| format!("{} = {}", l.name, l.value()))
             .collect::<Vec<_>>()
             .join("\n"),
         lines(ID_RULES),

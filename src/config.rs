@@ -21,11 +21,34 @@ pub struct Rule {
     pub workspace: usize,
 }
 
-/// A pinned app button on the bar. `target` is an exe path or "shell:AppsFolder\<AUMID>".
+/// A pinned app button on the bar. `target` is an exe path, "shell:AppsFolder\<AUMID>" or a
+/// web address (a web app, e.g. LastTerminal at http://127.0.0.1:3101). `icon`: optional icon
+/// file (.ico / .exe), environment variables allowed; empty = the target's own icon.
 #[derive(Clone, PartialEq, Debug)]
 pub struct Launcher {
     pub name: String,
     pub target: String,
+    pub icon: String,
+}
+
+impl Launcher {
+    /// "target" or "target | icon", as written in the config.
+    pub fn value(&self) -> String {
+        if self.icon.is_empty() { self.target.clone() } else { format!("{} | {}", self.target, self.icon) }
+    }
+
+    fn parse(name: &str, val: &str) -> Launcher {
+        let (target, icon) = match val.split_once('|') {
+            Some((t, i)) => (t.trim(), i.trim()),
+            None => (val.trim(), ""),
+        };
+        Launcher { name: name.to_string(), target: target.to_string(), icon: icon.to_string() }
+    }
+
+    pub fn is_web(&self) -> bool {
+        let t = self.target.to_ascii_lowercase();
+        t.starts_with("http://") || t.starts_with("https://")
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -301,7 +324,7 @@ pub fn parse(text: &str) -> Config {
                 None => bad(),
             },
             ("pinned_apps", app) => c.pinned_apps.push(app.trim_end_matches(".exe").to_string()),
-            ("launchers", name) if !val.is_empty() => c.launchers.push(Launcher { name: name.to_string(), target: val.to_string() }),
+            ("launchers", name) if !val.is_empty() => c.launchers.push(Launcher::parse(name, val)),
             ("rules", app) => {
                 let nums: Vec<Option<usize>> = val.split(',').map(|s| s.trim().parse().ok()).collect();
                 match nums.as_slice() {
@@ -376,9 +399,10 @@ pub fn render(c: &Config) -> String {
     }
     s.push_str("\n[launchers]\n");
     s.push_str("# Pinned app buttons on the bar (right-click a window button > Pin to bar).\n");
-    s.push_str("# name = exe path   or   name = shell:AppsFolder\\<app id>\n");
+    s.push_str("# name = exe path   or   name = shell:AppsFolder\\<app id>   or   name = web address\n");
+    s.push_str("# Optional icon after a |, e.g.  lastterminal = http://127.0.0.1:3101 | %LOCALAPPDATA%\\LastTerminal\\icon.ico\n");
     for l in &c.launchers {
-        s.push_str(&format!("{} = {}\n", l.name, l.target));
+        s.push_str(&format!("{} = {}\n", l.name, l.value()));
     }
     s.push_str("\n[rules]\n");
     s.push_str("# New windows of an app open on a given monitor and workspace (monitor 1 = leftmost):\n");
@@ -428,6 +452,12 @@ mod tests {
         assert_eq!(back.switch, MOD_CONTROL | MOD_ALT);
         assert_eq!((back.bar_edge, back.icons_only, back.align), (Edge::Bottom, true, Align::Right));
         assert!(back.hide_taskbar && !back.tray);
+        // Pins: plain, and a web app with its own icon, both survive a save.
+        let mut p = parse("[launchers]\ncalc = shell:AppsFolder\\x!App\nlastterminal = http://127.0.0.1:3101 | %LOCALAPPDATA%\\LastTerminal\\icon.ico\n");
+        p.errors.clear();
+        let pb = parse(&render(&p));
+        assert_eq!(pb.launchers, p.launchers);
+        assert!(pb.launchers[1].is_web() && pb.launchers[1].icon.ends_with("icon.ico") && !pb.launchers[0].is_web());
         // Integrations: off unless turned on, and kept when saved.
         assert!(!back.tailscale && !back.win_key_start && !back.memory);
         let mut on = parse("[bar]\ntailscale = true\nwin_key_start = true\nmemory = true\n");
