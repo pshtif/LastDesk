@@ -20,6 +20,7 @@ mod bar;
 mod cloak;
 mod config;
 mod guard;
+mod lastterminal;
 mod launcher;
 mod layout;
 mod mem;
@@ -543,6 +544,13 @@ impl App {
         });
         if tailscale::active() != was {
             self.bars_refresh(); // the icon's slot appears / goes
+        }
+        let was = lastterminal::active();
+        lastterminal::set_enabled(self.config.bar && self.config.lastterminal, move || unsafe {
+            let _ = PostMessageW(HWND(m as *mut _), status::WM_STATUS, WPARAM(status::STATUS_LASTTERMINAL), LPARAM(0));
+        });
+        if lastterminal::active() != was {
+            self.bars_refresh();
         }
     }
 

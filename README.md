@@ -44,6 +44,8 @@ own workspaces, and replaces the Windows taskbar with its own bar on every monit
 - Tailscale: status, connect / disconnect, and exit nodes. Mullvad nodes are grouped by
   country and city. Health warnings and an alert when the exit node goes offline. It talks to
   the Tailscale service directly, so Tailscale's tray app isn't needed.
+- LastTerminal (if installed): its running sessions on hover; click for a menu to open
+  LastTerminal on one of them, or start LastTerminal when it isn't running.
 - Win key opens Start on the monitor you're on.
 - Network drives that switch between a home path and an away path, e.g. a NAS by local
   address at home and through Tailscale or a VPN elsewhere. See below.
@@ -119,6 +121,7 @@ hide_taskbar = false        # hide the Windows taskbar; the bar takes its place
 tray = true                 # app tray icons in the bar
 memory = false              # memory meter
 tailscale = false           # Tailscale status and menu (if installed)
+lastterminal = false        # LastTerminal sessions and menu (if installed)
 win_key_start = false       # Win key opens Start on the monitor you're on
 
 [pinned_apps]               # shown on every workspace

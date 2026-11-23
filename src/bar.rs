@@ -200,6 +200,7 @@ pub enum Hit {
     Launcher(usize),
     Tailscale,
     Memory,
+    LastTerminal,
     Window(isize),
     TrayIcon(usize),
     Tray,
@@ -245,6 +246,8 @@ pub struct Bar {
     pub privacy: RECT,
     /// Memory meter (zero width when turned off).
     pub mem: RECT,
+    /// LastTerminal icon (zero width when turned off or not installed).
+    pub lt: RECT,
     /// Tailscale icon (zero width when Tailscale isn't installed).
     pub ts: RECT,
     pub net: RECT,
@@ -508,6 +511,9 @@ impl Bar {
         if contains(&self.privacy, x, y) {
             return Hit::Privacy;
         }
+        if contains(&self.lt, x, y) {
+            return Hit::LastTerminal;
+        }
         if contains(&self.mem, x, y) {
             return Hit::Memory;
         }
@@ -664,6 +670,7 @@ impl App {
                 privacy: RECT::default(),
                 ts: RECT::default(),
                 mem: RECT::default(),
+                lt: RECT::default(),
                 net: RECT::default(),
                 vol: RECT::default(),
                 battery: RECT::default(),
@@ -957,8 +964,10 @@ impl App {
             let n_priv = (!self.status.mic.is_empty()) as i32 + (!self.status.cam.is_empty()) as i32;
             let ts_w = if crate::tailscale::active() { icon_w } else { 0 };
             b.ts = RECT { left: b.net.left - ts_w, top: s(3.0), right: b.net.left, bottom: h - s(3.0) };
+            let lt_w = if crate::lastterminal::active() { icon_w } else { 0 };
+            b.lt = RECT { left: b.ts.left - lt_w, top: s(3.0), right: b.ts.left, bottom: h - s(3.0) };
             let mem_w = if self.config.memory { s(70.0) } else { 0 };
-            b.mem = RECT { left: b.ts.left - mem_w, top: s(3.0), right: b.ts.left, bottom: h - s(3.0) };
+            b.mem = RECT { left: b.lt.left - mem_w, top: s(3.0), right: b.lt.left, bottom: h - s(3.0) };
             b.privacy = RECT { left: b.mem.left - icon_w * n_priv, top: s(3.0), right: b.mem.left, bottom: h - s(3.0) };
             let mut ix = b.privacy.left - s(4.0);
             let mut tray_icons: Vec<(u32, u32, RECT)> = icons
@@ -1248,6 +1257,23 @@ impl App {
                     }
                 }
             }
+            // LastTerminal: a terminal glyph, dim while its server isn't running, with the number of
+            // running sessions in the corner.
+            if b.lt.right > b.lt.left {
+                if b.hover == Hit::LastTerminal {
+                    ui::fill_round(mem, b.lt, s(6.0), hover_bg);
+                }
+                let sessions = crate::lastterminal::sessions();
+                let mut r = b.lt;
+                ui::draw_text(mem, &glyph(0xE756), &mut r, if sessions.is_some() { ui::TEXT } else { dim }, f_icon);
+                let n = sessions.as_ref().map(|s| s.len()).unwrap_or(0);
+                if n > 0 {
+                    let f_small = ui::font(s(9.5), true);
+                    let mut cr = RECT { left: b.lt.right - s(12.0), top: b.lt.bottom - s(13.0), right: b.lt.right, bottom: b.lt.bottom - s(1.0) };
+                    ui::draw_text(mem, &n.min(99).to_string(), &mut cr, ui::ACCENT, f_small);
+                    let _ = DeleteObject(f_small);
+                }
+            }
             // Memory meter: "RAM 62%", orange when memory is getting full, red when it's nearly gone.
             if b.mem.right > b.mem.left {
                 if b.hover == Hit::Memory {
@@ -1448,6 +1474,17 @@ impl App {
                 })
             }
             Hit::Memory => Some(crate::mem::summary()),
+            Hit::LastTerminal => Some(match crate::lastterminal::sessions() {
+                None => "LastTerminal isn't running (click to start it)".into(),
+                Some(list) => {
+                    let mut t = format!("LastTerminal\t{}", if list.len() == 1 { "1 session".to_string() } else { format!("{} sessions", list.len()) });
+                    for s in list.iter().take(10) {
+                        let what = if s.running.is_empty() { "idle" } else { s.running.as_str() };
+                        t.push_str(&format!("\n{}\t{what}", s.name));
+                    }
+                    t
+                }
+            }),
             Hit::Battery => {
                 let mut ps = SYSTEM_POWER_STATUS::default();
                 let mut parts = Vec::new();
@@ -1478,6 +1515,7 @@ impl App {
             Hit::Privacy => b.privacy,
             Hit::Tailscale => b.ts,
             Hit::Memory => b.mem,
+            Hit::LastTerminal => b.lt,
             Hit::Battery => b.battery,
             _ => return,
         };
@@ -1494,7 +1532,7 @@ impl App {
             unsafe {
                 let _ = InvalidateRect(self.bars[i].hwnd, None, false);
             }
-            if matches!(self.bars[i].hover, Hit::Volume | Hit::Network | Hit::Privacy | Hit::Tailscale | Hit::Memory | Hit::Battery) && TIP.with(|t| unsafe { IsWindowVisible(t.borrow().0).as_bool() }) {
+            if matches!(self.bars[i].hover, Hit::Volume | Hit::Network | Hit::Privacy | Hit::Tailscale | Hit::LastTerminal | Hit::Memory | Hit::Battery) && TIP.with(|t| unsafe { IsWindowVisible(t.borrow().0).as_bool() }) {
                 self.show_status_tip(i, self.bars[i].hover);
             }
         }
@@ -1517,7 +1555,7 @@ impl App {
 
     pub fn bar_show_tip(&mut self, hwnd: HWND) {
         let Some(i) = self.bar_index(hwnd) else { return };
-        if matches!(self.bars[i].hover, Hit::Volume | Hit::Network | Hit::Privacy | Hit::Tailscale | Hit::Memory | Hit::Battery) {
+        if matches!(self.bars[i].hover, Hit::Volume | Hit::Network | Hit::Privacy | Hit::Tailscale | Hit::LastTerminal | Hit::Memory | Hit::Battery) {
             self.show_status_tip(i, self.bars[i].hover);
             return;
         }
@@ -1673,7 +1711,7 @@ impl App {
                 unsafe {
                     SetTimer(hwnd, TIP_TIMER, 450, None);
                 }
-            } else if matches!(hit, Hit::Volume | Hit::Network | Hit::Privacy | Hit::Tailscale | Hit::Memory | Hit::Battery | Hit::Launcher(_)) {
+            } else if matches!(hit, Hit::Volume | Hit::Network | Hit::Privacy | Hit::Tailscale | Hit::LastTerminal | Hit::Memory | Hit::Battery | Hit::Launcher(_)) {
                 unsafe {
                     SetTimer(hwnd, TIP_TIMER, 450, None);
                 }
@@ -1859,6 +1897,11 @@ pub unsafe extern "system" fn bar_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPA
                 tailscale_menu();
                 return LRESULT(0);
             }
+            if msg == WM_LBUTTONUP && with_app(|app| app.bar_hit_at(hwnd, x, y)).flatten() == Some(Hit::LastTerminal) {
+                hide_tip();
+                lastterminal_menu();
+                return LRESULT(0);
+            }
             let keys = with_app(|app| app.bar_click(hwnd, x, y, msg == WM_MBUTTONUP)).flatten();
             if let Some(k) = keys {
                 press(&k);
@@ -1875,6 +1918,10 @@ pub unsafe extern "system" fn bar_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPA
             match with_app(|app| app.bar_hit_at(hwnd, x, y)).flatten() {
                 Some(Hit::Tailscale) => {
                     tailscale_menu();
+                    return LRESULT(0);
+                }
+                Some(Hit::LastTerminal) => {
+                    lastterminal_menu();
                     return LRESULT(0);
                 }
                 _ => {}
@@ -2173,6 +2220,61 @@ fn tailscale_menu() {
                 },
                 ExitPick::LanAccess(on) => crate::tailscale::set_lan_access(*on),
             },
+            _ => {}
+        }
+    }
+}
+
+/// LastTerminal's menu: its running sessions (each opens LastTerminal on it), open it, or
+/// start its server when it isn't running.
+fn lastterminal_menu() {
+    const CMD_OPEN: usize = 1;
+    const CMD_START: usize = 2;
+    const CMD_SESSION: usize = 100; // 100 + index into the list
+    let list = crate::lastterminal::sessions();
+    unsafe {
+        let Ok(menu) = CreatePopupMenu() else { return };
+        let add = |flags: MENU_ITEM_FLAGS, id: usize, text: &str| {
+            let t = wide_z(&text.replace('&', "&&"));
+            let _ = AppendMenuW(menu, flags, id, windows::core::PCWSTR(t.as_ptr()));
+        };
+        match &list {
+            None => {
+                add(MF_STRING | MF_GRAYED, 0, "LastTerminal isn't running");
+                let _ = AppendMenuW(menu, MF_SEPARATOR, 0, windows::core::PCWSTR::null());
+                add(MF_STRING, CMD_START, "Start LastTerminal");
+            }
+            Some(sessions) => {
+                if sessions.is_empty() {
+                    add(MF_STRING | MF_GRAYED, 0, "No sessions running");
+                }
+                for (n, s) in sessions.iter().take(20).enumerate() {
+                    let what = if s.running.is_empty() { String::new() } else { format!("  ·  {}", s.running) };
+                    let mut label = format!("{}{what}", s.name);
+                    if label.chars().count() > 70 {
+                        label = label.chars().take(67).collect::<String>() + "…";
+                    }
+                    add(MF_STRING, CMD_SESSION + n, &label);
+                }
+                let _ = AppendMenuW(menu, MF_SEPARATOR, 0, windows::core::PCWSTR::null());
+                add(MF_STRING, CMD_OPEN, "Open LastTerminal");
+            }
+        }
+        match run_menu(menu) {
+            CMD_OPEN => crate::lastterminal::open(None),
+            CMD_START => {
+                crate::lastterminal::start_server();
+                // Give the server a moment, then open the page.
+                std::thread::spawn(|| {
+                    std::thread::sleep(std::time::Duration::from_millis(1500));
+                    crate::lastterminal::open(None);
+                });
+            }
+            c if c >= CMD_SESSION => {
+                if let Some(s) = list.as_ref().and_then(|l| l.get(c - CMD_SESSION)) {
+                    crate::lastterminal::open(Some(&s.id));
+                }
+            }
             _ => {}
         }
     }

@@ -92,6 +92,8 @@ pub struct Config {
     pub memory: bool,
     /// Tailscale status and menu in the bar (if Tailscale is installed).
     pub tailscale: bool,
+    /// LastTerminal sessions in the bar (if LastTerminal is installed).
+    pub lastterminal: bool,
     /// The Win key opens Start on the monitor you're on (needs a keyboard hook).
     pub win_key_start: bool,
     pub errors: Vec<String>,
@@ -229,6 +231,7 @@ pub fn parse(text: &str) -> Config {
         tray: true,
         memory: false,
         tailscale: false,
+        lastterminal: false,
         win_key_start: false,
         errors: Vec::new(),
     };
@@ -319,6 +322,10 @@ pub fn parse(text: &str) -> Config {
                 Some(b) => c.tailscale = b,
                 None => bad(),
             },
+            ("bar", "lastterminal") => match bool_of(val) {
+                Some(b) => c.lastterminal = b,
+                None => bad(),
+            },
             ("bar", "win_key_start") => match bool_of(val) {
                 Some(b) => c.win_key_start = b,
                 None => bad(),
@@ -390,6 +397,8 @@ pub fn render(c: &Config) -> String {
     s.push_str(&format!("memory = {}\n", c.memory));
     s.push_str("# Tailscale status and menu in the bar, if Tailscale is installed (replaces its tray app).\n");
     s.push_str(&format!("tailscale = {}\n", c.tailscale));
+    s.push_str("# LastTerminal sessions in the bar, if LastTerminal is installed.\n");
+    s.push_str(&format!("lastterminal = {}\n", c.lastterminal));
     s.push_str("# The Win key opens Start on the monitor you're on (uses a keyboard hook that only looks at the Win key).\n");
     s.push_str(&format!("win_key_start = {}\n\n", c.win_key_start));
     s.push_str("[pinned_apps]\n");
