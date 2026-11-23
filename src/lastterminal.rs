@@ -133,13 +133,13 @@ mod tests {
     #[test]
     fn parses_sessions() {
         let body = r#"[
-            {"id":"a1","type":"local","cwd":"D:\\code\\LastDesk","title":"","running":"claude.exe","lastLine":"","viewers":1,"meta":{"startedAt":1}},
+            {"id":"a1","type":"local","cwd":"D:\\code\\LastDesk","title":"","running":"vim.exe","lastLine":"","viewers":1,"meta":{"startedAt":1}},
             {"id":"b2","type":"ssh","title":"","running":"","lastLine":"","viewers":0,"meta":{"host":"nas","username":"peter"}},
             {"id":"c3","type":"local","cwd":"C:\\x","title":"","running":"","lastLine":"","viewers":0,"meta":{"name":"build"},"ended":true}
         ]"#;
         let s = super::parse(body).unwrap();
         assert_eq!(s.len(), 2, "ended sessions are left out");
-        assert_eq!((s[0].name.as_str(), s[0].running.as_str()), ("LastDesk", "claude.exe"));
+        assert_eq!((s[0].name.as_str(), s[0].running.as_str()), ("LastDesk", "vim.exe"));
         assert_eq!((s[1].name.as_str(), s[1].running.as_str(), s[1].place.as_str()), ("peter@nas", "ssh", "peter@nas"));
         // Against a running LastTerminal, if there is one here.
         if let Some(live) = super::read_sessions() {
