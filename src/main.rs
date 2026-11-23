@@ -1219,7 +1219,16 @@ pub(crate) fn show_menu(hwnd: HWND) {
                 ShellExecuteW(None, w!("open"), w!("notepad.exe"), PCWSTR(p.as_ptr()), None, SW_SHOWNORMAL);
             }
             Some(MenuAction::Exit) => {
-                let _ = DestroyWindow(hwnd);
+                // Asked first: it sits next to everyday items and a slip quits the bar.
+                let answer = MessageBoxW(
+                    hwnd,
+                    w!("Exit LastDesk?\n\nAll windows are shown again and the Windows taskbar comes back."),
+                    w!("LastDesk"),
+                    MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2 | MB_SETFOREGROUND,
+                );
+                if answer == IDYES {
+                    let _ = DestroyWindow(hwnd);
+                }
             }
             None => {}
         }
