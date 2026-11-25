@@ -35,6 +35,26 @@ fn exe() -> PathBuf {
     base.join("LastTerminal").join("lastterminal-headless.exe")
 }
 
+/// LastTerminal's own icon (the icon.ico it installs next to its server), loaded once per size;
+/// invalid when it isn't there (the bar falls back to a glyph).
+pub fn icon(size: i32) -> windows::Win32::UI::WindowsAndMessaging::HICON {
+    use std::os::windows::ffi::OsStrExt;
+    use windows::Win32::UI::WindowsAndMessaging::{LoadImageW, HICON, IMAGE_ICON, LR_LOADFROMFILE};
+    thread_local! {
+        static ICONS: std::cell::RefCell<Vec<(i32, isize)>> = const { std::cell::RefCell::new(Vec::new()) };
+    }
+    ICONS.with(|cache| {
+        if let Some((_, h)) = cache.borrow().iter().find(|(s, _)| *s == size) {
+            return HICON(*h as *mut _);
+        }
+        let path = exe().with_file_name("icon.ico");
+        let w: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+        let h = unsafe { LoadImageW(None, windows::core::PCWSTR(w.as_ptr()), IMAGE_ICON, size, size, LR_LOADFROMFILE) }.map(|h| h.0 as isize).unwrap_or(0);
+        cache.borrow_mut().push((size, h));
+        HICON(h as *mut _)
+    })
+}
+
 /// Is LastTerminal (headless) installed?
 pub fn installed() -> bool {
     exe().exists()

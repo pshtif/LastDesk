@@ -201,6 +201,7 @@ pub enum Hit {
     Tailscale,
     Memory,
     LastTerminal,
+    Keyboard,
     Window(isize),
     TrayIcon(usize),
     Tray,
@@ -250,6 +251,8 @@ pub struct Bar {
     pub lt: RECT,
     /// Tailscale icon (zero width when Tailscale isn't installed).
     pub ts: RECT,
+    /// Keyboard layout ("ENG" over "UK"; zero width with only one layout installed).
+    pub kbd: RECT,
     pub net: RECT,
     pub vol: RECT,
     pub battery: RECT,
@@ -520,6 +523,9 @@ impl Bar {
         if contains(&self.ts, x, y) {
             return Hit::Tailscale;
         }
+        if contains(&self.kbd, x, y) {
+            return Hit::Keyboard;
+        }
         if contains(&self.net, x, y) {
             return Hit::Network;
         }
@@ -669,6 +675,7 @@ impl App {
                 tray: RECT::default(),
                 privacy: RECT::default(),
                 ts: RECT::default(),
+                kbd: RECT::default(),
                 mem: RECT::default(),
                 lt: RECT::default(),
                 net: RECT::default(),
@@ -691,6 +698,7 @@ impl App {
         self.bars_refresh();
         unsafe {
             SetTimer(self.main, crate::CLOCK_TIMER, 10_000, None);
+            SetTimer(self.main, crate::KBD_TIMER, 300, None);
         }
     }
 
@@ -962,8 +970,10 @@ impl App {
             b.vol = RECT { left: b.battery.left - icon_w, top: s(3.0), right: b.battery.left, bottom: h - s(3.0) };
             b.net = RECT { left: b.vol.left - icon_w, top: s(3.0), right: b.vol.left, bottom: h - s(3.0) };
             let n_priv = (!self.status.mic.is_empty()) as i32 + (!self.status.cam.is_empty()) as i32;
+            let kbd_w = if crate::keyboard::shown() { s(36.0) } else { 0 };
+            b.kbd = RECT { left: b.net.left - kbd_w, top: s(3.0), right: b.net.left, bottom: h - s(3.0) };
             let ts_w = if crate::tailscale::active() { icon_w } else { 0 };
-            b.ts = RECT { left: b.net.left - ts_w, top: s(3.0), right: b.net.left, bottom: h - s(3.0) };
+            b.ts = RECT { left: b.kbd.left - ts_w, top: s(3.0), right: b.kbd.left, bottom: h - s(3.0) };
             let lt_w = if crate::lastterminal::active() { icon_w } else { 0 };
             b.lt = RECT { left: b.ts.left - lt_w, top: s(3.0), right: b.ts.left, bottom: h - s(3.0) };
             let mem_w = if self.config.memory { s(70.0) } else { 0 };
@@ -1257,15 +1267,26 @@ impl App {
                     }
                 }
             }
-            // LastTerminal: a terminal glyph, dim while its server isn't running, with the number of
+            // LastTerminal: its icon, faded while its server isn't running, with the number of
             // running sessions in the corner.
             if b.lt.right > b.lt.left {
                 if b.hover == Hit::LastTerminal {
                     ui::fill_round(mem, b.lt, s(6.0), hover_bg);
                 }
                 let sessions = crate::lastterminal::sessions();
-                let mut r = b.lt;
-                ui::draw_text(mem, &glyph(0xE756), &mut r, if sessions.is_some() { ui::TEXT } else { dim }, f_icon);
+                // Its own icon (faded while its server isn't running); a glyph if it can't be loaded.
+                let sz = s(18.0);
+                let ico = crate::lastterminal::icon(sz);
+                if ico.is_invalid() {
+                    let mut r = b.lt;
+                    ui::draw_text(mem, &glyph(0xE756), &mut r, if sessions.is_some() { ui::TEXT } else { dim }, f_icon);
+                } else {
+                    let (x0, y0) = (b.lt.left + (b.lt.right - b.lt.left - sz) / 2, b.lt.top + (b.lt.bottom - b.lt.top - sz) / 2);
+                    let _ = DrawIconEx(mem, x0, y0, ico, sz, sz, 0, None, DI_NORMAL);
+                    if sessions.is_none() {
+                        ui::shade(mem, RECT { left: x0, top: y0, right: x0 + sz, bottom: y0 + sz }, ui::rgb(0x17, 0x18, 0x1B), 150);
+                    }
+                }
                 let n = sessions.as_ref().map(|s| s.len()).unwrap_or(0);
                 if n > 0 {
                     let f_small = ui::font(s(9.5), true);
@@ -1319,6 +1340,20 @@ impl App {
                         ui::fill_round(mem, RECT { left: x0, top: y0, right: x0 + d, bottom: y0 + d }, d / 2, color);
                     }
                 }
+            }
+            // Keyboard layout: the language over the layout's country ("ENG" / "UK").
+            if b.kbd.right > b.kbd.left {
+                if b.hover == Hit::Keyboard {
+                    ui::fill_round(mem, b.kbd, s(6.0), hover_bg);
+                }
+                let (top, bottom) = crate::keyboard::short(crate::keyboard::current());
+                let f_small = ui::font(s(11.0), false);
+                let mid = (b.kbd.top + b.kbd.bottom) / 2;
+                let mut tr = RECT { bottom: mid + s(1.0), top: mid - s(13.0), ..b.kbd };
+                ui::draw_text(mem, &top, &mut tr, ui::TEXT, f_small);
+                let mut br = RECT { top: mid - s(1.0), bottom: mid + s(13.0), ..b.kbd };
+                ui::draw_text(mem, &bottom, &mut br, ui::MUTED, f_small);
+                let _ = DeleteObject(f_small);
             }
             if b.hover == Hit::Network {
                 ui::fill_round(mem, b.net, s(6.0), hover_bg);
@@ -1474,6 +1509,7 @@ impl App {
                 })
             }
             Hit::Memory => Some(crate::mem::summary()),
+            Hit::Keyboard => Some(crate::keyboard::name(crate::keyboard::current())),
             Hit::LastTerminal => Some(match crate::lastterminal::sessions() {
                 None => "LastTerminal isn't running (click to start it)".into(),
                 Some(list) => {
@@ -1514,6 +1550,7 @@ impl App {
             Hit::Network => b.net,
             Hit::Privacy => b.privacy,
             Hit::Tailscale => b.ts,
+            Hit::Keyboard => b.kbd,
             Hit::Memory => b.mem,
             Hit::LastTerminal => b.lt,
             Hit::Battery => b.battery,
@@ -1532,7 +1569,7 @@ impl App {
             unsafe {
                 let _ = InvalidateRect(self.bars[i].hwnd, None, false);
             }
-            if matches!(self.bars[i].hover, Hit::Volume | Hit::Network | Hit::Privacy | Hit::Tailscale | Hit::LastTerminal | Hit::Memory | Hit::Battery) && TIP.with(|t| unsafe { IsWindowVisible(t.borrow().0).as_bool() }) {
+            if matches!(self.bars[i].hover, Hit::Volume | Hit::Network | Hit::Privacy | Hit::Tailscale | Hit::LastTerminal | Hit::Memory | Hit::Battery | Hit::Keyboard) && TIP.with(|t| unsafe { IsWindowVisible(t.borrow().0).as_bool() }) {
                 self.show_status_tip(i, self.bars[i].hover);
             }
         }
@@ -1555,7 +1592,7 @@ impl App {
 
     pub fn bar_show_tip(&mut self, hwnd: HWND) {
         let Some(i) = self.bar_index(hwnd) else { return };
-        if matches!(self.bars[i].hover, Hit::Volume | Hit::Network | Hit::Privacy | Hit::Tailscale | Hit::LastTerminal | Hit::Memory | Hit::Battery) {
+        if matches!(self.bars[i].hover, Hit::Volume | Hit::Network | Hit::Privacy | Hit::Tailscale | Hit::LastTerminal | Hit::Memory | Hit::Battery | Hit::Keyboard) {
             self.show_status_tip(i, self.bars[i].hover);
             return;
         }
@@ -1711,7 +1748,7 @@ impl App {
                 unsafe {
                     SetTimer(hwnd, TIP_TIMER, 450, None);
                 }
-            } else if matches!(hit, Hit::Volume | Hit::Network | Hit::Privacy | Hit::Tailscale | Hit::LastTerminal | Hit::Memory | Hit::Battery | Hit::Launcher(_)) {
+            } else if matches!(hit, Hit::Volume | Hit::Network | Hit::Privacy | Hit::Tailscale | Hit::LastTerminal | Hit::Memory | Hit::Battery | Hit::Keyboard | Hit::Launcher(_)) {
                 unsafe {
                     SetTimer(hwnd, TIP_TIMER, 450, None);
                 }
@@ -1902,6 +1939,11 @@ pub unsafe extern "system" fn bar_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPA
                 lastterminal_menu();
                 return LRESULT(0);
             }
+            if msg == WM_LBUTTONUP && with_app(|app| app.bar_hit_at(hwnd, x, y)).flatten() == Some(Hit::Keyboard) {
+                hide_tip();
+                keyboard_menu();
+                return LRESULT(0);
+            }
             let keys = with_app(|app| app.bar_click(hwnd, x, y, msg == WM_MBUTTONUP)).flatten();
             if let Some(k) = keys {
                 press(&k);
@@ -1922,6 +1964,10 @@ pub unsafe extern "system" fn bar_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPA
                 }
                 Some(Hit::LastTerminal) => {
                     lastterminal_menu();
+                    return LRESULT(0);
+                }
+                Some(Hit::Keyboard) => {
+                    keyboard_menu();
                     return LRESULT(0);
                 }
                 _ => {}
@@ -2273,6 +2319,42 @@ fn lastterminal_menu() {
             c if c >= CMD_SESSION => {
                 if let Some(s) = list.as_ref().and_then(|l| l.get(c - CMD_SESSION)) {
                     crate::lastterminal::open(Some(&s.id));
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// The keyboard layouts (left or right click on the indicator): the current one checked;
+/// choosing one switches the app that was focused (and, as Windows does by default, all).
+fn keyboard_menu() {
+    const CMD_LAYOUT: usize = 100; // 100 + index into the list
+    const CMD_SETTINGS: usize = 1;
+    // Still the app the user was typing in: the bar never takes focus (the menu will).
+    let focused = unsafe { GetForegroundWindow() };
+    let list = crate::keyboard::layouts();
+    let now = crate::keyboard::current();
+    unsafe {
+        let Ok(menu) = CreatePopupMenu() else { return };
+        for (n, hkl) in list.iter().enumerate() {
+            let t = wide_z(&crate::keyboard::name(*hkl).replace('&', "&&"));
+            let flags = if *hkl == now { MF_STRING | MF_CHECKED } else { MF_STRING };
+            let _ = AppendMenuW(menu, flags, CMD_LAYOUT + n, windows::core::PCWSTR(t.as_ptr()));
+        }
+        let _ = AppendMenuW(menu, MF_SEPARATOR, 0, windows::core::PCWSTR::null());
+        let t = wide_z("Language settings…");
+        let _ = AppendMenuW(menu, MF_STRING, CMD_SETTINGS, windows::core::PCWSTR(t.as_ptr()));
+        match run_menu(menu) {
+            CMD_SETTINGS => {
+                ShellExecuteW(None, w!("open"), w!("ms-settings:regionlanguage"), None, None, SW_SHOWNORMAL);
+            }
+            c if c >= CMD_LAYOUT => {
+                if let Some(hkl) = list.get(c - CMD_LAYOUT) {
+                    // Focus back where it was, then that app is asked to switch.
+                    let _ = SetForegroundWindow(focused);
+                    crate::keyboard::switch(focused, *hkl);
+                    with_app(|app| app.bars_status_changed());
                 }
             }
             _ => {}

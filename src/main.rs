@@ -20,6 +20,7 @@ mod bar;
 mod cloak;
 mod config;
 mod guard;
+mod keyboard;
 mod lastterminal;
 mod launcher;
 mod layout;
@@ -82,6 +83,8 @@ const PLACE_TIMER: usize = 5;
 const TRAY_TIMER: usize = 6;
 const FS_TIMER: usize = 7;
 const TASKBAR_TIMER: usize = 8;
+/// The focused app's keyboard layout, looked at for the bar's indicator.
+const KBD_TIMER: usize = 9;
 const OSD_MS: u32 = 900;
 const RUN_KEY: PCWSTR = w!("Software\\Microsoft\\Windows\\CurrentVersion\\Run");
 const APP_NAME: PCWSTR = w!("LastDesk");
@@ -1342,6 +1345,14 @@ unsafe extern "system" fn main_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
                 app.bars_place_all();
                 app.taskbar_enforce();
             });
+            LRESULT(0)
+        }
+        WM_TIMER if wp.0 == KBD_TIMER => {
+            if keyboard::shown_changed() {
+                with_app(|app| app.bars_refresh());
+            } else if keyboard::refresh() {
+                with_app(|app| app.bars_status_changed());
+            }
             LRESULT(0)
         }
         WM_TIMER if wp.0 == CLOCK_TIMER => {

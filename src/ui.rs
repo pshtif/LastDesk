@@ -225,3 +225,17 @@ pub(crate) unsafe fn frame_round(hdc: HDC, r: RECT, radius: i32, width: i32, col
     SelectObject(hdc, op);
     let _ = DeleteObject(pen);
 }
+
+/// `color` laid over `r` at `alpha` (0-255): fades what's drawn there (an icon shown as off).
+pub(crate) unsafe fn shade(hdc: HDC, r: RECT, color: COLORREF, alpha: u8) {
+    use windows::Win32::Graphics::Gdi::{AlphaBlend, CreateCompatibleBitmap, CreateCompatibleDC, DeleteDC, DeleteObject, SelectObject, SetPixel, AC_SRC_OVER, BLENDFUNCTION};
+    let src = CreateCompatibleDC(hdc);
+    let bmp = CreateCompatibleBitmap(hdc, 1, 1);
+    let old = SelectObject(src, bmp);
+    let _ = SetPixel(src, 0, 0, color);
+    let bf = BLENDFUNCTION { BlendOp: AC_SRC_OVER as u8, BlendFlags: 0, SourceConstantAlpha: alpha, AlphaFormat: 0 };
+    let _ = AlphaBlend(hdc, r.left, r.top, r.right - r.left, r.bottom - r.top, src, 0, 0, 1, 1, bf);
+    SelectObject(src, old);
+    let _ = DeleteObject(bmp);
+    let _ = DeleteDC(src);
+}
