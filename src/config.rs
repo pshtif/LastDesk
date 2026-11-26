@@ -66,7 +66,8 @@ pub enum Align {
 
 #[derive(Clone)]
 pub struct Config {
-    pub workspaces: usize,
+    /// An empty workspace is removed when you switch away from it.
+    pub remove_empty: bool,
     /// Workspace switch slide duration in ms; 0 = off.
     pub animation: u32,
     /// Apps (exe names) that keep their own window position when launched from Start.
@@ -207,7 +208,7 @@ fn bool_of(v: &str) -> Option<bool> {
 
 pub fn parse(text: &str) -> Config {
     let mut c = Config {
-        workspaces: 4,
+        remove_empty: false,
         animation: 200,
         launch_ignore: Vec::new(),
         switch: MOD_ALT,
@@ -250,9 +251,11 @@ pub fn parse(text: &str) -> Config {
         };
         let mut bad = || c.errors.push(format!("line {}: {}", n + 1, raw.trim()));
         match (section.as_str(), key.as_str()) {
-            ("", "workspaces") => match val.parse::<usize>() {
-                Ok(v) if (1..=9).contains(&v) => c.workspaces = v,
-                _ => bad(),
+            // Workspaces are added with + now; an older fixed count is ignored.
+            ("", "workspaces") => {}
+            ("", "remove_empty_workspaces") => match bool_of(val) {
+                Some(b) => c.remove_empty = b,
+                None => bad(),
             },
             ("", "launch_ignore") => {
                 c.launch_ignore = val.split(',').map(|s| s.trim().trim_end_matches(".exe").to_lowercase()).filter(|s| !s.is_empty()).collect()
@@ -369,8 +372,8 @@ pub fn render(c: &Config) -> String {
     let mut s = String::new();
     s.push_str("# LastDesk configuration. Use tray > Settings, or edit this file and use tray > \"Reload config\".\n");
     s.push_str("# Lines starting with # are comments.\n\n");
-    s.push_str("# Workspaces per monitor (1-9).\n");
-    s.push_str(&format!("workspaces = {}\n", c.workspaces));
+    s.push_str("# Each monitor has the workspaces you add (+ in the bar). Remove one when you leave it empty:\n");
+    s.push_str(&format!("remove_empty_workspaces = {}\n", c.remove_empty));
     s.push_str("# Slide when switching workspaces: off | fast | normal | slow (or milliseconds).\n");
     s.push_str(&format!("animation = {}\n", anim_name(c.animation)));
     s.push_str("# Apps launched from Start open on that monitor. List apps that should keep their own\n# window position instead, e.g. launch_ignore = steam, vlc\n");
@@ -435,7 +438,7 @@ mod tests {
     fn default_config_parses_cleanly() {
         let c = parse(&default_text());
         assert!(c.errors.is_empty(), "{:?}", c.errors);
-        assert_eq!(c.workspaces, 4);
+        assert!(!c.remove_empty);
         assert_eq!(c.switch, MOD_ALT);
         assert_eq!(c.move_, MOD_ALT | MOD_SHIFT);
         assert_eq!((c.pin.mods, c.pin.vk), (MOD_ALT | MOD_SHIFT, 'P' as u32));
@@ -447,7 +450,6 @@ mod tests {
     #[test]
     fn custom_values_rules_and_errors() {
         let c = parse("workspaces = 6\n[keys]\nswitch = win+alt\noverview = ctrl+alt+f2\n[bar]\nposition = bottom\nbuttons = icons\nalign = center\n[pinned_apps]\nSpotify.exe\n[rules]\nslack = 2, 3\nbroken = x\n");
-        assert_eq!(c.workspaces, 6);
         assert_eq!(c.switch, MOD_WIN | MOD_ALT);
         assert_eq!((c.overview.mods, c.overview.vk), (MOD_CONTROL | MOD_ALT, 0x71));
         assert_eq!((c.bar_edge, c.icons_only, c.align), (Edge::Bottom, true, Align::Center));
@@ -462,7 +464,6 @@ mod tests {
         c.errors.clear();
         let back = parse(&render(&c));
         assert!(back.errors.is_empty(), "{:?}", back.errors);
-        assert_eq!(back.workspaces, 3);
         assert_eq!(back.switch, MOD_CONTROL | MOD_ALT);
         assert_eq!((back.bar_edge, back.icons_only, back.align), (Edge::Bottom, true, Align::Right));
         assert!(back.hide_taskbar && !back.tray);
@@ -484,9 +485,12 @@ mod tests {
     }
 
     #[test]
-    fn out_of_range_workspaces_is_an_error() {
+    fn old_workspace_count_is_ignored_and_remove_empty_kept() {
+        // Workspaces are added with + now: an older fixed count is no error, just ignored.
         let c = parse("workspaces = 12");
-        assert_eq!(c.workspaces, 4);
-        assert_eq!(c.errors.len(), 1);
+        assert!(c.errors.is_empty() && !c.remove_empty);
+        let on = parse("remove_empty_workspaces = true");
+        assert!(on.remove_empty && on.errors.is_empty());
+        assert!(parse(&render(&on)).remove_empty);
     }
 }

@@ -58,12 +58,6 @@ use cloak::{Cloaker, Method};
 use win::{hwnd_key, key_hwnd, Monitor};
 
 /// Workspaces per monitor (from config, 1..=9).
-static WS_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(4);
-
-fn workspaces() -> usize {
-    WS_COUNT.load(std::sync::atomic::Ordering::Relaxed)
-}
-
 const WM_TRAY: u32 = WM_APP + 1;
 /// Sent by `lastdesk.exe --settings` to the running instance.
 const WM_OPEN_SETTINGS: u32 = WM_APP + 3;
@@ -88,10 +82,15 @@ const OSD_MS: u32 = 900;
 const RUN_KEY: PCWSTR = w!("Software\\Microsoft\\Windows\\CurrentVersion\\Run");
 const APP_NAME: PCWSTR = w!("LastDesk");
 
+/// Workspaces a monitor can have at most (Alt+1..9).
+const MAX_WS: usize = 9;
+
 struct MonState {
     name: String,
     active: usize,
-    /// Windows hidden on each (inactive) workspace, z-order topmost first.
+    /// Windows hidden on each (inactive) workspace, z-order topmost first. Its length is how
+    /// many workspaces the monitor has (1 to MAX_WS; added with +, removed by hand or when left
+    /// empty if the setting says so).
     hidden: Vec<Vec<isize>>,
 }
 
@@ -195,12 +194,68 @@ impl App {
         self.mons.iter().position(|m| m.name == name)
     }
 
+    /// How many workspaces monitor m has.
+    fn count(&self, m: usize) -> usize {
+        self.mons.get(m).map(|ms| ms.hidden.len().max(1)).unwrap_or(1)
+    }
+
+    /// Monitor m gets at least n workspaces (at most MAX_WS); whether it has n now.
+    fn ensure_ws(&mut self, m: usize, n: usize) -> bool {
+        let Some(ms) = self.mons.get_mut(m) else { return false };
+        let want = n.min(MAX_WS);
+        if ms.hidden.len() < want {
+            ms.hidden.resize(want, Vec::new());
+        }
+        ms.hidden.len() >= n
+    }
+
+    /// A new workspace on monitor m (the + in the bar), switched to.
+    fn add_workspace(&mut self, m: usize) {
+        let n = self.count(m);
+        if n >= MAX_WS || !self.ensure_ws(m, n + 1) {
+            return;
+        }
+        self.bars_refresh();
+        self.switch_to(m, n, None);
+    }
+
+    /// Workspace w of monitor m goes (never the last one). Its windows move to the one before it
+    /// (the next, for the first), shown if that's the one on screen; the ones after it move up.
+    fn remove_workspace(&mut self, m: usize, w: usize) {
+        if m >= self.mons.len() || self.count(m) <= 1 || w >= self.count(m) {
+            return;
+        }
+        let nb = if w > 0 { w - 1 } else { 1 };
+        if self.mons[m].active == w {
+            // Not removed again on the way out (empty-workspace removal).
+            let auto = std::mem::replace(&mut self.config.remove_empty, false);
+            self.switch_to(m, nb, None);
+            self.config.remove_empty = auto;
+        }
+        let moved = std::mem::take(&mut self.mons[m].hidden[w]);
+        if self.mons[m].active == nb {
+            for k in moved {
+                self.show(k);
+            }
+        } else {
+            self.mons[m].hidden[nb].extend(moved);
+        }
+        self.mons[m].hidden.remove(w);
+        if self.mons[m].active > w {
+            self.mons[m].active -= 1;
+        }
+        self.save();
+        self.update_tray();
+        self.bars_refresh();
+        self.show_osd(m, Some(format!("Removed workspace {}", w + 1)));
+    }
+
     fn rebuild_monitors(&mut self) {
         self.monitors = win::monitors();
         self.mons = self
             .monitors
             .iter()
-            .map(|m| MonState { name: m.name.clone(), active: 0, hidden: vec![Vec::new(); workspaces()] })
+            .map(|m| MonState { name: m.name.clone(), active: 0, hidden: vec![Vec::new(); 1] })
             .collect();
     }
 
@@ -401,8 +456,13 @@ impl App {
     fn apply_rule(&mut self, h: HWND) -> bool {
         let k = hwnd_key(h);
         let exe = self.exe(h);
-        let Some(rule) = self.config.rules.iter().find(|r| r.app == exe) else { return false };
-        let to = (rule.monitor.min(self.mons.len().saturating_sub(1)), rule.workspace.min(workspaces() - 1));
+        let Some((rule_mon, rule_ws)) = self.config.rules.iter().find(|r| r.app == exe).map(|r| (r.monitor, r.workspace)) else { return false };
+        let tm = rule_mon.min(self.mons.len().saturating_sub(1));
+        // A workspace the rule names that isn't there yet is made.
+        if self.ensure_ws(tm, rule_ws + 1) {
+            self.bars_refresh();
+        }
+        let to = (tm, rule_ws.min(self.count(tm) - 1));
         let Some(cur) = win::monitor_name_of_window(h).and_then(|n| self.mon_index(&n)) else { return true };
         let from = (cur, self.mons[cur].active);
         if from == to {
@@ -505,7 +565,7 @@ impl App {
         let c = &self.config;
         let mut failed = Vec::new();
         unsafe {
-            for i in 0..workspaces() as u32 {
+            for i in 0..MAX_WS as u32 {
                 let vk = 0x31 + i; // '1'..
                 if RegisterHotKey(self.main, HK_FOCUS + i as i32, c.switch | MOD_NOREPEAT, vk).is_err() {
                     failed.push(format!("{}+{}", c.switch_text, i + 1));
@@ -548,19 +608,7 @@ impl App {
         let old_edge = self.config.bar_edge;
         let mut problems: Vec<String> = new.errors.iter().map(|e| format!("Not understood, ignored: {e}")).collect();
         self.unregister_hotkeys();
-        if new.workspaces != workspaces() {
-            // Changing the count: show everything, then rebuild and re-apply the layout.
-            let saved = layout::load();
-            self.layout_frozen = true;
-            self.reveal_all();
-            WS_COUNT.store(new.workspaces, std::sync::atomic::Ordering::Relaxed);
-            self.rebuild_monitors();
-            self.layout_frozen = false;
-            self.config = new;
-            self.apply_layout(saved);
-        } else {
-            self.config = new;
-        }
+        self.config = new;
         // Bar moved to the other edge: rebuild it there.
         if !self.bars.is_empty() && self.config.bar_edge != old_edge {
             self.taskbar_restore();
@@ -597,6 +645,10 @@ impl App {
     }
 
     fn switch_to(&mut self, m: usize, target: usize, focus: Option<HWND>) {
+        // Not there (Alt+N past the last one): nothing.
+        if target >= self.count(m) {
+            return;
+        }
         if target == self.mons[m].active {
             self.show_osd(m, None);
             return;
@@ -642,6 +694,14 @@ impl App {
         if let Some(s) = slide {
             s.run();
         }
+        // The workspace just left, empty: removed (Settings: remove empty workspaces).
+        if self.config.remove_empty && self.mons[m].hidden[old].is_empty() && self.count(m) > 1 {
+            self.mons[m].hidden.remove(old);
+            if self.mons[m].active > old {
+                self.mons[m].active -= 1;
+            }
+            self.bars_refresh();
+        }
         self.save();
         self.update_tray();
         self.show_osd(m, None);
@@ -655,6 +715,13 @@ impl App {
         let Some(m) = win::monitor_name_of_window(fg).and_then(|n| self.mon_index(&n)) else { return };
         if target == self.mons[m].active {
             self.show_osd(m, None);
+            return;
+        }
+        // One past the last: a new workspace for it.
+        if target == self.count(m) && self.ensure_ws(m, target + 1) {
+            self.bars_refresh();
+        }
+        if target >= self.count(m) {
             return;
         }
         let k = hwnd_key(fg);
@@ -790,6 +857,7 @@ impl App {
         };
         for ms in &self.mons {
             l.active.push((ms.name.clone(), ms.active));
+            l.counts.push((ms.name.clone(), ms.hidden.len().max(1)));
             for (w, list) in ms.hidden.iter().enumerate() {
                 for k in list {
                     l.entries.push(entry(&ms.name, Some(w), *k));
@@ -809,9 +877,14 @@ impl App {
 
     /// Put windows back on the workspaces recorded in `l` (all windows are visible now).
     fn apply_layout(&mut self, l: layout::Layout) {
+        for (name, n) in &l.counts {
+            if let Some(m) = self.mon_index(name) {
+                self.ensure_ws(m, (*n).max(1));
+            }
+        }
         for (name, a) in &l.active {
             if let Some(m) = self.mon_index(name) {
-                if *a < workspaces() {
+                if self.ensure_ws(m, a + 1) {
                     self.mons[m].active = *a;
                 }
             }
@@ -839,7 +912,7 @@ impl App {
                 None => {
                     self.pinned.insert(k);
                 }
-                Some(w) if w < workspaces() && w != self.mons[m].active => {
+                Some(w) if self.ensure_ws(m, w + 1) && w != self.mons[m].active => {
                     self.hide(h);
                     self.mons[m].hidden[w].push(k);
                 }
@@ -890,7 +963,7 @@ impl App {
     }
 
     fn counts(&self, m: usize) -> Vec<usize> {
-        (0..workspaces())
+        (0..self.count(m))
             .map(|w| if w == self.mons[m].active { self.visible_on(m).len() } else { self.mons[m].hidden[w].len() })
             .collect()
     }
@@ -912,7 +985,7 @@ impl App {
             let hm = windows::Win32::Graphics::Gdi::MonitorFromPoint(pt, MONITOR_DEFAULTTONEAREST);
             let _ = GetDpiForMonitor(hm, MDT_EFFECTIVE_DPI, &mut dpi_x, &mut dpi_y);
             self.osd_scale = dpi_x as f32 / 96.0;
-            let l = ui::osd_layout(workspaces(), self.osd_scale);
+            let l = ui::osd_layout(self.count(m), self.osd_scale);
             let x = (mon.work.left + mon.work.right - l.w) / 2;
             let y = mon.work.top + (mon.work.bottom - mon.work.top) * 2 / 3 - l.h / 2;
             let rgn = CreateRoundRectRgn(0, 0, l.w + 1, l.h + 1, (14.0 * self.osd_scale) as i32, (14.0 * self.osd_scale) as i32);
@@ -1100,7 +1173,7 @@ pub(crate) fn show_menu(hwnd: HWND) {
             let visible = app.visible_on(m);
             let active = app.mons[m].active;
             let mut ws_nodes = Vec::new();
-            for w in 0..workspaces() {
+            for w in 0..app.count(m) {
                 let wins: Vec<isize> = if w == active { visible.iter().map(|h| hwnd_key(*h)).collect() } else { app.mons[m].hidden[w].clone() };
                 if wins.is_empty() {
                     ws_nodes.push(MenuNode::Item(format!("Workspace {}  (empty)", w + 1), Some(MenuAction::Go(m, w, None)), w == active));
@@ -1266,10 +1339,10 @@ unsafe extern "system" fn main_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
                     return;
                 }
                 app.overview_close();
-                if (HK_FOCUS..HK_FOCUS + workspaces() as i32).contains(&id) {
+                if (HK_FOCUS..HK_FOCUS + MAX_WS as i32).contains(&id) {
                     let m = app.current_mon();
                     app.switch_to(m, (id - HK_FOCUS) as usize, None);
-                } else if (HK_MOVE..HK_MOVE + workspaces() as i32).contains(&id) {
+                } else if (HK_MOVE..HK_MOVE + MAX_WS as i32).contains(&id) {
                     app.move_focused((id - HK_MOVE) as usize);
                 } else if id == HK_PIN {
                     app.toggle_pin();
@@ -1277,7 +1350,7 @@ unsafe extern "system" fn main_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
                     // Step one workspace, stopping at the ends (like Windows' desktops).
                     let m = app.current_mon();
                     let a = app.mons[m].active;
-                    let t = if id == HK_NEXT { (a + 1).min(workspaces() - 1) } else { a.saturating_sub(1) };
+                    let t = if id == HK_NEXT { (a + 1).min(app.count(m) - 1) } else { a.saturating_sub(1) };
                     app.switch_to(m, t, None);
                 }
             });
@@ -1711,7 +1784,6 @@ fn main() {
         trace("windows"); let _ = SetLayeredWindowAttributes(osd, COLORREF(0), 240, LWA_ALPHA);
 
         let cfg = config::load();
-        WS_COUNT.store(cfg.workspaces, std::sync::atomic::Ordering::Relaxed);
         let mut app = App {
             main,
             osd,
@@ -1720,7 +1792,7 @@ fn main() {
             mons: Vec::new(),
             methods: HashMap::new(),
             pinned: HashSet::new(),
-            osd_model: ui::OsdModel { label: String::new(), active: 0, counts: vec![0; workspaces()] },
+            osd_model: ui::OsdModel { label: String::new(), active: 0, counts: vec![0; 1] },
             osd_scale: 1.0,
             tray_icon: HICON::default(),
             taskbar_created: RegisterWindowMessageW(w!("TaskbarCreated")),

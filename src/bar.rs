@@ -21,7 +21,7 @@ use windows::Win32::UI::WindowsAndMessaging::*;
 
 use crate::ui;
 use crate::win::{self, hwnd_key, key_hwnd};
-use crate::{with_app, workspaces, App};
+use crate::{with_app, App};
 
 pub const CLASS: windows::core::PCWSTR = w!("LastDeskBar");
 pub const WM_APPBAR: u32 = WM_APP + 2;
@@ -197,6 +197,8 @@ pub unsafe extern "system" fn tip_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPA
 pub enum Hit {
     Start,
     Workspace(usize),
+    /// The + after the workspaces: a new one.
+    AddWorkspace,
     Launcher(usize),
     Memory,
     Keyboard,
@@ -237,6 +239,8 @@ pub struct Bar {
     pub scale: f32,
     pub start: RECT,
     pub cells: Vec<RECT>,
+    /// The + after them (zero width at the most there can be).
+    pub add: RECT,
     /// Pinned apps without a window in this bar: (index into config.launchers, rect).
     pub pins: Vec<(usize, RECT)>,
     pub buttons: Vec<Button>,
@@ -497,6 +501,9 @@ impl Bar {
         if let Some(i) = self.cells.iter().position(|r| contains(r, x, y)) {
             return Hit::Workspace(i);
         }
+        if contains(&self.add, x, y) {
+            return Hit::AddWorkspace;
+        }
         if let Some((li, _)) = self.pins.iter().find(|(_, r)| contains(r, x, y)) {
             return Hit::Launcher(*li);
         }
@@ -664,6 +671,7 @@ impl App {
                 scale: dx as f32 / 96.0,
                 start: RECT::default(),
                 cells: Vec::new(),
+                add: RECT::default(),
                 pins: Vec::new(),
                 buttons: Vec::new(),
                 tray_icons: Vec::new(),
@@ -900,7 +908,6 @@ impl App {
         }
         self.sync_launcher_icons();
         let all = win::bar_windows();
-        let n = workspaces();
         let icons_only = self.config.icons_only;
         let align = self.config.align;
         let tray_host = crate::tray::active();
@@ -948,6 +955,7 @@ impl App {
             b.start = RECT { left: pad, top: s(3.0), right: pad + s(34.0), bottom: h - s(3.0) };
             let cell = s(24.0);
             let mut x = b.start.right + s(8.0);
+            let n = self.mons[m].hidden.len().max(1);
             b.cells = (0..n)
                 .map(|_| {
                     let r = RECT { left: x, top: (h - cell) / 2, right: x + cell, bottom: (h + cell) / 2 };
@@ -955,6 +963,13 @@ impl App {
                     r
                 })
                 .collect();
+            b.add = if n < crate::MAX_WS {
+                let r = RECT { left: x, top: (h - cell) / 2, right: x + cell, bottom: (h + cell) / 2 };
+                x += cell + s(4.0);
+                r
+            } else {
+                RECT { left: x, top: 0, right: x, bottom: 0 }
+            };
             let right_w = s(150.0);
             let batt_w = s(64.0);
             b.clock = RECT { left: w - pad - right_w, top: s(3.0), right: w - pad, bottom: h - s(3.0) };
@@ -1133,6 +1148,14 @@ impl App {
                 let color = if active || occupied { ui::TEXT } else { ui::rgb(0x60, 0x63, 0x6A) };
                 let mut tr = *r;
                 ui::draw_text(mem, &(i + 1).to_string(), &mut tr, color, f_num);
+            }
+            // + : a new workspace (only while hovered does it look like a cell).
+            if b.add.right > b.add.left {
+                if b.hover == Hit::AddWorkspace {
+                    ui::fill_round(mem, b.add, s(6.0), hover_bg);
+                }
+                let mut tr = b.add;
+                ui::draw_text(mem, "+", &mut tr, ui::rgb(0x8A, 0x8E, 0x96), f_num);
             }
 
             // Pinned apps that aren't running here: icon only. A dragged one leaves an empty
@@ -1808,6 +1831,7 @@ impl App {
                 return Some(vec![VK_LWIN]);
             }
             Hit::Workspace(w) if !middle => self.switch_to(m, w, None),
+            Hit::AddWorkspace if !middle => self.add_workspace(m),
             Hit::Window(k) => unsafe {
                 let h = key_hwnd(k);
                 if middle {
@@ -1935,6 +1959,10 @@ pub unsafe extern "system" fn bar_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPA
             crate::preview::hide();
             hide_tip();
             match with_app(|app| app.bar_hit_at(hwnd, x, y)).flatten() {
+                Some(Hit::Workspace(w)) => {
+                    workspace_menu(hwnd, w);
+                    return LRESULT(0);
+                }
                 Some(Hit::Keyboard) => {
                     keyboard_menu();
                     return LRESULT(0);
@@ -2030,10 +2058,16 @@ fn window_menu(k: isize, m: usize) {
         let t = wide(if on_bar { "Unpin from bar" } else { "Pin to bar" });
         let _ = AppendMenuW(menu, MF_STRING, CMD_LAUNCHER, windows::core::PCWSTR(t.as_ptr()));
         if let Ok(sub) = CreatePopupMenu() {
-            for w in 0..workspaces() {
+            let count = with_app(|app| app.count(m)).unwrap_or(1);
+            for w in 0..count {
                 let t = wide(&format!("Workspace {}", w + 1));
                 let flags = if w == active { MF_STRING | MF_CHECKED | MF_GRAYED } else { MF_STRING };
                 let _ = AppendMenuW(sub, flags, CMD_WS + w, windows::core::PCWSTR(t.as_ptr()));
+            }
+            if count < crate::MAX_WS {
+                let _ = AppendMenuW(sub, MF_SEPARATOR, 0, windows::core::PCWSTR::null());
+                let t = wide("New workspace");
+                let _ = AppendMenuW(sub, MF_STRING, CMD_WS + count, windows::core::PCWSTR(t.as_ptr()));
             }
             let t = wide("Move to workspace");
             let _ = AppendMenuW(menu, MF_POPUP, sub.0 as usize, windows::core::PCWSTR(t.as_ptr()));
@@ -2070,9 +2104,12 @@ fn window_menu(k: isize, m: usize) {
             CMD_LAUNCHER => {
                 with_app(|app| app.toggle_launcher(k));
             }
-            c if (CMD_WS..CMD_WS + workspaces()).contains(&c) => {
+            c if (CMD_WS..CMD_WS + crate::MAX_WS).contains(&c) => {
                 with_app(|app| {
+                    // "New workspace": made first.
+                    app.ensure_ws(m, c - CMD_WS + 1);
                     app.move_window(k, (m, active), (m, c - CMD_WS));
+                    app.save();
                     app.bars_refresh();
                 });
             }
@@ -2097,6 +2134,21 @@ fn wide_z(s: &str) -> Vec<u16> {
 }
 
 /// What an exit node menu item does.
+/// A workspace cell's menu (right click): remove it (its windows move to the one before).
+fn workspace_menu(hwnd: HWND, w: usize) {
+    const CMD_REMOVE: usize = 1;
+    let Some((m, count)) = with_app(|app| app.bar_index(hwnd).map(|i| (app.bars[i].mon, app.count(app.bars[i].mon)))).flatten() else { return };
+    unsafe {
+        let Ok(menu) = CreatePopupMenu() else { return };
+        let t = wide_z(&format!("Remove workspace {}", w + 1));
+        let flags = if count > 1 { MF_STRING } else { MF_STRING | MF_GRAYED };
+        let _ = AppendMenuW(menu, flags, CMD_REMOVE, windows::core::PCWSTR(t.as_ptr()));
+        if run_menu(menu) == CMD_REMOVE {
+            with_app(|app| app.remove_workspace(m, w));
+        }
+    }
+}
+
 /// The keyboard layouts (left or right click on the indicator): the current one checked;
 /// choosing one switches the app that was focused (and, as Windows does by default, all).
 fn keyboard_menu() {

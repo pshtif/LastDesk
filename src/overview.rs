@@ -18,7 +18,7 @@ use windows::Win32::UI::WindowsAndMessaging::*;
 
 use crate::ui;
 use crate::win::{self, hwnd_key, key_hwnd};
-use crate::{monitor_labels, with_app, workspaces, App};
+use crate::{monitor_labels, with_app, App};
 
 pub const CLASS: windows::core::PCWSTR = w!("LastDeskOverview");
 
@@ -260,7 +260,7 @@ impl App {
     /// Windows per workspace on monitor `m`: (hwnd, pinned).
     fn windows_by_ws(&self, m: usize) -> Vec<Vec<(isize, bool)>> {
         let name = &self.mons[m].name;
-        (0..workspaces())
+        (0..self.count(m))
             .map(|w| {
                 if w == self.mons[m].active {
                     win::visible_windows()
@@ -458,10 +458,10 @@ impl App {
         for o in &mut ov.overlays {
             let s = |v: f32| (v * o.scale).round() as i32;
             let (pad, top_h, header_h, gap, title_h, inner) = (s(28.0), s(56.0), s(44.0), s(12.0), s(28.0), s(10.0));
-            let n = workspaces() as i32;
-            let cw = (o.w - pad * (n + 1)) / n;
             let windows = &data[o.mon];
-            o.columns = (0..workspaces())
+            let n = windows.len().max(1) as i32;
+            let cw = (o.w - pad * (n + 1)) / n;
+            o.columns = (0..windows.len())
                 .map(|w| {
                     let x = pad + w as i32 * (cw + pad);
                     let header = RECT { left: x, top: top_h, right: x + cw, bottom: top_h + header_h };

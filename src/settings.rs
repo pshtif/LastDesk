@@ -184,8 +184,8 @@ fn seg_value(id: i32) -> String {
 fn gather() -> Config {
     let lines = |id: i32| text_of(id).lines().map(|l| l.trim().to_string()).filter(|l| !l.is_empty()).collect::<Vec<_>>().join("\n");
     let text = format!(
-        "workspaces = {}\nanimation = {}\nlaunch_ignore = {}\n[keys]\nswitch = {}\nmove = {}\npin = {}\noverview = {}\nnext = {}\nprev = {}\n[bar]\nenabled = {}\nposition = {}\nbuttons = {}\nalign = {}\nhide_taskbar = {}\ntray = {}\nmemory = {}\nwin_key_start = {}\n[plugins]\nenabled = {}\n[pinned_apps]\n{}\n[launchers]\n{}\n[rules]\n{}\n",
-        seg_value(ID_WORKSPACES),
+        "remove_empty_workspaces = {}\nanimation = {}\nlaunch_ignore = {}\n[keys]\nswitch = {}\nmove = {}\npin = {}\noverview = {}\nnext = {}\nprev = {}\n[bar]\nenabled = {}\nposition = {}\nbuttons = {}\nalign = {}\nhide_taskbar = {}\ntray = {}\nmemory = {}\nwin_key_start = {}\n[plugins]\nenabled = {}\n[pinned_apps]\n{}\n[launchers]\n{}\n[rules]\n{}\n",
+        toggle_on(ID_WORKSPACES),
         seg_value(ID_ANIM),
         SETTINGS.with(|s| s.borrow().as_ref().map(|s| s.launch_ignore.join(", ")).unwrap_or_default()),
         seg_value(ID_SWITCH),
@@ -548,10 +548,7 @@ pub fn open() {
         let mut y = 18;
         header("Workspaces", y);
         y += 32;
-        label("Workspaces per monitor", y);
-        let nums: Vec<(String, String)> = (1..=9).map(|n| (n.to_string(), n.to_string())).collect();
-        let nums_ref: Vec<(&str, &str)> = nums.iter().map(|(a, b)| (a.as_str(), b.as_str())).collect();
-        seg(ID_WORKSPACES, &nums_ref, &cfg.workspaces.to_string(), y);
+        toggle(ID_WORKSPACES, "Remove empty workspaces when you leave them", cfg.remove_empty, y);
         y += 40;
         label("Switch animation", y);
         let anim_sel = match config::anim_name(cfg.animation).as_str() {

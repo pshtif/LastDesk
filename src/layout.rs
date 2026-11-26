@@ -3,6 +3,7 @@
 //!
 //! `layout.txt` (tab-separated, one record per line):
 //!   A <monitor> <active workspace>
+//!   N <monitor> <how many workspaces it has>
 //!   W <monitor> <workspace | P for pinned> <hwnd> <exe> <class> <title>
 //!
 //! On start, a window is matched by hwnd first (LastDesk restarted, window still alive),
@@ -24,6 +25,8 @@ pub struct Entry {
 #[derive(Default)]
 pub struct Layout {
     pub active: Vec<(String, usize)>,
+    /// Workspaces per monitor (older files have none: as many as their windows need).
+    pub counts: Vec<(String, usize)>,
     pub entries: Vec<Entry>,
 }
 
@@ -39,6 +42,9 @@ pub fn save(l: &Layout) {
     let mut out = String::new();
     for (m, a) in &l.active {
         out.push_str(&format!("A\t{}\t{}\n", clean(m), a));
+    }
+    for (m, n) in &l.counts {
+        out.push_str(&format!("N\t{}\t{}\n", clean(m), n));
     }
     for e in &l.entries {
         let ws = e.ws.map(|w| w.to_string()).unwrap_or_else(|| "P".into());
@@ -60,6 +66,11 @@ pub fn load() -> Layout {
             ["A", m, a] => {
                 if let Ok(a) = a.parse() {
                     l.active.push((m.to_string(), a));
+                }
+            }
+            ["N", m, n] => {
+                if let Ok(n) = n.parse() {
+                    l.counts.push((m.to_string(), n));
                 }
             }
             ["W", m, ws, h, exe, class, title] => {
