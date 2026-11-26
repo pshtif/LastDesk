@@ -282,10 +282,6 @@ use windows::Win32::Media::MediaFoundation::{
 use windows::Win32::System::Threading::{OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION};
 
 pub const STATUS_PRIVACY: usize = 2;
-/// Tailscale status changed (posted by the tailscale module).
-pub const STATUS_TAILSCALE: usize = 3;
-/// LastTerminal sessions changed (posted by the lastterminal module).
-pub const STATUS_LASTTERMINAL: usize = 4;
 
 static CAMERA_PIDS: Mutex<Vec<u32>> = Mutex::new(Vec::new());
 

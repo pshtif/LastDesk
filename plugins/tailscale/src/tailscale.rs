@@ -359,9 +359,6 @@ static STARTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::n
 static WATCH: Mutex<isize> = Mutex::new(0);
 
 /// Shown and connected? (Installed and turned on in Settings.)
-pub fn active() -> bool {
-    installed() && ENABLED.load(std::sync::atomic::Ordering::SeqCst)
-}
 
 /// Turn the integration on or off (Settings > Integrations). Off closes the connection to
 /// the Tailscale service; Tailscale itself is left as it is.
@@ -442,7 +439,7 @@ fn start(notify: impl Fn() + Send + Sync + 'static) {
             continue;
         }
         if !buf[..n].starts_with(b"HTTP/1.1 200") {
-            crate::trace(&format!("tailscale watch refused: {}", String::from_utf8_lossy(&buf[..n.min(200)]).lines().last().unwrap_or("")));
+            eprintln!("{}", format!("tailscale watch refused: {}", String::from_utf8_lossy(&buf[..n.min(200)]).lines().last().unwrap_or("")));
             basic = !basic; // try the other form
             std::thread::sleep(Duration::from_secs(1));
             continue;

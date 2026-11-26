@@ -1,0 +1,7 @@
+{
+  "id": "lastterminal",
+  "name": "LastTerminal",
+  "version": "0.1.0",
+  "description": "its running sessions in the bar; open or start it",
+  "exe": "lastterminal-plugin.exe"
+}

@@ -1,0 +1,7 @@
+{
+  "id": "tailscale",
+  "name": "Tailscale",
+  "version": "0.1.0",
+  "description": "status, connect and exit nodes in the bar",
+  "exe": "tailscale-plugin.exe"
+}

@@ -223,29 +223,3 @@ pub fn bar_windows() -> Vec<HWND> {
     }
     v
 }
-
-/// Put text on the clipboard.
-pub fn set_clipboard_text(text: &str) {
-    use windows::Win32::Foundation::{GlobalFree, HANDLE};
-    use windows::Win32::System::DataExchange::{CloseClipboard, EmptyClipboard, OpenClipboard, SetClipboardData};
-    use windows::Win32::System::Memory::{GlobalAlloc, GlobalLock, GlobalUnlock, GMEM_MOVEABLE};
-    use windows::Win32::System::Ole::CF_UNICODETEXT;
-    let w: Vec<u16> = text.encode_utf16().chain(std::iter::once(0)).collect();
-    unsafe {
-        if OpenClipboard(None).is_err() {
-            return;
-        }
-        let _ = EmptyClipboard();
-        if let Ok(h) = GlobalAlloc(GMEM_MOVEABLE, w.len() * 2) {
-            let p = GlobalLock(h) as *mut u16;
-            if !p.is_null() {
-                std::ptr::copy_nonoverlapping(w.as_ptr(), p, w.len());
-                let _ = GlobalUnlock(h);
-                if SetClipboardData(CF_UNICODETEXT.0 as u32, HANDLE(h.0)).is_err() {
-                    let _ = GlobalFree(h);
-                }
-            }
-        }
-        let _ = CloseClipboard();
-    }
-}

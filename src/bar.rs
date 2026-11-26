@@ -198,9 +198,7 @@ pub enum Hit {
     Start,
     Workspace(usize),
     Launcher(usize),
-    Tailscale,
     Memory,
-    LastTerminal,
     Keyboard,
     /// A plugin's item: index into plugins::items() (the same on every bar).
     Plugin(usize),
@@ -249,10 +247,6 @@ pub struct Bar {
     pub privacy: RECT,
     /// Memory meter (zero width when turned off).
     pub mem: RECT,
-    /// LastTerminal icon (zero width when turned off or not installed).
-    pub lt: RECT,
-    /// Tailscale icon (zero width when Tailscale isn't installed).
-    pub ts: RECT,
     /// Keyboard layout ("ENG" over "UK"; zero width with only one layout installed).
     pub kbd: RECT,
     /// Plugins' items: (plugin id, rect), in plugins::items() order.
@@ -518,14 +512,8 @@ impl Bar {
         if contains(&self.privacy, x, y) {
             return Hit::Privacy;
         }
-        if contains(&self.lt, x, y) {
-            return Hit::LastTerminal;
-        }
         if contains(&self.mem, x, y) {
             return Hit::Memory;
-        }
-        if contains(&self.ts, x, y) {
-            return Hit::Tailscale;
         }
         if contains(&self.kbd, x, y) {
             return Hit::Keyboard;
@@ -681,11 +669,9 @@ impl App {
                 tray_icons: Vec::new(),
                 tray: RECT::default(),
                 privacy: RECT::default(),
-                ts: RECT::default(),
                 kbd: RECT::default(),
                 plugins: Vec::new(),
                 mem: RECT::default(),
-                lt: RECT::default(),
                 net: RECT::default(),
                 vol: RECT::default(),
                 battery: RECT::default(),
@@ -980,12 +966,8 @@ impl App {
             let n_priv = (!self.status.mic.is_empty()) as i32 + (!self.status.cam.is_empty()) as i32;
             let kbd_w = if crate::keyboard::shown() { s(36.0) } else { 0 };
             b.kbd = RECT { left: b.net.left - kbd_w, top: s(3.0), right: b.net.left, bottom: h - s(3.0) };
-            let ts_w = if crate::tailscale::active() { icon_w } else { 0 };
-            b.ts = RECT { left: b.kbd.left - ts_w, top: s(3.0), right: b.kbd.left, bottom: h - s(3.0) };
-            let lt_w = if crate::lastterminal::active() { icon_w } else { 0 };
-            b.lt = RECT { left: b.ts.left - lt_w, top: s(3.0), right: b.ts.left, bottom: h - s(3.0) };
             let mem_w = if self.config.memory { s(70.0) } else { 0 };
-            b.mem = RECT { left: b.lt.left - mem_w, top: s(3.0), right: b.lt.left, bottom: h - s(3.0) };
+            b.mem = RECT { left: b.kbd.left - mem_w, top: s(3.0), right: b.kbd.left, bottom: h - s(3.0) };
             let mut px = b.mem.left;
             let mut plugin_rects: Vec<(String, RECT)> = crate::plugins::items()
                 .iter()
@@ -1287,34 +1269,6 @@ impl App {
                     }
                 }
             }
-            // LastTerminal: its icon, faded while its server isn't running, with the number of
-            // running sessions in the corner.
-            if b.lt.right > b.lt.left {
-                if b.hover == Hit::LastTerminal {
-                    ui::fill_round(mem, b.lt, s(6.0), hover_bg);
-                }
-                let sessions = crate::lastterminal::sessions();
-                // Its own icon (faded while its server isn't running); a glyph if it can't be loaded.
-                let sz = s(18.0);
-                let ico = crate::lastterminal::icon(sz);
-                if ico.is_invalid() {
-                    let mut r = b.lt;
-                    ui::draw_text(mem, &glyph(0xE756), &mut r, if sessions.is_some() { ui::TEXT } else { dim }, f_icon);
-                } else {
-                    let (x0, y0) = (b.lt.left + (b.lt.right - b.lt.left - sz) / 2, b.lt.top + (b.lt.bottom - b.lt.top - sz) / 2);
-                    let _ = DrawIconEx(mem, x0, y0, ico, sz, sz, 0, None, DI_NORMAL);
-                    if sessions.is_none() {
-                        ui::shade(mem, RECT { left: x0, top: y0, right: x0 + sz, bottom: y0 + sz }, ui::rgb(0x17, 0x18, 0x1B), 150);
-                    }
-                }
-                let n = sessions.as_ref().map(|s| s.len()).unwrap_or(0);
-                if n > 0 {
-                    let f_small = ui::font(s(9.5), true);
-                    let mut cr = RECT { left: b.lt.right - s(12.0), top: b.lt.bottom - s(13.0), right: b.lt.right, bottom: b.lt.bottom - s(1.0) };
-                    ui::draw_text(mem, &n.min(99).to_string(), &mut cr, ui::ACCENT, f_small);
-                    let _ = DeleteObject(f_small);
-                }
-            }
             // Plugins' items: a glyph (icon font) or short text, in the colour asked for, with an
             // optional badge in the corner.
             let items = crate::plugins::items();
@@ -1323,20 +1277,54 @@ impl App {
                 if b.hover == Hit::Plugin(n) {
                     ui::fill_round(mem, *r, s(6.0), hover_bg);
                 }
-                let color = match it.color.as_str() {
+                let color_of = |name: &str| match name {
                     "muted" => dim,
                     "accent" => ui::ACCENT,
                     "attention" => ATTENTION,
                     "red" => ui::rgb(0xF0, 0x4A, 0x4A),
+                    "green" => ui::rgb(0x5A, 0xC8, 0x6E),
                     _ => ui::TEXT,
                 };
+                let color = if it.dim { dim } else { color_of(it.color.as_str()) };
                 let mut rr = *r;
-                if !it.glyph.is_empty() {
+                if it.shape == "grid" {
+                    // 3×3 dots, a "T" of them lit in the item's colour (none lit: all dim).
+                    let lit = (!it.dim && !matches!(it.color.as_str(), "" | "none" | "muted")).then(|| color_of(it.color.as_str()));
+                    let d = s(3.0).max(2);
+                    let step = s(5.0);
+                    let (cx, cy) = ((r.left + r.right) / 2, (r.top + r.bottom) / 2);
+                    for row in -1..=1 {
+                        for col in -1..=1 {
+                            let in_t = row == 0 || (row == 1 && col == 0);
+                            let c = match lit {
+                                Some(c) if in_t => c,
+                                _ => dim,
+                            };
+                            let (x0, y0) = (cx + col * step - d / 2, cy + row * step - d / 2);
+                            ui::fill_round(mem, RECT { left: x0, top: y0, right: x0 + d, bottom: y0 + d }, d / 2, c);
+                        }
+                    }
+                } else if !it.icon.is_empty() {
+                    let sz = s(18.0);
+                    let ico = plugin_icon(&it.icon, sz);
+                    if !ico.is_invalid() {
+                        let (x0, y0) = (r.left + (r.right - r.left - sz) / 2, r.top + (r.bottom - r.top - sz) / 2);
+                        let _ = DrawIconEx(mem, x0, y0, ico, sz, sz, 0, None, DI_NORMAL);
+                        if it.dim {
+                            ui::shade(mem, RECT { left: x0, top: y0, right: x0 + sz, bottom: y0 + sz }, ui::rgb(0x17, 0x18, 0x1B), 150);
+                        }
+                    }
+                } else if !it.glyph.is_empty() {
                     ui::draw_text(mem, &it.glyph, &mut rr, color, f_icon);
                 } else {
                     let f_bold = ui::font(s(12.0), true);
                     ui::draw_text(mem, &it.text, &mut rr, color, f_bold);
                     let _ = DeleteObject(f_bold);
+                }
+                if !it.dot.is_empty() {
+                    let d = s(6.0).max(4);
+                    let (x0, y0) = (r.right - s(7.0) - d / 2, r.bottom - s(8.0) - d / 2);
+                    ui::fill_round(mem, RECT { left: x0, top: y0, right: x0 + d, bottom: y0 + d }, d, color_of(it.dot.as_str()));
                 }
                 if !it.badge.is_empty() {
                     let f_small = ui::font(s(9.5), true);
@@ -1357,38 +1345,6 @@ impl App {
                     ui::draw_text(mem, "RAM", &mut lr, ui::MUTED, f_text);
                     let mut vr = RECT { left: mid, ..b.mem };
                     ui::draw_text(mem, &format!("{p}%"), &mut vr, color, f_text);
-                }
-            }
-            // Tailscale: a 3×3 grid of dots with a bright "T" when connected (dim when not,
-            // accent colour when using an exit node, orange when it needs a login).
-            if b.ts.right > b.ts.left {
-                if b.hover == Hit::Tailscale {
-                    ui::fill_round(mem, b.ts, s(6.0), hover_bg);
-                }
-                use crate::tailscale::State;
-                let st = crate::tailscale::status().unwrap_or_default();
-                let lit = match st.state {
-                    State::Running if !st.warnings().is_empty() => Some(ATTENTION),
-                    State::Running if st.exit.is_some() => Some(ui::ACCENT),
-                    State::Running => Some(ui::TEXT),
-                    State::NeedsLogin => Some(ATTENTION),
-                    State::Starting => Some(ui::MUTED),
-                    State::Stopped | State::Unavailable => None,
-                };
-                let d = s(3.0).max(2);
-                let step = s(5.0);
-                let cx = (b.ts.left + b.ts.right) / 2;
-                let cy = (b.ts.top + b.ts.bottom) / 2;
-                for row in -1..=1 {
-                    for col in -1..=1 {
-                        let in_t = row == 0 || (row == 1 && col == 0);
-                        let color = match lit {
-                            Some(c) if in_t => c,
-                            _ => dim,
-                        };
-                        let (x0, y0) = (cx + col * step - d / 2, cy + row * step - d / 2);
-                        ui::fill_round(mem, RECT { left: x0, top: y0, right: x0 + d, bottom: y0 + d }, d / 2, color);
-                    }
                 }
             }
             // Keyboard layout: the language over the layout's country ("ENG" / "UK").
@@ -1537,49 +1493,9 @@ impl App {
                 Net::Wifi(q) => format!("Wi-Fi: {} ({}%)", self.status.ssid, q),
                 Net::Offline => "Not connected".into(),
             }),
-            Hit::Tailscale => {
-                use crate::tailscale::State;
-                let st = crate::tailscale::status().unwrap_or_default();
-                Some(match st.state {
-                    State::Running => {
-                        let mut parts = vec!["Tailscale: connected".to_string()];
-                        if !st.tailnet.is_empty() {
-                            parts.push(st.tailnet.clone());
-                        }
-                        if !st.ip.is_empty() {
-                            parts.push(st.ip.clone());
-                        }
-                        if let Some(e) = st.exit_label() {
-                            parts.push(format!("via {e}"));
-                        }
-                        let mut text = parts.join("  ·  ");
-                        // Problems on their own lines.
-                        for w in st.warnings() {
-                            text.push_str("\n⚠ ");
-                            text.push_str(&w);
-                        }
-                        text
-                    }
-                    State::Starting => "Tailscale: connecting…".into(),
-                    State::NeedsLogin => "Tailscale: needs login (click)".into(),
-                    State::Stopped => "Tailscale: disconnected".into(),
-                    State::Unavailable => "Tailscale: service not running".into(),
-                })
-            }
             Hit::Memory => Some(crate::mem::summary()),
             Hit::Keyboard => Some(crate::keyboard::name(crate::keyboard::current())),
             Hit::Plugin(n) => crate::plugins::items().get(n).map(|(_, it)| it.tooltip.clone()).filter(|t| !t.is_empty()),
-            Hit::LastTerminal => Some(match crate::lastterminal::sessions() {
-                None => "LastTerminal isn't running (click to start it)".into(),
-                Some(list) => {
-                    let mut t = format!("LastTerminal\t{}", if list.len() == 1 { "1 session".to_string() } else { format!("{} sessions", list.len()) });
-                    for s in list.iter().take(10) {
-                        let what = if s.running.is_empty() { "idle" } else { s.running.as_str() };
-                        t.push_str(&format!("\n{}\t{what}", s.name));
-                    }
-                    t
-                }
-            }),
             Hit::Battery => {
                 let mut ps = SYSTEM_POWER_STATUS::default();
                 let mut parts = Vec::new();
@@ -1608,14 +1524,12 @@ impl App {
             Hit::Volume => b.vol,
             Hit::Network => b.net,
             Hit::Privacy => b.privacy,
-            Hit::Tailscale => b.ts,
             Hit::Keyboard => b.kbd,
             Hit::Plugin(n) => match b.plugins.get(n) {
                 Some((_, r)) => *r,
                 None => return,
             },
             Hit::Memory => b.mem,
-            Hit::LastTerminal => b.lt,
             Hit::Battery => b.battery,
             _ => return,
         };
@@ -1632,7 +1546,7 @@ impl App {
             unsafe {
                 let _ = InvalidateRect(self.bars[i].hwnd, None, false);
             }
-            if matches!(self.bars[i].hover, Hit::Volume | Hit::Network | Hit::Privacy | Hit::Tailscale | Hit::LastTerminal | Hit::Memory | Hit::Battery | Hit::Keyboard | Hit::Plugin(_)) && TIP.with(|t| unsafe { IsWindowVisible(t.borrow().0).as_bool() }) {
+            if matches!(self.bars[i].hover, Hit::Volume | Hit::Network | Hit::Privacy | Hit::Memory | Hit::Battery | Hit::Keyboard | Hit::Plugin(_)) && TIP.with(|t| unsafe { IsWindowVisible(t.borrow().0).as_bool() }) {
                 self.show_status_tip(i, self.bars[i].hover);
             }
         }
@@ -1655,7 +1569,7 @@ impl App {
 
     pub fn bar_show_tip(&mut self, hwnd: HWND) {
         let Some(i) = self.bar_index(hwnd) else { return };
-        if matches!(self.bars[i].hover, Hit::Volume | Hit::Network | Hit::Privacy | Hit::Tailscale | Hit::LastTerminal | Hit::Memory | Hit::Battery | Hit::Keyboard | Hit::Plugin(_)) {
+        if matches!(self.bars[i].hover, Hit::Volume | Hit::Network | Hit::Privacy | Hit::Memory | Hit::Battery | Hit::Keyboard | Hit::Plugin(_)) {
             self.show_status_tip(i, self.bars[i].hover);
             return;
         }
@@ -1811,7 +1725,7 @@ impl App {
                 unsafe {
                     SetTimer(hwnd, TIP_TIMER, 450, None);
                 }
-            } else if matches!(hit, Hit::Volume | Hit::Network | Hit::Privacy | Hit::Tailscale | Hit::LastTerminal | Hit::Memory | Hit::Battery | Hit::Keyboard | Hit::Plugin(_) | Hit::Launcher(_)) {
+            } else if matches!(hit, Hit::Volume | Hit::Network | Hit::Privacy | Hit::Memory | Hit::Battery | Hit::Keyboard | Hit::Plugin(_) | Hit::Launcher(_)) {
                 unsafe {
                     SetTimer(hwnd, TIP_TIMER, 450, None);
                 }
@@ -1992,19 +1906,14 @@ pub unsafe extern "system" fn bar_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPA
             if msg == WM_LBUTTONUP && with_app(|app| app.bar_drag_end(hwnd)) == Some(true) {
                 return LRESULT(0);
             }
-            if msg == WM_LBUTTONUP && with_app(|app| app.bar_hit_at(hwnd, x, y)).flatten() == Some(Hit::Tailscale) {
-                hide_tip();
-                tailscale_menu();
-                return LRESULT(0);
-            }
-            if msg == WM_LBUTTONUP && with_app(|app| app.bar_hit_at(hwnd, x, y)).flatten() == Some(Hit::LastTerminal) {
-                hide_tip();
-                lastterminal_menu();
-                return LRESULT(0);
-            }
             if let Some((id, work)) = with_app(|app| app.bar_plugin_at(hwnd, x, y)).flatten() {
                 hide_tip();
-                crate::plugins::click(&id, if msg == WM_MBUTTONUP { "middle" } else { "left" }, work);
+                let menu_on_click = msg == WM_LBUTTONUP && crate::plugins::items().iter().any(|(pid, it)| *pid == id && it.menu_on_click);
+                if menu_on_click {
+                    plugin_menu(&id, work);
+                } else {
+                    crate::plugins::click(&id, if msg == WM_MBUTTONUP { "middle" } else { "left" }, work);
+                }
                 return LRESULT(0);
             }
             if msg == WM_LBUTTONUP && with_app(|app| app.bar_hit_at(hwnd, x, y)).flatten() == Some(Hit::Keyboard) {
@@ -2026,14 +1935,6 @@ pub unsafe extern "system" fn bar_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPA
             crate::preview::hide();
             hide_tip();
             match with_app(|app| app.bar_hit_at(hwnd, x, y)).flatten() {
-                Some(Hit::Tailscale) => {
-                    tailscale_menu();
-                    return LRESULT(0);
-                }
-                Some(Hit::LastTerminal) => {
-                    lastterminal_menu();
-                    return LRESULT(0);
-                }
                 Some(Hit::Keyboard) => {
                     keyboard_menu();
                     return LRESULT(0);
@@ -2196,210 +2097,6 @@ fn wide_z(s: &str) -> Vec<u16> {
 }
 
 /// What an exit node menu item does.
-enum ExitPick {
-    None,
-    Suggested,
-    Node(String),
-    Best(String, Option<String>),
-    LanAccess(bool),
-}
-
-/// Tailscale's menu (left or right click on its icon): connect/disconnect, exit node, IP.
-fn tailscale_menu() {
-    use crate::tailscale::State;
-    const CMD_TOGGLE: usize = 1;
-    const CMD_COPY_IP: usize = 2;
-    const CMD_APP: usize = 3;
-    const CMD_ADMIN: usize = 4;
-    const CMD_UNATTENDED: usize = 5;
-    const CMD_PICK: usize = 1000; // 1000 + index into picks
-    let st = crate::tailscale::status().unwrap_or_default();
-    // Refresh the exit node list in the background for next time (online states change).
-    std::thread::spawn(crate::tailscale::load_exit_nodes);
-    let nodes = crate::tailscale::exit_nodes();
-    let active = st.exit.as_ref().map(|(id, _)| id.clone());
-    let active_node = active.as_ref().and_then(|id| nodes.iter().find(|n| &n.id == id).cloned());
-    let mut picks: Vec<ExitPick> = Vec::new();
-    unsafe {
-        let Ok(menu) = CreatePopupMenu() else { return };
-        let add = |m: HMENU, flags: MENU_ITEM_FLAGS, id: usize, text: &str| {
-            let t = wide_z(&text.replace('&', "&&"));
-            let _ = AppendMenuW(m, flags, id, windows::core::PCWSTR(t.as_ptr()));
-        };
-        let add_sub = |m: HMENU, sub: HMENU, flags: MENU_ITEM_FLAGS, text: &str| {
-            let t = wide_z(&text.replace('&', "&&"));
-            let _ = AppendMenuW(m, MF_POPUP | flags, sub.0 as usize, windows::core::PCWSTR(t.as_ptr()));
-        };
-        let check = |on: bool| if on { MF_CHECKED } else { MF_UNCHECKED };
-        let head = match st.state {
-            State::Running if !st.tailnet.is_empty() => format!("Connected to {}", st.tailnet),
-            State::Running => "Connected".into(),
-            State::Starting => "Connecting…".into(),
-            State::NeedsLogin => "Needs login".into(),
-            State::Stopped => "Disconnected".into(),
-            State::Unavailable => "Tailscale service isn't running".into(),
-        };
-        add(menu, MF_STRING | MF_GRAYED, 0, &head);
-        if let Some(l) = st.exit_label() {
-            add(menu, MF_STRING | MF_GRAYED, 0, &format!("Exit node: {l}"));
-        }
-        for w in st.warnings() {
-            let w: String = if w.chars().count() > 90 { w.chars().take(87).collect::<String>() + "…" } else { w };
-            add(menu, MF_STRING | MF_GRAYED, 0, &format!("⚠ {w}"));
-        }
-        let _ = AppendMenuW(menu, MF_SEPARATOR, 0, windows::core::PCWSTR::null());
-        match st.state {
-            State::Running | State::Starting => add(menu, MF_STRING, CMD_TOGGLE, "Disconnect"),
-            State::Stopped => add(menu, MF_STRING, CMD_TOGGLE, "Connect"),
-            State::NeedsLogin => add(menu, MF_STRING, CMD_APP, "Log in…"),
-            State::Unavailable => {}
-        }
-        if st.state == State::Running {
-            if !st.ip.is_empty() {
-                add(menu, MF_STRING, CMD_COPY_IP, &format!("Copy this device's IP ({})", st.ip));
-            }
-            if !nodes.is_empty() || active.is_some() {
-                if let Ok(sub) = CreatePopupMenu() {
-                    let mut pick = |p: ExitPick| {
-                        picks.push(p);
-                        CMD_PICK + picks.len() - 1
-                    };
-                    add(sub, MF_STRING | check(active.is_none()), pick(ExitPick::None), "None");
-                    add(sub, MF_STRING, pick(ExitPick::Suggested), "Fastest (Tailscale's suggestion)");
-                    // Your own exit nodes, by name.
-                    let own: Vec<&crate::tailscale::ExitNode> = nodes.iter().filter(|n| !n.is_located()).collect();
-                    if !own.is_empty() {
-                        let _ = AppendMenuW(sub, MF_SEPARATOR, 0, windows::core::PCWSTR::null());
-                        for n in own {
-                            let on = active.as_deref() == Some(n.id.as_str());
-                            let label = if n.online { n.name.clone() } else { format!("{} (offline)", n.name) };
-                            let flags = MF_STRING | check(on) | if n.online || on { MF_ENABLED } else { MF_GRAYED };
-                            add(sub, flags, pick(ExitPick::Node(n.id.clone())), &label);
-                        }
-                    }
-                    // Located ones (Mullvad): Country → City; picking one uses its best server.
-                    let mut countries: Vec<&str> = nodes.iter().filter(|n| n.is_located()).map(|n| n.country.as_str()).collect();
-                    countries.dedup();
-                    if !countries.is_empty() {
-                        let _ = AppendMenuW(sub, MF_SEPARATOR, 0, windows::core::PCWSTR::null());
-                    }
-                    for country in countries {
-                        let in_country: Vec<&crate::tailscale::ExitNode> = nodes.iter().filter(|n| n.country == country).collect();
-                        let any_online = in_country.iter().any(|n| n.online);
-                        let here = active_node.as_ref().is_some_and(|a| a.country == country);
-                        let mut cities: Vec<&str> = in_country.iter().map(|n| n.city.as_str()).collect();
-                        cities.dedup();
-                        let dim = if any_online { MF_ENABLED } else { MF_GRAYED };
-                        if cities.len() <= 1 {
-                            add(sub, MF_STRING | check(here) | dim, pick(ExitPick::Best(country.to_string(), None)), country);
-                            continue;
-                        }
-                        let Ok(csub) = CreatePopupMenu() else { continue };
-                        add(csub, MF_STRING | dim, pick(ExitPick::Best(country.to_string(), None)), &format!("Any city in {country}"));
-                        let _ = AppendMenuW(csub, MF_SEPARATOR, 0, windows::core::PCWSTR::null());
-                        for city in cities {
-                            let online = in_country.iter().any(|n| n.city == city && n.online);
-                            let on = here && active_node.as_ref().is_some_and(|a| a.city == city);
-                            let flags = MF_STRING | check(on) | if online { MF_ENABLED } else { MF_GRAYED };
-                            add(csub, flags, pick(ExitPick::Best(country.to_string(), Some(city.to_string()))), city);
-                        }
-                        add_sub(sub, csub, check(here) | dim, country);
-                    }
-                    let _ = AppendMenuW(sub, MF_SEPARATOR, 0, windows::core::PCWSTR::null());
-                    add(sub, MF_STRING | check(st.lan_access), pick(ExitPick::LanAccess(!st.lan_access)), "Allow local network access");
-                    add_sub(menu, sub, check(active.is_some()), "Exit node");
-                }
-            }
-        }
-        if st.state != State::Unavailable {
-            add(menu, MF_STRING | check(st.unattended), CMD_UNATTENDED, "Stay connected without LastDesk (unattended)");
-        }
-        let _ = AppendMenuW(menu, MF_SEPARATOR, 0, windows::core::PCWSTR::null());
-        add(menu, MF_STRING, CMD_APP, "Open Tailscale app");
-        add(menu, MF_STRING, CMD_ADMIN, "Admin console");
-        match run_menu(menu) {
-            CMD_TOGGLE => crate::tailscale::set_running(st.state == State::Stopped),
-            CMD_COPY_IP => crate::win::set_clipboard_text(&st.ip),
-            CMD_UNATTENDED => crate::tailscale::set_unattended(!st.unattended),
-            CMD_APP => {
-                if let Some(p) = crate::tailscale::app_path() {
-                    let t = wide_z(&p);
-                    ShellExecuteW(None, w!("open"), windows::core::PCWSTR(t.as_ptr()), None, None, SW_SHOWNORMAL);
-                }
-            }
-            CMD_ADMIN => {
-                ShellExecuteW(None, w!("open"), w!("https://login.tailscale.com/admin/machines"), None, None, SW_SHOWNORMAL);
-            }
-            c if c >= CMD_PICK && c < CMD_PICK + picks.len() => match &picks[c - CMD_PICK] {
-                ExitPick::None => crate::tailscale::set_exit_node(None),
-                ExitPick::Suggested => crate::tailscale::use_suggested(),
-                ExitPick::Node(id) => crate::tailscale::set_exit_node(Some(id)),
-                ExitPick::Best(country, city) => match crate::tailscale::best_node(country, city.as_deref()) {
-                    Some(id) => crate::tailscale::set_exit_node(Some(&id)),
-                    None => crate::message("No server there is online right now.", true),
-                },
-                ExitPick::LanAccess(on) => crate::tailscale::set_lan_access(*on),
-            },
-            _ => {}
-        }
-    }
-}
-
-/// LastTerminal's menu: its running sessions (each opens LastTerminal on it), open it, or
-/// start its server when it isn't running.
-fn lastterminal_menu() {
-    const CMD_OPEN: usize = 1;
-    const CMD_START: usize = 2;
-    const CMD_SESSION: usize = 100; // 100 + index into the list
-    let list = crate::lastterminal::sessions();
-    unsafe {
-        let Ok(menu) = CreatePopupMenu() else { return };
-        let add = |flags: MENU_ITEM_FLAGS, id: usize, text: &str| {
-            let t = wide_z(&text.replace('&', "&&"));
-            let _ = AppendMenuW(menu, flags, id, windows::core::PCWSTR(t.as_ptr()));
-        };
-        match &list {
-            None => {
-                add(MF_STRING | MF_GRAYED, 0, "LastTerminal isn't running");
-                let _ = AppendMenuW(menu, MF_SEPARATOR, 0, windows::core::PCWSTR::null());
-                add(MF_STRING, CMD_START, "Start LastTerminal");
-            }
-            Some(sessions) => {
-                if sessions.is_empty() {
-                    add(MF_STRING | MF_GRAYED, 0, "No sessions running");
-                }
-                for (n, s) in sessions.iter().take(20).enumerate() {
-                    let what = if s.running.is_empty() { String::new() } else { format!("  ·  {}", s.running) };
-                    let mut label = format!("{}{what}", s.name);
-                    if label.chars().count() > 70 {
-                        label = label.chars().take(67).collect::<String>() + "…";
-                    }
-                    add(MF_STRING, CMD_SESSION + n, &label);
-                }
-                let _ = AppendMenuW(menu, MF_SEPARATOR, 0, windows::core::PCWSTR::null());
-                add(MF_STRING, CMD_OPEN, "Open LastTerminal");
-            }
-        }
-        match run_menu(menu) {
-            CMD_OPEN => crate::lastterminal::open(None),
-            CMD_START => {
-                crate::lastterminal::start_server();
-                // Give the server a moment, then open the page.
-                std::thread::spawn(|| {
-                    std::thread::sleep(std::time::Duration::from_millis(1500));
-                    crate::lastterminal::open(None);
-                });
-            }
-            c if c >= CMD_SESSION => {
-                if let Some(s) = list.as_ref().and_then(|l| l.get(c - CMD_SESSION)) {
-                    crate::lastterminal::open(Some(&s.id));
-                }
-            }
-            _ => {}
-        }
-    }
-}
-
 /// The keyboard layouts (left or right click on the indicator): the current one checked;
 /// choosing one switches the app that was focused (and, as Windows does by default, all).
 fn keyboard_menu() {
@@ -2436,6 +2133,30 @@ fn keyboard_menu() {
     }
 }
 
+/// A plugin's icon file at a size (an .ico, or the icon of an .exe / .dll), loaded once.
+fn plugin_icon(path: &str, size: i32) -> HICON {
+    thread_local! {
+        static ICONS: std::cell::RefCell<Vec<(String, i32, isize)>> = const { std::cell::RefCell::new(Vec::new()) };
+    }
+    ICONS.with(|cache| {
+        if let Some((_, _, h)) = cache.borrow().iter().find(|(p, s, _)| p == path && *s == size) {
+            return HICON(*h as *mut _);
+        }
+        let w = wide_z(path);
+        let h = unsafe {
+            if path.to_lowercase().ends_with(".ico") {
+                LoadImageW(None, windows::core::PCWSTR(w.as_ptr()), IMAGE_ICON, size, size, LR_LOADFROMFILE).map(|h| h.0 as isize).unwrap_or(0)
+            } else {
+                let mut large = HICON::default();
+                ExtractIconExW(windows::core::PCWSTR(w.as_ptr()), 0, Some(&mut large), None, 1);
+                large.0 as isize
+            }
+        };
+        cache.borrow_mut().push((path.to_string(), size, h));
+        HICON(h as *mut _)
+    })
+}
+
 /// A plugin's menu (right click on its item); a right click goes to it when it has none.
 fn plugin_menu(id: &str, work: RECT) {
     let items = crate::plugins::menu(id);
@@ -2443,9 +2164,9 @@ fn plugin_menu(id: &str, work: RECT) {
         crate::plugins::click(id, "right", work);
         return;
     }
-    unsafe {
-        let Ok(menu) = CreatePopupMenu() else { return };
-        for (n, it) in items.iter().enumerate() {
+    /// Adds items (and their submenus) to a menu; command n is ids[n - 1].
+    unsafe fn add(menu: HMENU, items: &[crate::plugins::MenuItem], ids: &mut Vec<String>) {
+        for it in items {
             if it.separator {
                 let _ = AppendMenuW(menu, MF_SEPARATOR, 0, windows::core::PCWSTR::null());
                 continue;
@@ -2458,12 +2179,25 @@ fn plugin_menu(id: &str, work: RECT) {
                 flags |= MF_GRAYED;
             }
             let t = wide_z(&it.label.replace('&', "&&"));
-            let _ = AppendMenuW(menu, flags, 1 + n, windows::core::PCWSTR(t.as_ptr()));
+            if !it.items.is_empty() {
+                if let Ok(sub) = CreatePopupMenu() {
+                    add(sub, &it.items, ids);
+                    let _ = AppendMenuW(menu, flags | MF_POPUP, sub.0 as usize, windows::core::PCWSTR(t.as_ptr()));
+                }
+                continue;
+            }
+            ids.push(it.id.clone());
+            let _ = AppendMenuW(menu, flags, ids.len(), windows::core::PCWSTR(t.as_ptr()));
         }
+    }
+    unsafe {
+        let Ok(menu) = CreatePopupMenu() else { return };
+        let mut ids = Vec::new();
+        add(menu, &items, &mut ids);
         let cmd = run_menu(menu);
         if cmd >= 1 {
-            if let Some(it) = items.get(cmd - 1) {
-                crate::plugins::menu_chosen(id, &it.id, work);
+            if let Some(chosen) = ids.get(cmd - 1) {
+                crate::plugins::menu_chosen(id, chosen, work);
             }
         }
     }

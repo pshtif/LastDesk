@@ -21,7 +21,6 @@ mod cloak;
 mod config;
 mod guard;
 mod keyboard;
-mod lastterminal;
 mod launcher;
 mod layout;
 mod mem;
@@ -35,7 +34,6 @@ mod taskbar;
 mod tray;
 mod tweaks;
 mod ui;
-mod tailscale;
 mod win;
 mod winkey;
 
@@ -544,21 +542,6 @@ impl App {
     fn integrations_apply(&mut self) {
         plugins::apply(&self.config.plugins, self.main);
         winkey::set_enabled(self.config.win_key_start, self.main);
-        let was = tailscale::active();
-        let m = self.main.0 as isize;
-        tailscale::set_enabled(self.config.bar && self.config.tailscale, move || unsafe {
-            let _ = PostMessageW(HWND(m as *mut _), status::WM_STATUS, WPARAM(status::STATUS_TAILSCALE), LPARAM(0));
-        });
-        if tailscale::active() != was {
-            self.bars_refresh(); // the icon's slot appears / goes
-        }
-        let was = lastterminal::active();
-        lastterminal::set_enabled(self.config.bar && self.config.lastterminal, move || unsafe {
-            let _ = PostMessageW(HWND(m as *mut _), status::WM_STATUS, WPARAM(status::STATUS_LASTTERMINAL), LPARAM(0));
-        });
-        if lastterminal::active() != was {
-            self.bars_refresh();
-        }
     }
 
     fn apply_config(&mut self, new: config::Config) -> Vec<String> {
@@ -1397,8 +1380,16 @@ unsafe extern "system" fn main_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
         status::WM_STATUS => {
             if wp.0 == plugins::STATUS_PLUGINS {
                 with_app(|app| {
-                    for (title, text) in plugins::take_notices() {
-                        notify_info(app.main, &title, &text);
+                    for (title, text, warning) in plugins::take_notices() {
+                        if warning {
+                            notify_balloon(app.main, &title, &text);
+                        } else {
+                            notify_info(app.main, &title, &text);
+                        }
+                    }
+                    // Opened as a pinned web app would be: a browser window already showing it comes forward.
+                    for target in plugins::take_opens() {
+                        launcher::open(&config::Launcher { name: String::new(), target, icon: String::new() });
                     }
                     if plugins::hotkeys_changed() {
                         let failed = plugins::register_hotkeys(app.main);
@@ -1417,19 +1408,6 @@ unsafe extern "system" fn main_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
                 }
                 if wp.0 == status::STATUS_NET && !app.status.refresh_net() {
                     return;
-                }
-                if wp.0 == status::STATUS_TAILSCALE {
-                    let st = tailscale::status().unwrap_or_default();
-                    trace(&format!(
-                        "tailscale {:?} nodes={} exit={:?} warnings={}",
-                        st.state,
-                        tailscale::exit_nodes().len(),
-                        st.exit.as_ref().map(|(_, online)| if *online { "online" } else { "offline" }),
-                        st.warnings().len()
-                    ));
-                    if let Some(text) = tailscale::take_alert() {
-                        notify_balloon(app.main, "Tailscale", &text);
-                    }
                 }
                 if wp.0 == status::STATUS_PRIVACY {
                     if app.status.refresh_privacy() {

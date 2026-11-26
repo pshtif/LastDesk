@@ -17,14 +17,20 @@
 //!
 //! Plugin → LastDesk:
 //! ```text
-//! {"type":"item","glyph":""|"text":"REC","tooltip":"…","color":"text|muted|accent|attention|red","badge":"…"}
+//! {"type":"item", one of: "glyph":"\uE722" | "text":"REC" | "icon":"C:\…\x.ico (or an .exe)" |
+//!               "shape":"grid" (3×3 dots, the lit ones in "color"),
+//!               "tooltip":"…", "color":"text|muted|accent|attention|red", "badge":"…",
+//!               "dim":true (shown as off), "dot":"<color>" (a dot in the corner),
+//!               "menuOnClick":true (a left click shows the menu too)}
 //! {"type":"item"}                                          no bar item
-//! {"type":"menu","items":[{"id","label","checked","enabled"} | {"separator":true}]}   right-click menu
+//! {"type":"menu","items":[{"id","label","checked","enabled","items":[…a submenu…]} | {"separator":true}]}
 //! {"type":"hotkeys","keys":[{"id","key":"ctrl+shift+s"}]}
-//! {"type":"notify","title":"…","text":"…"}                 a notification
+//! {"type":"notify","title":"…","text":"…","kind":"warning"?}   a notification
+//! {"type":"open","target":"https://…"}     opened by LastDesk (a browser window already showing
+//!                                          it is brought forward instead)
 //! ```
-//! A left click goes to the plugin as "click"; a right click shows its menu (a click when it has
-//! none).
+//! A left click goes to the plugin as "click" (or shows the menu, with menuOnClick); a right click
+//! shows its menu (a click when it has none).
 
 use std::io::{BufRead, BufReader, Write};
 use std::os::windows::process::CommandExt;
@@ -62,6 +68,13 @@ pub struct Item {
     pub tooltip: String,
     pub color: String,
     pub badge: String,
+    /// An icon file (.ico, or an .exe / .dll whose icon is used).
+    pub icon: String,
+    /// A drawn shape instead ("grid": 3×3 dots).
+    pub shape: String,
+    pub dim: bool,
+    pub dot: String,
+    pub menu_on_click: bool,
 }
 
 #[derive(Clone, Default, Debug)]
@@ -71,6 +84,25 @@ pub struct MenuItem {
     pub checked: bool,
     pub enabled: bool,
     pub separator: bool,
+    /// A submenu.
+    pub items: Vec<MenuItem>,
+}
+
+fn menu_items(v: &Value) -> Vec<MenuItem> {
+    v.as_array()
+        .map(|a| {
+            a.iter()
+                .map(|m| MenuItem {
+                    id: m["id"].as_str().unwrap_or("").to_string(),
+                    label: m["label"].as_str().unwrap_or("").to_string(),
+                    checked: m["checked"].as_bool().unwrap_or(false),
+                    enabled: m["enabled"].as_bool().unwrap_or(true),
+                    separator: m["separator"].as_bool().unwrap_or(false),
+                    items: menu_items(&m["items"]),
+                })
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 struct Running {
@@ -83,7 +115,10 @@ struct Running {
 }
 
 static RUNNING: Mutex<Vec<Running>> = Mutex::new(Vec::new());
-static NOTICES: Mutex<Vec<(String, String)>> = Mutex::new(Vec::new());
+/// Notifications asked for: (title, text, a warning).
+static NOTICES: Mutex<Vec<(String, String, bool)>> = Mutex::new(Vec::new());
+/// Addresses plugins asked LastDesk to open.
+static OPENS: Mutex<Vec<String>> = Mutex::new(Vec::new());
 /// The hotkeys registered now: (plugin id, its hotkey id), by HK_BASE + index.
 static REGISTERED: Mutex<Vec<(String, String)>> = Mutex::new(Vec::new());
 static MAIN: AtomicIsize = AtomicIsize::new(0);
@@ -148,7 +183,7 @@ pub fn apply(enabled: &[String], main: HWND) {
                     run.push(r);
                     changed = true;
                 }
-                Err(e) => NOTICES.lock().unwrap().push((m.name.clone(), format!("Couldn't start: {e}"))),
+                Err(e) => NOTICES.lock().unwrap().push((m.name.clone(), format!("Couldn't start: {e}"), true)),
             }
         }
     }
@@ -208,30 +243,28 @@ pub fn stop_all() {
 fn take(id: &str, v: &Value) {
     let s = |k: &str| v[k].as_str().unwrap_or("").to_string();
     match v["type"].as_str() {
-        Some("notify") => NOTICES.lock().unwrap().push((s("title"), s("text"))),
+        Some("notify") => NOTICES.lock().unwrap().push((s("title"), s("text"), s("kind") == "warning")),
+        Some("open") => OPENS.lock().unwrap().push(s("target")),
         Some(kind @ ("item" | "menu" | "hotkeys")) => {
             let mut run = RUNNING.lock().unwrap();
             let Some(r) = run.iter_mut().find(|r| r.id == id) else { return };
             match kind {
                 "item" => {
-                    r.item = (v.get("glyph").is_some() || v.get("text").is_some())
-                        .then(|| Item { glyph: s("glyph"), text: s("text"), tooltip: s("tooltip"), color: s("color"), badge: s("badge") });
+                    r.item = ["glyph", "text", "icon", "shape"].iter().any(|k| v.get(*k).is_some()).then(|| Item {
+                        glyph: s("glyph"),
+                        text: s("text"),
+                        tooltip: s("tooltip"),
+                        color: s("color"),
+                        badge: s("badge"),
+                        icon: s("icon"),
+                        shape: s("shape"),
+                        dim: v["dim"].as_bool().unwrap_or(false),
+                        dot: s("dot"),
+                        menu_on_click: v["menuOnClick"].as_bool().unwrap_or(false),
+                    });
                 }
                 "menu" => {
-                    r.menu = v["items"]
-                        .as_array()
-                        .map(|a| {
-                            a.iter()
-                                .map(|m| MenuItem {
-                                    id: m["id"].as_str().unwrap_or("").to_string(),
-                                    label: m["label"].as_str().unwrap_or("").to_string(),
-                                    checked: m["checked"].as_bool().unwrap_or(false),
-                                    enabled: m["enabled"].as_bool().unwrap_or(true),
-                                    separator: m["separator"].as_bool().unwrap_or(false),
-                                })
-                                .collect()
-                        })
-                        .unwrap_or_default();
+                    r.menu = menu_items(&v["items"]);
                 }
                 _ => {
                     r.hotkeys = v["keys"]
@@ -255,9 +288,14 @@ pub fn menu(id: &str) -> Vec<MenuItem> {
     RUNNING.lock().unwrap().iter().find(|r| r.id == id).map(|r| r.menu.clone()).unwrap_or_default()
 }
 
-/// Notifications plugins asked for since last time: (title, text).
-pub fn take_notices() -> Vec<(String, String)> {
+/// Notifications plugins asked for since last time: (title, text, a warning).
+pub fn take_notices() -> Vec<(String, String, bool)> {
     std::mem::take(&mut *NOTICES.lock().unwrap())
+}
+
+/// Addresses plugins asked to open since last time.
+pub fn take_opens() -> Vec<String> {
+    std::mem::take(&mut *OPENS.lock().unwrap())
 }
 
 fn rect_json(r: RECT) -> Value {
