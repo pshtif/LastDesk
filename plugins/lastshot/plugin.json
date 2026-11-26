@@ -1,0 +1,7 @@
+{
+  "id": "lastshot",
+  "name": "LastShot",
+  "version": "0.1.0",
+  "description": "screenshots and recordings of a region, window or monitor",
+  "exe": "lastshot.exe"
+}

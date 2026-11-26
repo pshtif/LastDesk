@@ -52,6 +52,8 @@ const ID_MEMORY: i32 = 120;
 const ID_TWEAK: i32 = 130;
 /// Section headers: ID_SECTION + section index.
 const ID_SECTION: i32 = 150;
+/// Plugins: ID_PLUGIN + index into plugins::discover().
+const ID_PLUGIN: i32 = 200;
 const ID_LASTTERMINAL: i32 = 121;
 
 const EN_KILLFOCUS: u32 = 0x0200;
@@ -184,7 +186,7 @@ fn seg_value(id: i32) -> String {
 fn gather() -> Config {
     let lines = |id: i32| text_of(id).lines().map(|l| l.trim().to_string()).filter(|l| !l.is_empty()).collect::<Vec<_>>().join("\n");
     let text = format!(
-        "workspaces = {}\nanimation = {}\nlaunch_ignore = {}\n[keys]\nswitch = {}\nmove = {}\npin = {}\noverview = {}\nnext = {}\nprev = {}\n[bar]\nenabled = {}\nposition = {}\nbuttons = {}\nalign = {}\nhide_taskbar = {}\ntray = {}\nmemory = {}\ntailscale = {}\nlastterminal = {}\nwin_key_start = {}\n[pinned_apps]\n{}\n[launchers]\n{}\n[rules]\n{}\n",
+        "workspaces = {}\nanimation = {}\nlaunch_ignore = {}\n[keys]\nswitch = {}\nmove = {}\npin = {}\noverview = {}\nnext = {}\nprev = {}\n[bar]\nenabled = {}\nposition = {}\nbuttons = {}\nalign = {}\nhide_taskbar = {}\ntray = {}\nmemory = {}\ntailscale = {}\nlastterminal = {}\nwin_key_start = {}\n[plugins]\nenabled = {}\n[pinned_apps]\n{}\n[launchers]\n{}\n[rules]\n{}\n",
         seg_value(ID_WORKSPACES),
         seg_value(ID_ANIM),
         SETTINGS.with(|s| s.borrow().as_ref().map(|s| s.launch_ignore.join(", ")).unwrap_or_default()),
@@ -204,6 +206,13 @@ fn gather() -> Config {
         toggle_on(ID_TAILSCALE),
         toggle_on(ID_LASTTERMINAL),
         toggle_on(ID_WINKEY),
+        crate::plugins::discover()
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| toggle_on(ID_PLUGIN + *i as i32))
+            .map(|(_, p)| p.id.clone())
+            .collect::<Vec<_>>()
+            .join(", "),
         lines(ID_PINNED),
         // Not edited here (pin/unpin from the bar): keep the app's current list.
         with_app(|a| a.config.launchers.clone())
@@ -618,6 +627,19 @@ pub fn open() {
         }
         y += 12;
 
+        // Plugins found in the plugins folder: each on or off.
+        let found = crate::plugins::discover();
+        if !found.is_empty() {
+            header("Plugins", y);
+            y += 34;
+            for (i, p) in found.iter().enumerate() {
+                let text = if p.description.is_empty() { p.name.clone() } else { format!("{} \u{2014} {}", p.name, p.description) };
+                toggle(ID_PLUGIN + i as i32, &text, cfg.plugins.contains(&p.id), y);
+                y += 36;
+            }
+            y += 12;
+        }
+
         // Windows tweaks: show and change the system's own settings (not stored in config).
         header("Windows tweaks", y);
         y += 26;
@@ -830,6 +852,7 @@ pub unsafe extern "system" fn settings_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp
                 ID_WORKSPACES | ID_ANIM | ID_SWITCH | ID_MOVE | ID_BAR | ID_EDGE | ID_BUTTONS | ID_ALIGN | ID_HIDE_TASKBAR | ID_TRAY | ID_MEMORY | ID_TAILSCALE | ID_LASTTERMINAL | ID_WINKEY => apply(),
                 ID_PIN | ID_OVERVIEW | ID_NEXT | ID_PREV | ID_PINNED | ID_RULES if code == EN_KILLFOCUS => apply(),
                 // STN_CLICKED only (a double-click also sends STN_DBLCLK: don't fold twice).
+                i if (ID_PLUGIN..ID_PLUGIN + 50).contains(&i) => apply(),
                 i if (ID_SECTION..ID_SECTION + 20).contains(&i) && code == 0 => toggle_section(hwnd, (i - ID_SECTION) as usize),
                 i if (ID_TWEAK..ID_TWEAK + crate::tweaks::ALL.len() as i32).contains(&i) => {
                     let t = crate::tweaks::ALL[(i - ID_TWEAK) as usize];

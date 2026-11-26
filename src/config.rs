@@ -96,6 +96,8 @@ pub struct Config {
     pub lastterminal: bool,
     /// The Win key opens Start on the monitor you're on (needs a keyboard hook).
     pub win_key_start: bool,
+    /// Plugins turned on (their ids; see plugins.rs).
+    pub plugins: Vec<String>,
     pub errors: Vec<String>,
 }
 
@@ -233,9 +235,12 @@ pub fn parse(text: &str) -> Config {
         tailscale: false,
         lastterminal: false,
         win_key_start: false,
+        plugins: Vec::new(),
         errors: Vec::new(),
     };
     let mut section = String::new();
+    // A byte-order mark (some editors write one) isn't part of the first line.
+    let text = text.trim_start_matches('\u{feff}');
     for (n, raw) in text.lines().enumerate() {
         let line = raw.split('#').next().unwrap_or("").trim();
         if line.is_empty() {
@@ -330,6 +335,7 @@ pub fn parse(text: &str) -> Config {
                 Some(b) => c.win_key_start = b,
                 None => bad(),
             },
+            ("plugins", "enabled") => c.plugins = val.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect(),
             ("pinned_apps", app) => c.pinned_apps.push(app.trim_end_matches(".exe").to_string()),
             ("launchers", name) if !val.is_empty() => c.launchers.push(Launcher::parse(name, val)),
             ("rules", app) => {
@@ -401,6 +407,9 @@ pub fn render(c: &Config) -> String {
     s.push_str(&format!("lastterminal = {}\n", c.lastterminal));
     s.push_str("# The Win key opens Start on the monitor you're on (uses a keyboard hook that only looks at the Win key).\n");
     s.push_str(&format!("win_key_start = {}\n\n", c.win_key_start));
+    s.push_str("[plugins]\n");
+    s.push_str("# Plugins turned on (their ids), from the plugins folder next to lastdesk.exe.\n");
+    s.push_str(&format!("enabled = {}\n\n", c.plugins.join(", ")));
     s.push_str("[pinned_apps]\n");
     s.push_str("# Apps shown on every workspace. One exe name per line (without .exe), e.g. spotify\n");
     for a in &c.pinned_apps {

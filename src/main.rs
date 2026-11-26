@@ -27,6 +27,7 @@ mod layout;
 mod mem;
 mod netdrives;
 mod overview;
+mod plugins;
 mod preview;
 mod settings;
 mod status;
@@ -498,6 +499,7 @@ impl App {
             let _ = UnregisterHotKey(self.main, HK_NEXT);
             let _ = UnregisterHotKey(self.main, HK_PREV);
         }
+        plugins::unregister_hotkeys(self.main);
     }
 
     /// Register shortcuts from the config; returns the ones another app already owns.
@@ -527,6 +529,7 @@ impl App {
                 failed.push(format!("{} (previous)", c.prev.text));
             }
         }
+        failed.extend(plugins::register_hotkeys(self.main));
         failed
     }
 
@@ -539,6 +542,7 @@ impl App {
     /// Apply a config (from file or the Settings window). Returns problems to report.
     /// Optional integrations (Settings > Integrations): start or stop each to match the config.
     fn integrations_apply(&mut self) {
+        plugins::apply(&self.config.plugins, self.main);
         winkey::set_enabled(self.config.win_key_start, self.main);
         let was = tailscale::active();
         let m = self.main.0 as isize;
@@ -991,6 +995,18 @@ fn notify_balloon(hwnd: HWND, title: &str, text: &str) {
     }
 }
 
+/// The same as a plain notice (a plugin's: saved, copied…), not a warning.
+fn notify_info(hwnd: HWND, title: &str, text: &str) {
+    let mut nid = tray_data(hwnd);
+    nid.uFlags = NIF_INFO;
+    nid.dwInfoFlags = NIIF_INFO;
+    copy_wide(&mut nid.szInfoTitle, title);
+    copy_wide(&mut nid.szInfo, text);
+    unsafe {
+        let _ = Shell_NotifyIconW(NIM_MODIFY, &nid);
+    }
+}
+
 fn tray_data(hwnd: HWND) -> NOTIFYICONDATAW {
     NOTIFYICONDATAW { cbSize: std::mem::size_of::<NOTIFYICONDATAW>() as u32, hWnd: hwnd, uID: 1, ..Default::default() }
 }
@@ -1256,6 +1272,11 @@ unsafe extern "system" fn main_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
         WM_HOTKEY => {
             mask_alt();
             let id = wp.0 as i32;
+            if (plugins::HK_BASE..plugins::HK_BASE + 100).contains(&id) {
+                let work = with_app(|app| app.monitors.get(app.current_mon()).map(|m| m.work)).flatten().unwrap_or_default();
+                plugins::hotkey(id, work);
+                return LRESULT(0);
+            }
             with_app(|app| {
                 if id == HK_OVERVIEW {
                     app.overview_toggle();
@@ -1374,6 +1395,22 @@ unsafe extern "system" fn main_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
             LRESULT(0)
         }
         status::WM_STATUS => {
+            if wp.0 == plugins::STATUS_PLUGINS {
+                with_app(|app| {
+                    for (title, text) in plugins::take_notices() {
+                        notify_info(app.main, &title, &text);
+                    }
+                    if plugins::hotkeys_changed() {
+                        let failed = plugins::register_hotkeys(app.main);
+                        if !failed.is_empty() {
+                            notify_balloon(app.main, "LastDesk", &format!("These shortcuts are used by another app and won't work: {}", failed.join(", ")));
+                        }
+                    }
+                    app.bars_refresh(); // an item may have appeared or gone
+                    app.bars_status_changed();
+                });
+                return LRESULT(0);
+            }
             with_app(|app| {
                 if wp.0 == status::STATUS_NET {
                     netdrives::schedule_check(); // joined another network? (debounced, off the UI thread)
@@ -1432,6 +1469,7 @@ unsafe extern "system" fn main_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
         WM_DESTROY => {
             trace("main window: WM_DESTROY");
             guard::mark_clean_exit();
+            plugins::stop_all();
             tray::destroy();
             with_app(|app| {
                 app.taskbar_restore();

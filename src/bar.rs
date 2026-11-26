@@ -202,6 +202,8 @@ pub enum Hit {
     Memory,
     LastTerminal,
     Keyboard,
+    /// A plugin's item: index into plugins::items() (the same on every bar).
+    Plugin(usize),
     Window(isize),
     TrayIcon(usize),
     Tray,
@@ -253,6 +255,8 @@ pub struct Bar {
     pub ts: RECT,
     /// Keyboard layout ("ENG" over "UK"; zero width with only one layout installed).
     pub kbd: RECT,
+    /// Plugins' items: (plugin id, rect), in plugins::items() order.
+    pub plugins: Vec<(String, RECT)>,
     pub net: RECT,
     pub vol: RECT,
     pub battery: RECT,
@@ -526,6 +530,9 @@ impl Bar {
         if contains(&self.kbd, x, y) {
             return Hit::Keyboard;
         }
+        if let Some(n) = self.plugins.iter().position(|(_, r)| contains(r, x, y)) {
+            return Hit::Plugin(n);
+        }
         if contains(&self.net, x, y) {
             return Hit::Network;
         }
@@ -676,6 +683,7 @@ impl App {
                 privacy: RECT::default(),
                 ts: RECT::default(),
                 kbd: RECT::default(),
+                plugins: Vec::new(),
                 mem: RECT::default(),
                 lt: RECT::default(),
                 net: RECT::default(),
@@ -978,7 +986,19 @@ impl App {
             b.lt = RECT { left: b.ts.left - lt_w, top: s(3.0), right: b.ts.left, bottom: h - s(3.0) };
             let mem_w = if self.config.memory { s(70.0) } else { 0 };
             b.mem = RECT { left: b.lt.left - mem_w, top: s(3.0), right: b.lt.left, bottom: h - s(3.0) };
-            b.privacy = RECT { left: b.mem.left - icon_w * n_priv, top: s(3.0), right: b.mem.left, bottom: h - s(3.0) };
+            let mut px = b.mem.left;
+            let mut plugin_rects: Vec<(String, RECT)> = crate::plugins::items()
+                .iter()
+                .rev()
+                .map(|(id, it)| {
+                    let wdt = if it.glyph.is_empty() && !it.text.is_empty() { s(16.0) + s(7.5) * it.text.chars().count() as i32 } else { icon_w };
+                    px -= wdt;
+                    (id.clone(), RECT { left: px, top: s(3.0), right: px + wdt, bottom: h - s(3.0) })
+                })
+                .collect();
+            plugin_rects.reverse();
+            b.plugins = plugin_rects;
+            b.privacy = RECT { left: px - icon_w * n_priv, top: s(3.0), right: px, bottom: h - s(3.0) };
             let mut ix = b.privacy.left - s(4.0);
             let mut tray_icons: Vec<(u32, u32, RECT)> = icons
                 .iter()
@@ -1295,6 +1315,36 @@ impl App {
                     let _ = DeleteObject(f_small);
                 }
             }
+            // Plugins' items: a glyph (icon font) or short text, in the colour asked for, with an
+            // optional badge in the corner.
+            let items = crate::plugins::items();
+            for (n, (id, r)) in b.plugins.iter().enumerate() {
+                let Some((_, it)) = items.iter().find(|(pid, _)| pid == id) else { continue };
+                if b.hover == Hit::Plugin(n) {
+                    ui::fill_round(mem, *r, s(6.0), hover_bg);
+                }
+                let color = match it.color.as_str() {
+                    "muted" => dim,
+                    "accent" => ui::ACCENT,
+                    "attention" => ATTENTION,
+                    "red" => ui::rgb(0xF0, 0x4A, 0x4A),
+                    _ => ui::TEXT,
+                };
+                let mut rr = *r;
+                if !it.glyph.is_empty() {
+                    ui::draw_text(mem, &it.glyph, &mut rr, color, f_icon);
+                } else {
+                    let f_bold = ui::font(s(12.0), true);
+                    ui::draw_text(mem, &it.text, &mut rr, color, f_bold);
+                    let _ = DeleteObject(f_bold);
+                }
+                if !it.badge.is_empty() {
+                    let f_small = ui::font(s(9.5), true);
+                    let mut cr = RECT { left: r.right - s(14.0), top: r.bottom - s(13.0), right: r.right, bottom: r.bottom - s(1.0) };
+                    ui::draw_text(mem, &it.badge, &mut cr, ui::ACCENT, f_small);
+                    let _ = DeleteObject(f_small);
+                }
+            }
             // Memory meter: "RAM 62%", orange when memory is getting full, red when it's nearly gone.
             if b.mem.right > b.mem.left {
                 if b.hover == Hit::Memory {
@@ -1422,6 +1472,14 @@ impl App {
         }
     }
 
+    /// The plugin item under (x, y) on this bar, with the work area of the bar's monitor.
+    pub fn bar_plugin_at(&self, hwnd: HWND, x: i32, y: i32) -> Option<(String, RECT)> {
+        let b = &self.bars[self.bar_index(hwnd)?];
+        let Hit::Plugin(n) = b.hit(x, y) else { return None };
+        let work = self.monitors.get(b.mon).map(|m| m.work).unwrap_or(b.rect);
+        b.plugins.get(n).map(|(id, _)| (id.clone(), work))
+    }
+
     /// What's under (x, y) on this bar.
     pub fn bar_hit_at(&self, hwnd: HWND, x: i32, y: i32) -> Option<Hit> {
         Some(self.bars[self.bar_index(hwnd)?].hit(x, y))
@@ -1510,6 +1568,7 @@ impl App {
             }
             Hit::Memory => Some(crate::mem::summary()),
             Hit::Keyboard => Some(crate::keyboard::name(crate::keyboard::current())),
+            Hit::Plugin(n) => crate::plugins::items().get(n).map(|(_, it)| it.tooltip.clone()).filter(|t| !t.is_empty()),
             Hit::LastTerminal => Some(match crate::lastterminal::sessions() {
                 None => "LastTerminal isn't running (click to start it)".into(),
                 Some(list) => {
@@ -1551,6 +1610,10 @@ impl App {
             Hit::Privacy => b.privacy,
             Hit::Tailscale => b.ts,
             Hit::Keyboard => b.kbd,
+            Hit::Plugin(n) => match b.plugins.get(n) {
+                Some((_, r)) => *r,
+                None => return,
+            },
             Hit::Memory => b.mem,
             Hit::LastTerminal => b.lt,
             Hit::Battery => b.battery,
@@ -1569,7 +1632,7 @@ impl App {
             unsafe {
                 let _ = InvalidateRect(self.bars[i].hwnd, None, false);
             }
-            if matches!(self.bars[i].hover, Hit::Volume | Hit::Network | Hit::Privacy | Hit::Tailscale | Hit::LastTerminal | Hit::Memory | Hit::Battery | Hit::Keyboard) && TIP.with(|t| unsafe { IsWindowVisible(t.borrow().0).as_bool() }) {
+            if matches!(self.bars[i].hover, Hit::Volume | Hit::Network | Hit::Privacy | Hit::Tailscale | Hit::LastTerminal | Hit::Memory | Hit::Battery | Hit::Keyboard | Hit::Plugin(_)) && TIP.with(|t| unsafe { IsWindowVisible(t.borrow().0).as_bool() }) {
                 self.show_status_tip(i, self.bars[i].hover);
             }
         }
@@ -1592,7 +1655,7 @@ impl App {
 
     pub fn bar_show_tip(&mut self, hwnd: HWND) {
         let Some(i) = self.bar_index(hwnd) else { return };
-        if matches!(self.bars[i].hover, Hit::Volume | Hit::Network | Hit::Privacy | Hit::Tailscale | Hit::LastTerminal | Hit::Memory | Hit::Battery | Hit::Keyboard) {
+        if matches!(self.bars[i].hover, Hit::Volume | Hit::Network | Hit::Privacy | Hit::Tailscale | Hit::LastTerminal | Hit::Memory | Hit::Battery | Hit::Keyboard | Hit::Plugin(_)) {
             self.show_status_tip(i, self.bars[i].hover);
             return;
         }
@@ -1748,7 +1811,7 @@ impl App {
                 unsafe {
                     SetTimer(hwnd, TIP_TIMER, 450, None);
                 }
-            } else if matches!(hit, Hit::Volume | Hit::Network | Hit::Privacy | Hit::Tailscale | Hit::LastTerminal | Hit::Memory | Hit::Battery | Hit::Keyboard | Hit::Launcher(_)) {
+            } else if matches!(hit, Hit::Volume | Hit::Network | Hit::Privacy | Hit::Tailscale | Hit::LastTerminal | Hit::Memory | Hit::Battery | Hit::Keyboard | Hit::Plugin(_) | Hit::Launcher(_)) {
                 unsafe {
                     SetTimer(hwnd, TIP_TIMER, 450, None);
                 }
@@ -1939,6 +2002,11 @@ pub unsafe extern "system" fn bar_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPA
                 lastterminal_menu();
                 return LRESULT(0);
             }
+            if let Some((id, work)) = with_app(|app| app.bar_plugin_at(hwnd, x, y)).flatten() {
+                hide_tip();
+                crate::plugins::click(&id, if msg == WM_MBUTTONUP { "middle" } else { "left" }, work);
+                return LRESULT(0);
+            }
             if msg == WM_LBUTTONUP && with_app(|app| app.bar_hit_at(hwnd, x, y)).flatten() == Some(Hit::Keyboard) {
                 hide_tip();
                 keyboard_menu();
@@ -1968,6 +2036,12 @@ pub unsafe extern "system" fn bar_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPA
                 }
                 Some(Hit::Keyboard) => {
                     keyboard_menu();
+                    return LRESULT(0);
+                }
+                Some(Hit::Plugin(_)) => {
+                    if let Some((id, work)) = with_app(|app| app.bar_plugin_at(hwnd, x, y)).flatten() {
+                        plugin_menu(&id, work);
+                    }
                     return LRESULT(0);
                 }
                 _ => {}
@@ -2358,6 +2432,39 @@ fn keyboard_menu() {
                 }
             }
             _ => {}
+        }
+    }
+}
+
+/// A plugin's menu (right click on its item); a right click goes to it when it has none.
+fn plugin_menu(id: &str, work: RECT) {
+    let items = crate::plugins::menu(id);
+    if items.is_empty() {
+        crate::plugins::click(id, "right", work);
+        return;
+    }
+    unsafe {
+        let Ok(menu) = CreatePopupMenu() else { return };
+        for (n, it) in items.iter().enumerate() {
+            if it.separator {
+                let _ = AppendMenuW(menu, MF_SEPARATOR, 0, windows::core::PCWSTR::null());
+                continue;
+            }
+            let mut flags = MF_STRING;
+            if it.checked {
+                flags |= MF_CHECKED;
+            }
+            if !it.enabled {
+                flags |= MF_GRAYED;
+            }
+            let t = wide_z(&it.label.replace('&', "&&"));
+            let _ = AppendMenuW(menu, flags, 1 + n, windows::core::PCWSTR(t.as_ptr()));
+        }
+        let cmd = run_menu(menu);
+        if cmd >= 1 {
+            if let Some(it) = items.get(cmd - 1) {
+                crate::plugins::menu_chosen(id, &it.id, work);
+            }
         }
     }
 }

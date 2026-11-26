@@ -39,9 +39,25 @@ if ($target -and (Get-Process lastdesk -ErrorAction SilentlyContinue | Where-Obj
 cargo build --release
 if ($LASTEXITCODE -ne 0) { throw "build failed" }
 
+# Plugins (plugins\<id>): each built and installed next to lastdesk.exe; turned on in Settings.
+$plugins = Get-ChildItem plugins -Directory -ErrorAction SilentlyContinue | Where-Object { Test-Path (Join-Path $_.FullName 'Cargo.toml') }
+foreach ($p in $plugins) {
+    Push-Location $p.FullName
+    cargo build --release
+    $ok = $LASTEXITCODE -eq 0
+    Pop-Location
+    if (-not $ok) { throw "plugin $($p.Name): build failed" }
+}
+
 Stop-LastDesk
 
 Copy-Item 'target\release\lastdesk.exe' $exe -Force
+foreach ($p in $plugins) {
+    $to = Join-Path $dest "plugins\$($p.Name)"
+    New-Item -ItemType Directory -Force $to | Out-Null
+    Copy-Item (Join-Path $p.FullName 'plugin.json') $to -Force
+    Get-ChildItem (Join-Path $p.FullName 'target\release') -Filter *.exe | Copy-Item -Destination $to -Force
+}
 
 if ($Autostart) {
     Set-ItemProperty 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run' -Name 'LastDesk' -Value "`"$exe`""
