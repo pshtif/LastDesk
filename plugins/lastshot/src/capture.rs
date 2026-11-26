@@ -104,9 +104,15 @@ pub fn save_png(s: &Shot, path: &Path) -> windows::core::Result<()> {
         let frame = frame.ok_or_else(windows::core::Error::empty)?;
         frame.Initialize(None)?;
         frame.SetSize(s.w as u32, s.h as u32)?;
-        let mut fmt = GUID_WICPixelFormat32bppBGR;
+        // 24-bit: the PNG encoder doesn't take 32bppBGR (it answers with 24bppBGR, and 4-byte
+        // pixels written as 3-byte ones come out stretched and striped).
+        let mut fmt = GUID_WICPixelFormat24bppBGR;
         frame.SetPixelFormat(&mut fmt)?;
-        frame.WritePixels(s.h as u32, (s.w * 4) as u32, &s.px)?;
+        if fmt != GUID_WICPixelFormat24bppBGR {
+            return Err(windows::core::Error::empty());
+        }
+        let bgr: Vec<u8> = s.px.chunks_exact(4).flat_map(|p| [p[0], p[1], p[2]]).collect();
+        frame.WritePixels(s.h as u32, (s.w * 3) as u32, &bgr)?;
         frame.Commit()?;
         enc.Commit()?;
     }
@@ -637,5 +643,37 @@ mod tests {
         assert_eq!(at(50, 30), (0x3C, 0x3C, 0xEB));
         assert_eq!(at(50, 5), (255, 255, 255));
         assert_eq!(at(5, 30), (255, 255, 255));
+    }
+
+    #[test]
+    fn png_keeps_every_pixel() {
+        use windows::Win32::System::Com::{CoInitializeEx, COINIT_MULTITHREADED};
+        // Every pixel different (odd width, so rows don't line up by chance).
+        let (w, h) = (37, 11);
+        let px: Vec<u8> = (0..w * h).flat_map(|i| [(i * 7) as u8, (i * 13) as u8, (i * 29) as u8, 0]).collect();
+        let s = Shot { x: 0, y: 0, w, h, px };
+        let path = std::env::temp_dir().join("lastshot-test.png");
+        unsafe {
+            let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
+        }
+        save_png(&s, &path).expect("saved");
+        let back = unsafe {
+            let factory: IWICImagingFactory = CoCreateInstance(&CLSID_WICImagingFactory, None, CLSCTX_INPROC_SERVER).unwrap();
+            let p: Vec<u16> = path.as_os_str().encode_wide_z();
+            let dec = factory.CreateDecoderFromFilename(PCWSTR(p.as_ptr()), None, windows::Win32::Foundation::GENERIC_READ, WICDecodeMetadataCacheOnDemand).unwrap();
+            let frame = dec.GetFrame(0).unwrap();
+            let (mut fw, mut fh) = (0, 0);
+            frame.GetSize(&mut fw, &mut fh).unwrap();
+            assert_eq!((fw, fh), (w as u32, h as u32));
+            let conv = factory.CreateFormatConverter().unwrap();
+            conv.Initialize(&frame, &GUID_WICPixelFormat32bppBGR, WICBitmapDitherTypeNone, None, 0.0, WICBitmapPaletteTypeCustom).unwrap();
+            let mut buf = vec![0u8; (w * h * 4) as usize];
+            conv.CopyPixels(std::ptr::null(), (w * 4) as u32, &mut buf).unwrap();
+            buf
+        };
+        let _ = std::fs::remove_file(&path);
+        for i in 0..(w * h) as usize {
+            assert_eq!(&back[i * 4..i * 4 + 3], &s.px[i * 4..i * 4 + 3], "pixel {i}");
+        }
     }
 }
