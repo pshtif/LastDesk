@@ -1,7 +1,7 @@
 # LastDesk
 
 Per-monitor workspaces and a lean taskbar for Windows 11. Native Rust, a single ~600 KB exe,
-about 6–10 MB of RAM.
+about 6–10 MB of RAM, plus optional plugins.
 
 Created by Peter @sHTiF Stefcek.
 
@@ -11,20 +11,23 @@ own workspaces, and replaces the Windows taskbar with its own bar on every monit
 ## Features
 
 **Workspaces**
-- Each monitor has its own workspaces (1–9, default 4).
+- Each monitor has its own workspaces. It starts with one; **+** in the bar adds one (up to
+  nine). Right-click a workspace to remove it: its windows move to the one before.
+- Optionally, an empty workspace is removed when you switch away from it (Settings, off by
+  default).
 - Overview of all workspaces (`Alt+``).
 - Pin a window to every workspace.
 - Rules: open an app on a given monitor and workspace.
 - Apps started from Start or the bar open on the monitor you started them from.
 
 **Bar** (one per monitor, top or bottom)
-- Start button and workspace cells. An orange frame marks a workspace with a window asking
-  for attention.
+- Start button, workspace cells and **+**. An orange frame marks a workspace with a window
+  asking for attention.
 - Window buttons:
   - reorder by dragging
   - hover for a live preview
   - turn orange when a window wants attention
-  - right-click for minimize, pin, move to workspace or close
+  - right-click for minimize, pin, move to workspace (or a new one) or close
 - Pinned apps ("Pin to bar"):
   - they keep their place and show a thin line along the top edge
   - while not running, they show as an icon that starts the app on that monitor
@@ -32,6 +35,7 @@ own workspaces, and replaces the Windows taskbar with its own bar on every monit
 - App tray icons, hosted in the bar.
 - Status icons:
   - microphone / camera in use (hover shows which app)
+  - keyboard layout ("ENG" over "UK"), when more than one is installed; click to switch
   - Wi-Fi signal or Ethernet
   - volume (scroll to change, middle-click to mute)
   - battery, plus fan speed on ASUS laptops
@@ -41,14 +45,10 @@ own workspaces, and replaces the Windows taskbar with its own bar on every monit
 
 **Optional** (Settings, all off by default)
 - Memory meter: RAM in use. Hover lists the apps using the most.
-- Tailscale: status, connect / disconnect, and exit nodes. Mullvad nodes are grouped by
-  country and city. Health warnings and an alert when the exit node goes offline. It talks to
-  the Tailscale service directly, so Tailscale's tray app isn't needed.
-- LastTerminal (if installed): its running sessions on hover; click for a menu to open
-  LastTerminal on one of them, or start LastTerminal when it isn't running.
 - Win key opens Start on the monitor you're on.
 - Network drives that switch between a home path and an away path, e.g. a NAS by local
   address at home and through Tailscale or a VPN elsewhere. See below.
+- Plugins (see below): Tailscale, LastTerminal, LastShot.
 
 **Windows tweaks** (Settings; each shows and changes Windows' own setting; most ask for admin)
 - Turn off Start search (~100 MB; typing in Start finds nothing).
@@ -56,12 +56,35 @@ own workspaces, and replaces the Windows taskbar with its own bar on every monit
 - No Bing web results in Start search.
 - Don't preload File Explorer in the background.
 
+## Plugins
+
+Optional parts that run as their own small programs, in `plugins\<id>\` next to
+`lastdesk.exe`. Turn them on in **Settings → Plugins**; a plugin that's off isn't started, and
+one that crashes takes nothing else down. `install.ps1` builds and installs them.
+
+- **Tailscale**: status in the bar, connect / disconnect, and exit nodes. Mullvad nodes are
+  grouped by country and city. Health warnings and an alert when the exit node goes offline.
+  It talks to the Tailscale service directly, so Tailscale's tray app isn't needed.
+- **LastTerminal** (if installed): its icon with the number of running sessions, the list on
+  hover; click for a menu to open LastTerminal on one of them, or start it when it isn't
+  running.
+- **LastShot**: screenshots and screen recordings.
+  - Click the camera or `Ctrl+Shift+S`: drag a region or click a window (`Enter`: the whole
+    monitor), draw on it freehand if you like, then save. It's saved as PNG in
+    `Pictures\LastShot` and copied to the clipboard.
+  - `Ctrl+Shift+R`: record a region to MP4 (needs ffmpeg), with a panel to pause, stop or
+    cancel. The panel and the frame around the region aren't recorded.
+
+A plugin talks to LastDesk in JSON lines over its stdin / stdout. It can add a bar item (an
+icon, a glyph or short text, with a tooltip), a menu, hotkeys and notifications. The protocol
+is described at the top of `src/plugins.rs`.
+
 ## Keys
 
 | Keys | Action |
 |---|---|
-| `Alt+1..N` | Switch the workspace of the monitor you're on |
-| `Alt+Shift+1..N` | Move the focused window to that workspace |
+| `Alt+1..9` | Switch to that workspace of the monitor you're on (if it has one) |
+| `Alt+Shift+1..9` | Move the focused window there (one past the last makes a new workspace) |
 | `Ctrl+Alt+Left/Right` | Previous / next workspace |
 | `Alt+Shift+P` | Pin / unpin the focused window (shown on every workspace) |
 | ``Alt+` `` | Overview |
@@ -75,6 +98,7 @@ LastDesk.
 - Windows 11. Developed and tested on ARM64 (Snapdragon), recent builds. It also builds for
   x64 (Intel / AMD); that build is untested. Windows 10 is untested.
 - To build: [Rust](https://rustup.rs) (stable) and the Visual Studio C++ build tools.
+- LastShot's recording: [ffmpeg](https://ffmpeg.org) (`winget install ffmpeg`).
 
 ## Install
 
@@ -100,13 +124,13 @@ apply as you change them. Everything lives in `%APPDATA%\LastDesk\config.ini` (>
 file…", then "Reload config"):
 
 ```ini
-workspaces = 4              # per monitor, 1-9
+remove_empty_workspaces = false   # remove an empty workspace when you leave it
 animation = normal          # off | fast | normal | slow
 launch_ignore = steam       # apps that keep their own position when started from Start
 
 [keys]
-switch = alt                # alt+1..N
-move = alt+shift            # alt+shift+1..N
+switch = alt                # alt+1..9
+move = alt+shift            # alt+shift+1..9
 pin = alt+shift+p
 overview = alt+`
 next = ctrl+alt+right
@@ -120,9 +144,10 @@ align = left                # left | center | right
 hide_taskbar = false        # hide the Windows taskbar; the bar takes its place
 tray = true                 # app tray icons in the bar
 memory = false              # memory meter
-tailscale = false           # Tailscale status and menu (if installed)
-lastterminal = false        # LastTerminal sessions and menu (if installed)
 win_key_start = false       # Win key opens Start on the monitor you're on
+
+[plugins]
+enabled = tailscale, lastterminal, lastshot
 
 [pinned_apps]               # shown on every workspace
 spotify
@@ -159,11 +184,13 @@ V: = \\192.168.1.10\Media | \\my-nas\Media | NAS Media
   windows invisible, and a hidden Windows taskbar is shown again.
 - **Watchdog:** a tiny guard process restarts LastDesk if it ever disappears without you
   choosing Exit. It stops after 3 restarts within 2 minutes, so a crash can't loop.
-- **Remembered layout:** each window's workspace is kept in `%LOCALAPPDATA%\LastDesk\layout.txt`
-  and restored after restarts and reboots. Tray > "Show all windows (reset)" clears it.
+- **Remembered layout:** each window's workspace, and each monitor's workspaces, are kept in
+  `%LOCALAPPDATA%\LastDesk\layout.txt` and restored after restarts and reboots. Tray > "Show
+  all windows (reset)" clears it.
 - **Window previews:** live DWM thumbnails. Nothing is captured or stored.
-- **Network:** no telemetry and no network access of its own. The Tailscale integration only
-  talks to the local Tailscale service.
+- **Network:** no telemetry and no network access of its own. The Tailscale plugin only talks
+  to the local Tailscale service, the LastTerminal plugin only to LastTerminal on this PC.
+- **Screenshots and recordings** (LastShot) stay on this PC, in `Pictures\LastShot`.
 - **Keyboard hook:** the optional Win-key feature uses one that only checks whether a key is
   the Win key.
 
